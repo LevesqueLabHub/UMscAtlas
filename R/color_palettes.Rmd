@@ -1,0 +1,100 @@
+---
+title: "Plot_colors_pUM"
+output: html_document
+date: "2025-05-30"
+---
+
+load relevant packages
+
+```{r}
+library(pals)
+library(grDevices)
+library(paletteer)
+library(patchwork)
+library(colorspace)
+library(brew)
+```
+# defined colors for UM scAtlas
+## here are all colors for different conditions
+```{r}
+# location colors: defines colors for different anatomical locations in the dataset (healthy iris, healthy choroid, choroid, ciliary body, iris, ciliochoroidal, brain, liver, thyroid, subcutaneous)
+location_colors <- c("healthy iris" = "#F3BC6AFF", "healthy choroid" = "#BB5137FF", "iris" = "#00778BFF", "choroid" = "#211747FF", "ciliary body" = "#B6E2E0FF", "ciliochoroidal" = "#6CACE4FF","brain" = "#661246FF", "thyroid" = "#AE1357FF", "liver" = "#E2ADDDFF", "subcut" = "#D7509FFF")
+# primary_location_colors colors defines colors for intra ocular loaction of primary tumors (pUM)
+primary_location_colors <- c("iris" = "#00778BFF", "choroid" = "#211747FF", "ciliary body" = "#B6E2E0FF", "ciliochoroidal" = "#6CACE4FF")
+# met_location_colors colors defines colors for anatomical loaction of metastatic tumors (mUM)
+met_location_colors <- c("brain" = "#661246FF", "thyroid" = "#AE1357FF", "liver" = "#E2ADDDFF", "subcut" = "#D7509FFF")
+# healthy_location_colors defines colors for healthy iris and healthy choroid samples
+healthy_location_colors <- c("healthy iris" = "#F3BC6AFF", "healthy choroid" = "#BB5137FF")
+# origin_colors defines disease status (healthy tissue, primary tumor, metastatic tumor)
+origin_colors <- c("primary" = "royalblue3", "healthy" = "sienna3", "metastasis" = "violetred4")
+# organ_colors defines colors of organ from which sample was derived (eye, brain, thyroid, liver, skin)
+organ_colors <- c("eye" = "#5498BAFF", "brain" = "#661246FF", "thyroid" = "#AE1357FF", "liver" = "#E2ADDDFF", "skin" = "#D7509FFF")
+# second_mutations_col defines colors for 3 secondary mutations defined in tumors (BAP1, SF3B1, EIF1AX)
+second_mutations_col <- c("BAP1" = "#1F867BFF", "SF3B1" = "#EAC541FF", "EIF1AX" = "#7B1C5DFF", "unknown" = "#E1E1E1FF", "none" = "#343434FF")
+# primary_mutations_col defines colors for 4 primary mutations defined in tumors (GNAQ, GNA11, PLCB4, CYSLTR2)
+primary_mutations_col <- c("GNAQ" = "#70395CFF", "GNA11" = "#846D86FF", "PLCB4" = "#D5B77DFF", "CYSLTR2" = "#A89E5EFF", "unknown" = "#E1E1E1FF", "none" = "#343434FF")
+# gender_col colors to discriminate between M & F from metadata
+gender_col <- c("M" = "#58827EFF", "F" = "#611554FF", "unknown" = "#E1E1E1FF")
+# ageGroup_col colors to discriminate between Young, Middle and Old age groups for GloScope Analysis
+ageGroup_col <- c("Young" = "#9386A6FF", "Middle" = "#BFCDD9FF", "Old" = "#7F8C72FF")
+# majority_celltype_col defines colors for major cell types (stored in majority_celltype)
+majority_celltype_col <- c("Glial cells" = "#5A5156", "B/Plasma cells" = "lightslateblue", "Myeloid cells" = "lightblue", "T/NK cells" = "#325A9B", "Melanoma cells" = "#B00068", "Melanocytes" = "#C075A6", "Endothelial cells" = "chartreuse4", "Epithelial cells" = "#1CBE4F", "Fibroblasts" = "yellowgreen", "Mesenchymal cells" = "darkgreen", "Pericytes" = "olivedrab4", "Smooth muscle cells" = "#1CFFCE", "Photoreceptor cells" = "peachpuff3")
+# tcell_col defines colors for t cell subtyping (stored in Subtyping)
+tcell_col <- c("CD4_EM" = "#00366CFF", "CD4_EX" = "#004B84FF", "CD4_N" = "#00619FFF", "CD4_REG" = "#0077BCFF", "CD8_EM" = "#408DCEFF", "CD8_EMRA" = "#68A1DCFF", "CD8_EX" = "#88B4E8FF", "CD8_N" = "#A4C7F3FF", "CD8_RM" = "#BED7FBFF", "gdT" = "#D4E6FFFF", "NK_CYTO" = "#E8F2FFFF", "NK_REST" = "#F9F9F9FF", "Proliferating cells" = "#001889FF")
+# otherImmune_color defines colors for other immune cells mostly identified by Azimuth (stored in Subtyping)
+otherImmune_color <- c("other Immune cells" = "#6B0077FF", "MAIT" = "#F8DCD9FF", "cDC1" = "#6C207EFF", "cDC2" = "#714C94FF", "pDC" = "#6E3587FF", "Plasma cells" = "#786AC6FF", "B cells" = "#3B2D7BFF", "Platelets" = "#091626FF")
+# macro_col defines colors for macrophage subtyping (stored in Subtyping)
+macro_col <- c("activated tissue-infiltrating Macrophages" = "#023FA5FF", "Intermediate TAMs" = "#485CA8FF", "ISG Macrophages" = "#6A76B2FF", "M1-like mono-derived TAMs" = "#878FBDFF", "M1-like TAMs" = "#A1A6C8FF", "M2-like TAMs" = "#B7BBD1FF", "Mature TAMs" = "#CBCDD9FF", "Mono-derived Macrophages" = "#DADBDFFF", "proliferating TAMs" = "#E2E2E2FF")
+# TME_SubTyp_col combining tcell_col, otherImmune_col, macro_col and other cells from TME that were not subtyped
+TME_SubTyp_col <- c(tcell_col, otherImmune_color, macro_col, "Glial cells" = "#5A5156", "Endothelial cells" = "chartreuse4", "Epithelial cells" = "#1CBE4F", "Fibroblasts" = "yellowgreen", "Mesenchymal cells" = "darkgreen", "Pericytes" = "olivedrab4", "Smooth muscle cells" = "#1CFFCE", "Photoreceptor cells" = "peachpuff3") 
+# fullData_SubTyp_col combines TME_SubTyp_col with Melanoma and Melanocyte colors to show subtyping of TME in also full Dataset
+fullData_SubTyp_col <- c(TME_SubTyp_col, "Melanoma cells" = "#B00068", "Melanocytes" = "#C075A6")
+# iCNV_colors defines colors to color UMAP by iCNV status stored in Malignant column (levels: Helathy, Malignant, Reference, NA -> Other cells)
+iCNV_colors <- c("Healthy" = "#ED8B58FF", "Malignant" = "#75005BFF", "Reference" = "#070707FF", "Other cells" = "#666879FF")
+# healthy_samp_col defines colors for each entry in orig.ident (samples with same orig.ident were obtained from same tumor or tissue biopsy)
+healthy_samp_col <- c("hCh18" = "#FFF7BCFF", "hCh20" = "#FEE391FF", "hCh21" = "#FEC44FFF", "hCh22" = "#FB9A29FF", "hCh23" = "#EC7014FF", "hCh24" = "#CC4C02FF", "hCh25" = "#993404FF", "hIr19" = "#6C1D0EFF")
+# primary_samp_col defines colors for each entry in orig.ident for primary tumors(samples with same orig.ident were obtained from same tumor biopsy and processed in duplicates if there is more than one samplename entry in dataset)
+pUM_samples <- c("pUM01", "pUM02", "pUM03", "pUM04", "pUM05", "pUM06", "pUM09", "pUM10", "pUM11", "pUM12", "pUM14", "pUM15", "pUM16", "pUM17", "pUM19", "pUM20", "pUM21", "pUM22", "pUM23", "pUM24", "pUM25")
+mint_colors <- as.character(paletteer::paletteer_c("grDevices::Mint", n = 24))
+cats <- unique(pUM_samples)
+if (length(cats) > 24) warning("More than 21 categories: colors will recycle")
+# Map categories to colors (up to 21)
+offset <- 3
+col_map <- setNames(mint_colors[ (seq_along(cats) - 1 + offset) %% 24 + 1 ], cats)
+# Assign colors to each element of x
+primary_samp_col <- col_map[pUM_samples]
+# mets_samp_col defines colors for each entry in orig.ident for primary tumors(samples with same orig.ident were obtained from same tumor biopsy and processed in duplicates if there is more than one samplename entry in dataset)
+mUM_samples <- c("mUM01", "mUM02", "mUM04", "mUM05", "mUM06", "mUM07", "mUM08", "mUM09", "mUM11", "mUM13", "mUM14", "mUM15", "mUM16", "mUM18", "mUM19", "mUM20")
+# Get all original colors (the full discrete palette)
+acton_all <- as.character(paletteer::paletteer_d("khroma::acton"))
+# Build an interpolator over the full palette and sample 16 evenly spaced colors
+acton_16 <- grDevices::colorRampPalette(acton_all)(16)
+# Print each color with its index
+#for (i in seq_along(acton_16)) {
+#  cat(sprintf("%2d: %s\n", i, acton_16[i]))}
+# Choose a stable order for unique samples (customize if you need a specific order)
+sample_levels <- unique(mUM_samples)  # or: sort(unique(sample_names))
+if (length(sample_levels) > 16) {
+  stop("You have more than 16 unique samples; increase n or reduce categories.")
+}
+# Map sample -> color (1:1, in the chosen order)
+col_map_M <- setNames(acton_16[seq_along(sample_levels)], sample_levels)
+# Per-element colors aligned to sample_names
+mets_samp_col <- col_map_M[mUM_samples]
+# sample_col combines healthy_samp_col, primary_samp_col and mets_samp_col to color all different tumor biopsies sequenced
+sample_col <- c(healthy_samp_col, primary_samp_col, mets_samp_col)
+# patientID_col combines patiendIDp_samp_col (obtained from primary_samp_col -> matching orig.ident and patientNumber have the same color), patientID_healthyonly (orig.ident hCh18 (matching color), where no corresponding tumor tissue was sequenced) and patiendIDmet_samp_col (taking colors from corresponding orig.ident of mUM samples), showing that from two patients 2 metastases are represented in the dataset
+patientID_prim <- c("P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9", "P10", "P11", "P12", "P13", "P14", "P16", "P17", "P18", "P19", "P20", "P21", "P22")
+# Assign colors to each element of x
+primary_samp_col <- col_map[pUM_samples]
+catsIDp <- unique(patientID_prim)
+if (length(catsIDp) > 24) warning("More than 21 categories: colors will recycle")
+# Map categories to colors (up to 21)
+offset <- 3
+col_mapIDp <- setNames(mint_colors[((seq_along(catsIDp) - 1 + offset) %% 24) + 1], catsIDp)
+# Assign colors to each element of x
+patiendIDp_samp_col <- col_mapIDp[patientID_prim]
+patiendIDmet_samp_col <- c("P23" = "#2D204C", "P24" = "#3F305B", "P25" = "#523F6C", "P26" = "#66507A", "P27" = "#7D5B87", "P28" = "#926390", "P29" = "#A56693", "P30" = "#B86897", "P31" = "#CC74A0", "P32" = "#D394B8", "P33" = "#D2A3C1", "P34" = "#D4B2CC", "P35" = "#D8C3D8", "P36" = "#E5E5F0")
+patientID_healthyonly <- c("P15" = "#FFF7BCFF")
+patientID_col <- c(patientID_healthyonly, patiendIDp_samp_col, patiendIDmet_samp_col)
+```
