@@ -12,8 +12,8 @@ Analysis of healthy, primary, and metastatic uveal melanoma using scRNA-seq and 
 | samplename | Sample Name | Identifies biological replicates sequenced in different libraries (use instead of Sample column (that shows projectnumber and Index from FGCZ |
 | healthy_location | Intraocular Location Healthy | Identifies intraocular location from healthy tissue |
 | Condition | Batch | Indicates sequencing batch for each sample |
-| primary_mutation | Primary Mutation | Identifies primary mutation (GNAQ, GNA11, PLCB4 or CYSLTR2) for each sample (assesed by WES or targeted sequencing) |
-| secondary_mutation | Secondary Mutation | Identifies secondary mutation (BAP1, SF3B1 or EIF1AX) for each sample (assesed by WES or targeted sequencing) |
+| primary_mutation | Primary Mutation | Identifies primary mutation (GNAQ, GNA11, PLCB4 or CYSLTR2) for each sample (assessed by WES or targeted sequencing) |
+| secondary_mutation | Secondary Mutation | Identifies secondary mutation (BAP1, SF3B1 or EIF1AX) for each sample (assessed by WES or targeted sequencing) |
 | Patient_nr | Patient Number | assigns a patient number (P1-P36) to each sequenced sample and shows which patients have multiple samples sequenced |
 | organ | Organ | Identifies organ from which sample is originating |
 | Gender | Gender | Identifies gender of patient sample was derived from |
