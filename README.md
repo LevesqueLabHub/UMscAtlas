@@ -49,11 +49,11 @@ graph TD
 ```
 
 ### ****Metadata Structure in Objects****
-```markdown
-Each Seurat Object contains:
+
+Each Seurat Object contains the following:
 
 #### **1. meta.data**
-Contains cell-level annotations and sample information:
+Cell-level annotations and sample information:
 - **`majority_celltype`**: Broad cell type annotation.
 - **`SubTyping`**: Detailed immune cell subtypes.
 - **`orig.ident`**: Original sample identifier (use for all analyses except GloScope).
@@ -73,5 +73,3 @@ Dimensionality reduction results for visualization:
 #### **3. assays**
 Gene expression data:
 - **`RNA`**: Normalized gene expression matrix (default assay for most analyses).
-
-```
