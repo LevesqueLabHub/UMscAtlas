@@ -38,14 +38,14 @@ Analysis of healthy, primary, and metastatic uveal melanoma using scRNA-seq and 
 - **Full Dataset**: All cells across all samples.
 - **TME Subset**: Tumor microenvironment cells, subsetted from Full Dataset.
 - **Melanoma/Melanocytes Subset**: Melanoma cells and melanocytes from h-p-m subsetted from Full Dataset.
-- **Melanoma Adapted Subset**: Melanoma subset for from p-m UM samples subsetted from Full Dataset.
+- **Melanoma Subset**: Subset of melanoma cells from p-m UM samples subsetted from Full Dataset.
 
 
 ```mermaid
 graph TD
-  A[<b>Full Dataset<br/>13_final_Dataset_reclustered.qs] --> B[<b>TME Subset<br/>01_TME_subset_integrated.qs]
-  A --> C[<b>Melanoma/Melanocytes Subset<br/>01_integrated_melanoma_melanocyte_subset.qs]
-  A --> D[<b>Melanoma/Melanocytes Subset<br/>01_integrated_melanoma_subset.qs]
+  A[<b>Full Dataset</b><br/>13_final_Dataset_reclustered.qs] --> B[<b>TME Subset</b><br/>01_TME_subset_integrated.qs]
+  A --> C[<b>Melanoma/Melanocytes Subset</b><br/>01_integrated_melanoma_melanocyte_subset.qs]
+  A --> D[<b>Melanoma Subset</b><br/>01_integrated_melanoma_subset.qs]
 ```
 
 ### **Metadata for Visualization**
