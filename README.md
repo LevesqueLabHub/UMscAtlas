@@ -43,9 +43,9 @@ Analysis of healthy, primary, and metastatic uveal melanoma using scRNA-seq and 
 
 ```mermaid
 graph TD
-    A[13_final_Dataset_reclustered] --> B[01_TME_subset_integrated]
-    A --> C[01_integrated_melanoma_melanocyte_subset]
-    A --> D[01_integrated_melanoma_subset]
+  A["13_final_Dataset_reclustered\nAll cells\nSeurat object"] --> B["01_TME_subset_integrated\nTME cells\nSeurat object"]
+  A --> C["01_integrated_melanoma_melanocyte_subset\nMelanoma + melanocytes\nSeurat object"]
+  A --> D["01_integrated_melanoma_subset\nMelanoma only\nSeurat object"]
 ```
 
 ### **Metadata for Visualization**
