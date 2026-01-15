@@ -33,3 +33,9 @@ Analysis of healthy, primary, and metastatic uveal melanoma using scRNA-seq and 
 | Time_sinceMetastasisDiagnosisY | Time since Diagnosis of Metastasis | Identifies time since diagnosis of metastasis in years until october 2025 |
 | PatientStatus | Status Patient | Indicates whether patient is deceased or alive |
 | LocationPrimaryTumor | Location of Primary Tumor | Identifies intaocular location of primary tumor also for metastases samples |
+
+Available Datasets
+- **Full Dataset**: All cells across all samples.
+- **TME Subset**: Tumor microenvironment cells, subsetted from Full Dataset.
+- **Melanoma/Melanocytes Subset**: Melanoma cells and melanocytes from h-p-m subsetted from Full Dataset.
+- **Melanoma Adapted Subset**: Melanoma subset for from p-m UM samples subsetted from Full Dataset.
