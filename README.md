@@ -48,17 +48,30 @@ graph TD
   A --> D[<b>Melanoma Subset</b><br/>01_integrated_melanoma_subset.qs]
 ```
 
-### **Metadata for Visualization**
+### ****Metadata Structure in Objects****
 ```markdown
-Each Seurat object contains:
-check table at the top and Rscript on how to name/color each of the variables in your analyis
-- `meta.data`:
-    - `majority_celltype`: Annotated cell identity
-    - `SubTyping`: Annotated cell identity with subtyping of Immunecells
-    - `orig.ident`: sample identifier (use for all analysis except GloScope!!!
-    - `samplename`: library identifier
-- `reductions`:
-    - `umap`: UMAP coordinates for visualization
-    - `pca`: PCA embeddings
-- `assays`:
-    - `RNA`: Normalized gene expression
+Each Seurat Object contains:
+
+#### **1. meta.data**
+Contains cell-level annotations and sample information:
+- **`majority_celltype`**: Broad cell type annotation.
+- **`SubTyping`**: Detailed immune cell subtypes.
+- **`orig.ident`**: Original sample identifier (use for all analyses except GloScope).
+- **`samplename`**: Library identifier.
+
+> **Tip:** Refer to the summary table at the top and the provided R script for recommended naming conventions and color palettes for these variables.
+
+---
+
+#### **2. reductions**
+Dimensionality reduction results for visualization:
+- **`umap`**: UMAP coordinates for clustering and visualization.
+- **`pca`**: PCA embeddings for exploratory analysis.
+
+---
+
+#### **3. assays**
+Gene expression data:
+- **`RNA`**: Normalized gene expression matrix (default assay for most analyses).
+
+```
