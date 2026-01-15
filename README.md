@@ -35,24 +35,28 @@ Analysis of healthy, primary, and metastatic uveal melanoma using scRNA-seq and 
 | LocationPrimaryTumor | Location of Primary Tumor | Identifies intaocular location of primary tumor also for metastases samples |
 
 ## Available Datasets
+
 - **Full Dataset**: All cells across all samples.
-- **TME Subset**: Tumor microenvironment cells, subsetted from Full Dataset.
-- **Melanoma/Melanocytes Subset**: Melanoma cells and melanocytes from h-p-m subsetted from Full Dataset.
+- **TME Subset**: Tumor microenvironment cells, subsetted from Full Dataset (all cells except Melanocytes and Melanoma cells).
+- **Melanoma/Melanocytes Subset**: Melanoma cells and melanocytes from healthy - primary - metastases subsetted from Full Dataset.
 - **Melanoma Subset**: Subset of melanoma cells from p-m UM samples subsetted from Full Dataset.
 
+> **Notes:**
+> - Melanoma cells were defined using inferred copy number variation (iCNV) profiles to distinguish malignant cells from non-malignant Melanocytes populations.
+> - All subsets are **Harmony-corrected**, except the **Full Dataset**.
 
 ```mermaid
 graph TD
   A[<b>Full Dataset</b><br/>13_final_Dataset_reclustered.qs] --> B[<b>TME Subset</b><br/>01_TME_subset_integrated.qs]
   A --> C[<b>Melanoma/Melanocytes Subset</b><br/>01_integrated_melanoma_melanocyte_subset.qs]
-  A --> D[<b>Melanoma Subset</b><br/>01_integrated_melanoma_subset.qs]
+  C --> D[<b>Melanoma Subset</b><br/>01_integrated_melanoma_subset.qs]
 ```
 
-### ****Metadata Structure in Objects****
+## Metadata Structure in Objects
 
-Each Seurat Object contains the following:
+Each Seurat object contains the following components:
 
-#### **1. meta.data**
+#### 1. meta.data
 Cell-level annotations and sample information:
 - **`majority_celltype`**: Broad cell type annotation.
 - **`SubTyping`**: Detailed immune cell subtypes.
@@ -63,13 +67,15 @@ Cell-level annotations and sample information:
 
 ---
 
-#### **2. reductions**
-Dimensionality reduction results for visualization:
+#### 2. reductions
+Dimensionality reduction results for visualization and integration:
 - **`umap`**: UMAP coordinates for clustering and visualization.
 - **`pca`**: PCA embeddings for exploratory analysis.
+- **Integration**: All subsets are Harmony-corrected (except the Full Dataset).
 
 ---
 
-#### **3. assays**
+#### 3. assays
 Gene expression data:
 - **`RNA`**: Normalized gene expression matrix (default assay for most analyses).
+
