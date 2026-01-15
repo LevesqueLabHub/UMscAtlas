@@ -43,6 +43,21 @@ Analysis of healthy, primary, and metastatic uveal melanoma using scRNA-seq and 
 
 ```mermaid
 graph TD
-    A[Full Seurat Object] --> B[TME Subset]
-    A --> C[Melanoma/Melanocytes Subset]
-    C --> D[Melanoma Adapted Subset]
+    A[13_final_Dataset_reclustered] --> B[01_TME_subset_integrated]
+    A --> C[01_integrated_melanoma_melanocyte_subset]
+    A --> D[01_integrated_melanoma_subset]
+
+### **Metadata for Visualization**
+```markdown
+Each Seurat object contains:
+check table at the top and Rscript on how to name/color each of the variables in your analyis
+- `meta.data`:
+    - `majority_celltype`: Annotated cell identity
+    - `SubTyping`: Annotated cell identity with subtyping of Immunecells
+    - `orig.ident`: sample identifier (use for all analysis except GloScope!!!
+    - `samplename`: library identifier
+- `reductions`:
+    - `umap`: UMAP coordinates for visualization
+    - `pca`: PCA embeddings
+- `assays`:
+    - `RNA`: Normalized gene expression
