@@ -59,7 +59,7 @@ Cell-level annotations and sample information:
 - **`orig.ident`**: Original sample identifier (use for all analyses except GloScope).
 - **`samplename`**: Library identifier.
 
-> **Tip:** Refer to the summary table at the top and the provided R script for recommended naming conventions and color palettes for these variables.
+> **Tip:** Refer to the summary table at the top and the provided R script for recommended naming conventions and color palettes.
 
 ---
 
