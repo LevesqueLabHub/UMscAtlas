@@ -39,3 +39,10 @@ Analysis of healthy, primary, and metastatic uveal melanoma using scRNA-seq and 
 - **TME Subset**: Tumor microenvironment cells, subsetted from Full Dataset.
 - **Melanoma/Melanocytes Subset**: Melanoma cells and melanocytes from h-p-m subsetted from Full Dataset.
 - **Melanoma Adapted Subset**: Melanoma subset for from p-m UM samples subsetted from Full Dataset.
+
+
+```mermaid
+graph TD
+    A[Full Seurat Object] --> B[TME Subset]
+    A --> C[Melanoma/Melanocytes Subset]
+    C --> D[Melanoma Adapted Subset]
