@@ -34,6 +34,11 @@ Analysis of healthy, primary, and metastatic uveal melanoma using scRNA-seq and 
 | PatientStatus | Status Patient | Indicates whether patient is deceased or alive |
 | LocationPrimaryTumor | Location of Primary Tumor | Identifies intaocular location of primary tumor also for metastases samples |
 
+## Symbols to Use in Plots
+- **healthy**: ● Circle (nr. 2)
+- **primary**: ▲ Triangle (nr. 3)
+- **metastases**: ◆ Diamond (nr. 5)
+
 ## Available Datasets
 
 - **Full Dataset**: All cells across all samples.
