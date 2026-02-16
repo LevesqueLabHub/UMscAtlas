@@ -52,9 +52,10 @@ Analysis of healthy, primary, and metastatic uveal melanoma using scRNA-seq and 
 
 ```mermaid
 graph TD
-  A[<b>Full Dataset</b><br/>13_final_Dataset_reclustered.qs] --> B[<b>TME Subset</b><br/>01_TME_subset_integrated.qs]
-  A --> C[<b>Melanoma/Melanocytes Subset</b><br/>01_integrated_melanoma_melanocyte_subset.qs]
-  C --> D[<b>Melanoma Subset</b><br/>01_integrated_melanoma_subset.qs]
+  A[<b>Full Dataset</b><br/>13_final_Dataset_reclustered_28012025.qs<br/>*not integrated*] --> B[<b>TME Subset</b><br/>01_integrated_multicorr_TME.qs<br/>*harmony corrected*]
+  A --> C[<b>Melanoma/Melanocytes Subset</b><br/>01_integrated_melanoma_melanocyte_subset.qs<br/>*harmony corrected*]
+  B --> E[<b>T/NK cell Subset</b><br/>01_integrated_TNK_subset.qs<br/>*harmony corrected*]
+  C --> D[<b>Melanoma Subset</b><br/>01_integrated_melanoma_subset.qs<br/>*harmony corrected*]
 ```
 
 ## Metadata Structure in Objects
@@ -77,6 +78,8 @@ Dimensionality reduction results for visualization and integration:
 - **`umap`**: UMAP coordinates for clustering and visualization.
 - **`pca`**: PCA embeddings for exploratory analysis.
 - **Integration**: All subsets are Harmony-corrected (except the Full Dataset).
+-   use reduction: **`umap`** for **Full Dataset**
+-   use reduction: **`umap_Condition_and_orig.ident_50PC_theta2`** for **Harmony-corrected Datasets**
 
 ---
 
