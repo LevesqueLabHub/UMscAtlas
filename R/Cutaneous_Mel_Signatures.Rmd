@@ -1,0 +1,240 @@
+---
+title: "Cutaneous Signatures scRNA"
+author: "Prachi Shukla"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+
+```{r libraries, message=FALSE}
+
+library(ggplot2)
+library(data.table)
+library(tidyverse)
+library(patchwork)
+library(RColorBrewer)
+library(viridisLite)
+library(scales)
+library(qs)
+library(qs2)
+library(Seurat)
+library(SCpubr)
+library(forcats)
+library(rstatix)
+library(kableExtra)
+library(ggpubr)
+library(UCell)
+
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+
+theme_set(theme_classic())
+
+```
+
+
+```{r functions}
+# Function to plot signatures and stats
+# sigs - character vector: vector of signatures to plot
+# metadata - dataframe: dataframe with clinical variables and signatures in wide form
+# stats - dataframe: rstatix wilcox_test output
+# colors - character vector: vector of colors
+# Returns: Plots list
+sigsVlnPlotsStats <- function(sigs, metadata, stats, colors = NULL){
+  
+  plots = lapply(sigs, function(x){
+    plot_df <- metadata
+    
+    stat_df <- stats %>%
+      filter(Signatures == x) %>%
+      mutate(
+        y.position = max(plot_df[, x], na.rm = TRUE) +
+          (c(1, 2.5, 4)*0.08) * diff(range(plot_df[, x], na.rm = TRUE))
+      )
+    
+    variable = unique(stats$comparison)
+    label = str_to_title(str_replace(variable, "_", " "))
+    
+    ggplot(plot_df, aes(x = .data[[variable]], y = .data[[x]], fill = .data[[variable]])) +
+      geom_violin(trim = FALSE) +
+      geom_boxplot(width = 0.15, fill = "white", outlier.shape = NA) +
+      stat_pvalue_manual(
+        stat_df,
+        label = "p.adj.signif",
+        xmin = "group1",
+        xmax = "group2",
+        y.position = "y.position",
+        tip.length = 0.01,
+        hide.ns = FALSE,
+        size = 10
+      ) +
+      scale_fill_manual(values = colors) +
+      scale_y_continuous(expand = expansion(mult = c(0.05, 0.25))) +
+      labs(x = label, y = x, fill = label) +
+      theme(
+        legend.position = "none",
+        text = element_text(size = 20)
+      )
+  })
+  
+  return(plots)
+}
+```
+
+
+# Introduction 
+Analysis on scRNA seq data as single cells.
+
+```{r loading_files}
+
+
+origin_colors <- c("primary" = "royalblue3", "healthy" = "sienna3", "metastasis" = "violetred4")
+
+location_colors <- c("healthy iris" = "#F3BC6AFF", "healthy choroid" = "#BB5137FF", "iris" = "#00778BFF", "choroid" = "#211747FF", "ciliary body" = "#B6E2E0FF", "ciliochoroidal" = "#6CACE4FF","brain" = "#661246FF", "thyroid" = "#AE1357FF", "liver" = "#E2ADDDFF", "subcut" = "#D7509FFF")
+
+
+second_mutations_col <- c("BAP1" = "#1F867BFF", "SF3B1" = "#EAC541FF", "EIF1AX" = "#7B1C5DFF", "unknown" = "#E1E1E1FF", "none" = "#343434FF")
+
+grouped_sigs = qs_read("..20250717_All_Signatures_Grouped.qs2")
+
+all_sigs = unname(unlist(lapply(grouped_sigs, names)))
+
+
+```
+
+# Appying Sigs
+
+```{r}
+mel= qs::qread("../01_integrated_melanoma_melanocyte_subset.qs", nthreads = 20)
+
+sigs = qs::qread("../20241202_All_Melanoma_Cell_Gene_Signatures.qs")
+```
+
+```{r ucell}
+
+mel = AddModuleScore_UCell(mel, features = sigs, maxRank = 2400, ncores = 20, assay = "RNA", name = "")
+mel = SmoothKNN(mel, signature.names = names(sigs), reduction = "harmony")
+
+```
+
+```{r saving, eval=FALSE}
+
+qs_save(mel, "../01_integrated_melanoma_melanocyte_subset_SIGS.qs2")
+
+```
+
+
+# Stats
+
+```{r, fig.width=10, fig.height=5, eval=FALSE}
+
+so = qs_read("../01_integrated_melanoma_melanocyte_subset_SIGS.qs2")
+
+ori = c("healthy", "primary", "metastasis")
+locs = c("choroid", "ciliary body", "iris")
+muts = c("BAP1", "SF3B1", "EIF1AX")
+
+all_dfs = list(origin = so@meta.data %>% mutate(origin = factor(origin, levels = ori)), 
+               location = so@meta.data %>% filter(location %in% locs) %>% mutate(location = factor(location, levels = locs)),
+               secondary_mutation = so@meta.data %>% filter(secondary_mutation %in% muts) %>% mutate(secondary_mutation = factor(secondary_mutation, levels = muts))) 
+```
+
+
+```{r, eval=FALSE}
+
+
+wilcox = lapply(names(all_dfs), function(x){
+ all_dfs[[x]] %>%
+    pivot_longer(
+      cols = all_of(all_sigs),
+      names_to = "Signatures",
+      values_to = "Values"
+    ) %>%
+    group_by(Signatures) %>%
+    wilcox_test(
+      formula = as.formula(paste("Values ~", x)),
+      p.adjust.method = "BH"
+    ) %>%
+    ungroup() %>%
+        mutate(comparison = x, p.adj.signif_tab = str_replace(p.adj.signif, "\\*", "\\\\*")) %>%  
+ select(-.y.)
+})
+
+names(wilcox) <- names(all_dfs)
+
+
+qs_save(list(DFs = all_dfs, Stats = wilcox), "../20260324_wilcox_rank_sum_sigs.qs2")
+```
+
+
+```{r, results='asis'}
+
+output = qs_read("../20260324_wilcox_rank_sum_sigs.qs2")
+
+wilcox = output$Stats
+all_dfs = output$DFs
+
+for(i in names(wilcox)){
+  
+  cat("##", str_to_title(str_replace(i, "_", " ")), "\n\n")
+  
+  print(
+    kbl(wilcox[[i]] %>% select(-comparison, -p.adj.signif) %>% rename(p.adj.signif = p.adj.signif_tab), escape = TRUE) %>% kable_styling("striped") %>% 
+ scroll_box(width = "900px", height = "800px")
+  )
+
+  cat("\n\n")
+  
+}
+
+
+```
+
+
+# Plots
+## Origin
+
+```{r, fig.width=16, fig.height=6.5}
+
+ori_sigs = c("Pigmentation_Rambow18", "Antigen.Presentation_Pozniak24", "Interferon.Alpha.Beta.Response_Pozniak24")
+
+
+plots = sigsVlnPlotsStats(sigs = ori_sigs, metadata = all_dfs$origin, stats = wilcox$origin, colors = origin_colors)
+
+wrap_plots(plots)
+```
+
+## Primary Location
+
+```{r, fig.width=12, fig.height=6}
+
+loc_sigs = c("Pigmentation_Rambow18", "Proliferative_Verfaillie15")
+
+plots = sigsVlnPlotsStats(sigs = loc_sigs, metadata = all_dfs$location, stats = wilcox$location, colors = location_colors)
+
+wrap_plots(plots)
+```
+
+## Secondary Mutation
+
+```{r, fig.width=8, fig.height=6}
+
+sec_mut_sigs = c("Pigmentation_Rambow18")
+
+plots = sigsVlnPlotsStats(sigs = sec_mut_sigs, metadata = all_dfs$secondary_mutation, 
+                          stats = wilcox$secondary_mutation, colors = second_mutations_col)
+
+wrap_plots(plots)
+```
+
+#### Session Info
+
+```{r sessionInfo}
+
+sessionInfo()
+
+```
+
+

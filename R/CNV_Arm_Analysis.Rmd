@@ -1,0 +1,350 @@
+---
+title: "CNV Arm Analysis"
+author: "Prachi Shukla"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+# By Arm CNV Extraction
+
+```{r libraries, message=FALSE}
+
+library(data.table)
+library(tidyverse)
+library(qs2)
+library(GWASTools)
+library(GenomicRanges)
+```
+
+```{r loading_files}
+
+# infercnv_res_path = "../Data/Derived/inferCNV/"
+# files = dir(infercnv_res_path, pattern = "HMM_CNV_predictions.HMMi6.leiden.hmm_mode-subclusters.Pnorm_0.3.pred_cnv_genes.dat", recursive = TRUE)
+# 
+# genes = lapply(paste0(infercnv_res_path, files), function(x) fread(x) %>% mutate(Sample = gsub(".*/(.*)/.*", "\\1", x)))
+# 
+# names(genes) = sapply(genes, function(x) unique(x$Sample))
+# qs_save(genes, "../Data/Derived/inferCNV_Output/20251024_HMM_gene_CNV_all.qs2")
+
+genes = qs_read("../20251024_HMM_gene_CNV_all.qs2")
+
+data("centromeres.hg38", package = "GWASTools")
+centromeres <- centromeres.hg38 %>%
+  transmute(chr = paste0("chr", chrom), start = left.base, end = right.base) 
+
+
+# chromosomes 13, 14, 15, 21, 22 are acrocentric, so p arms (13p/14p/15p/21p/22p) have essentially no annotated genes in GRCh38
+```
+
+
+
+```{r}
+
+centro_gr <- GRanges(seqnames = centromeres$chr,
+                     ranges = IRanges(start = centromeres$start, end = centromeres$end))
+
+for(i in names(genes)){
+
+genes_gr <- GRanges(seqnames = genes[[i]]$chr,
+                    ranges = IRanges(start = genes[[i]]$start, end = genes[[i]]$end),
+                    gene = genes[[i]]$gene)
+
+# Find overlaps with the centromere region (label "cen")
+hits <- findOverlaps(genes_gr, centro_gr)
+genes[[i]]$arm <- "unassigned"
+genes[[i]]$arm[unique(queryHits(hits))] <- "cen"
+
+# For non-centromeric genes[[i]], use the centromere midpoint as the p/q boundary
+centro_mid <- centromeres %>%
+  mutate(mid = floor((start + end) / 2)) %>%
+  select(chr, mid)
+
+
+ genes[[i]] <- genes[[i]] %>%
+   dplyr::rename(infercnv_subcluster = cell_group_name) %>% 
+  left_join(centro_mid, by = c("chr")) %>%
+  mutate(arm = ifelse(arm == "cen", "cen",
+               ifelse(end <= mid, "p",
+               ifelse(start >= mid, "q", "cen"))),
+         state_cat = case_when(
+           state <= 2 ~ "loss",
+           state >= 4 ~ "gain",
+           state == 3 ~ "neutral",
+         )) %>%
+  select(infercnv_subcluster, gene, chr, arm, state, state_cat)
+}
+
+
+```
+
+
+```{r eval=FALSE}
+
+summary_cnv = list()
+for(i in names(genes)){
+
+  ## ARM summary (p/q only; ignore 'cen')
+  arm_sum <- genes[[i]][arm %in% c("p","q"), .(
+    n_genes    = .N,
+    n_gain     = sum(state_cat == "gain"),
+    n_loss     = sum(state_cat == "loss"),
+    frac_gain  = mean(state_cat == "gain"),
+    frac_loss  = mean(state_cat == "loss"),
+    majority   = c("gain","loss","neutral")[
+                   which.max(c(sum(state_cat == "gain"),
+                               sum(state_cat == "loss"),
+                               sum(state_cat == "neutral")))
+                 ]
+  ), by = .(infercnv_subcluster, chr, arm)][
+    , chrom_arm := paste0(chr, arm)][
+    order(infercnv_subcluster, chr, arm)]
+
+  arm_sum[, strict_call := fifelse(frac_gain >= 0.6, "gain",
+                            fifelse(frac_loss >= 0.6, "loss", "neutral"))]
+
+
+  # wide table of strict calls for p and q
+  calls_wide <- dcast(
+    arm_sum[arm %in% c("p","q")],
+    infercnv_subcluster + chr ~ arm,
+    value.var = "strict_call"
+  )
+
+# counts of genes
+    counts_wide <- dcast(
+    arm_sum[arm %in% c("p","q")],
+    infercnv_subcluster + chr ~ arm,
+    value.var = "n_genes"
+  )
+  setnames(counts_wide, c("p","q"), c("n_genes_p","n_genes_q"))
+
+  both_wide <- merge(calls_wide, counts_wide, by = c("infercnv_subcluster","chr"), all = TRUE)
+
+  # AND rule:
+  # - if p missing (e.g., acrocentric), inherit q; if q missing, inherit p
+  # - gain only if p==gain & q==gain; loss only if p==loss & q==loss; else different
+  both_wide[, both_call := fifelse(is.na(p), q,
+                            fifelse(is.na(q), p,
+                            fifelse(p=="gain" & q=="gain", "gain",
+                            fifelse(p=="loss" & q=="loss", "loss", 
+                            fifelse(p=="neutral" & q=="neutral", "neutral", 
+                                    "different")))))]
+
+  # build "both" rows; fractions aren’t meaningful for AND, set to NA
+  both_sum <- both_wide[, .(
+    infercnv_subcluster,
+    chr,
+    arm        = "both",
+    chrom_arm  = paste0(chr, "both"),
+    n_genes    = rowSums(cbind(n_genes_p, n_genes_q), na.rm = TRUE),
+    n_gain     = NA_integer_,
+    n_loss     = NA_integer_,
+    frac_gain  = NA_real_,
+    frac_loss  = NA_real_,
+    majority   = both_call,
+    strict_call= both_call
+  )]
+
+  ## combine arm + both
+  summary_cnv[[i]] <- rbindlist(list(arm_sum, both_sum), use.names = TRUE, fill = TRUE)
+}
+
+combined = list(
+  Genes = rbindlist(genes, idcol = "Sample"),
+  CNV_Summary = rbindlist(summary_cnv, idcol = "Sample") %>%
+    mutate(infercnv_subcluster = gsub(".*\\.(.*)", "\\1", infercnv_subcluster))
+)
+
+qs_save(combined, "../20251031_by_arm_chr_CNV.qs2")
+
+```
+
+# Analysis
+
+```{r libraries, message=FALSE}
+
+library(ggplot2)
+library(data.table)
+library(tidyverse)
+library(patchwork)
+library(RColorBrewer)
+library(viridisLite)
+library(scales)
+library(qs)
+library(qs2)
+library(Seurat)
+library(SCpubr)
+library(forcats)
+library(grid)
+library(scales)
+
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+
+theme_set(theme_classic())
+
+cnv_type = c("gain" = "#9e002a", "loss" = "#00428c")
+
+bar_label = c("metastasis" = "#ef476f", "primary" = "#26547c", "healthy" = "#06d6a0")
+
+chrom_arm_thresh = 100
+```
+
+
+```{r loading_files}
+
+coi = c("gain" =  "chr6p", "gain" =  "chr8q", "gain" =  "chr1q", "gain" = "chr8both",
+"loss" = "chr1p", "loss" = "chr3both", "loss" = "chr6q", "loss" = "chr8p", "loss" = "chr16q", "loss" = "chr9p")
+
+so = qs::qread("../01_integrated_melanoma_melanocyte_subset.qs")
+
+cnv_arms = qs_read("../20251031_by_arm_chr_CNV.qs2")$CNV_Summary
+
+
+```
+
+
+# Introduction
+The inferCNV results were extracted for each sample and gene locations split by centromere. Chromosomes 13, 14, 15, 21, 22 are acrocentric and have no genes in their p arms. CNV for an arm are called if ≥ 60% of genes are have a certain CNV state. A 'both' suffix means the p and q arm calls concur (both gain or both loss). Chromosome arms with less than `r chrom_arm_thresh` cells are removed.
+
+```{r chromosome_info}
+
+chr_call = cnv_arms %>% select(Sample, infercnv_subcluster, chrom_arm, strict_call) %>% distinct()
+
+# Adding chromosome mutation information
+chr_call = so@meta.data %>% select(Sample, sample_barcode, infercnv_subcluster, seurat_clusters_CNV, origin, Malignant) %>% 
+  merge(., chr_call, by = c("Sample", "infercnv_subcluster"))  %>% arrange(Sample, infercnv_subcluster) 
+
+# Removing healthy cells
+# chr_call_filt = chr_call %>% filter(Malignant == "Malignant")
+
+```
+
+
+```{r removing_lowly_occuring_calls}
+
+cells_by_arm <- chr_call %>% group_by(Sample, origin, infercnv_subcluster, chrom_arm) %>% count(name = "n_cells") %>% filter(n_cells > chrom_arm_thresh) %>% 
+  unite(col = "good_combs", c("Sample", "infercnv_subcluster", "chrom_arm"))
+
+```
+
+
+
+```{r counting}
+# All chromosomes
+# If a sample has a chromosome arm with a loss or a gain as counted above it is counted. If both arms have the same CNV the sample is counted under 'both'. 
+arm_by_sample <- chr_call %>% 
+  unite(col = "good_combs", c("Sample", "infercnv_subcluster", "chrom_arm"), remove = FALSE) %>% 
+  filter(good_combs %in% cells_by_arm$good_combs) %>% 
+  select(Sample, infercnv_subcluster, chrom_arm, strict_call, origin) 
+
+# summarize to one row per Sample x chrom_arm
+arm_by_sample <- arm_by_sample %>%
+  
+  mutate(is_gain = strict_call == "gain",
+         is_loss = strict_call == "loss") %>%
+  group_by(Sample, chrom_arm, origin) %>%
+  summarise(
+    has_gain = any(is_gain, na.rm = TRUE),
+    has_loss = any(is_loss, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    CNV = case_when(
+      has_gain & !has_loss ~ "gain",
+      has_loss & !has_gain ~ "loss",
+      has_gain & has_loss & str_ends(chrom_arm, "both") ~ "different",
+      TRUE                 ~ NA_character_
+    )
+  ) %>% 
+  select(Sample, chrom_arm, CNV, origin) %>% filter(!is.na(CNV)) %>% mutate(chr_id = str_remove(chrom_arm, "(p|q|both)$")) %>%
+  group_by(Sample, chr_id, origin) %>%
+  filter(
+    if (any(str_ends(chrom_arm, "both") & CNV != "different")) {
+      str_ends(chrom_arm, "both")      # keep only 'both'
+    } else {
+      !str_ends(chrom_arm, "both")     # keep p/q (no 'both' or 'both' is "different")
+    }
+  ) %>% ungroup()
+
+```
+
+# Selected Chromosomes
+
+```{r, fig.width=6, fig.height=10}
+
+chr_counts <- arm_by_sample %>%
+  filter(chrom_arm %in% coi) %>%
+  count(name = "Num_Samps", chrom_arm, CNV, origin) %>%
+  mutate(
+    order_ = as.numeric(gsub("^chr(\\d+).*$", "\\1", chrom_arm))
+  )
+
+arms_add <- coi
+
+chr_counts2 <- chr_counts %>%
+  bind_rows(
+    expand_grid(
+      chrom_arm = arms_add,
+      CNV       = unique(chr_counts$CNV),
+      origin    = "healthy"
+    ) %>% mutate(Num_Samps = 0L)
+  ) %>%
+  distinct(chrom_arm, CNV, origin, .keep_all = TRUE) %>%
+  mutate(
+    order_ = as.numeric(gsub("^chr(\\d+).*$", "\\1", chrom_arm)),
+    Num_Samps = if_else(CNV == "loss", -Num_Samps, Num_Samps)
+  )
+
+## 2) Same y-axis scale for all three plots (symmetric around 0 is usually nicest)
+m <- max(abs(chr_counts2$Num_Samps), na.rm = TRUE)
+ylims <- c(-m, m)
+
+base_theme <- theme(
+  axis.text.x = element_text(angle = 45, hjust = 1),
+  panel.spacing.x = unit(0.15, "lines")
+)
+
+p_healthy <- ggplot(chr_counts2 %>% filter(origin == "healthy"),
+  aes(x = fct_reorder(chrom_arm, order_), y = Num_Samps, fill = CNV)
+) +
+  geom_col() +
+  guides(fill = "none") +
+  labs(x = "Chromosome Arm", y = "Instances of CNV", title = "Healthy") +
+  scale_fill_manual(values = cnv_type) +
+  facet_grid(~order_, scales = "free_x", space = "free_x") +
+  coord_cartesian(ylim = ylims) +
+  geom_hline(yintercept = 0, colour = "lightgrey", linewidth = 0.01) +
+  base_theme
+
+p_primary <- ggplot(chr_counts2 %>% filter(origin == "primary"),
+  aes(x = fct_reorder(chrom_arm, order_), y = Num_Samps, fill = CNV)
+) +
+  geom_col() +
+  labs(x = "Chromosome Arm", fill = "CNV Call", y = "Instances of CNV", title = "Primary") +
+  scale_fill_manual(values = cnv_type) +
+  facet_grid(~order_, scales = "free_x", space = "free_x") +
+  coord_cartesian(ylim = ylims) +
+  geom_hline(yintercept = 0, colour = "lightgrey", linewidth = 0.01) +
+  base_theme
+
+p_mets <- ggplot(chr_counts2 %>% filter(origin == "metastasis"),
+  aes(x = fct_reorder(chrom_arm, order_), y = Num_Samps, fill = CNV)
+) +
+  geom_col() +
+  guides(fill = "none") +
+  labs(x = "Chromosome Arm", y = "Instances of CNV", title = "Metastasis") +
+  scale_fill_manual(values = cnv_type) +
+  facet_grid(~order_, scales = "free_x", space = "free_x") +
+  coord_cartesian(ylim = ylims) +
+  geom_hline(yintercept = 0, colour = "lightgrey", linewidth = 0.01) +
+  base_theme
+
+# pdf("UM_chromosome_arm_CNV_analysis.pdf", width = 5, height = 7)
+(p_healthy / p_primary / p_mets) + plot_layout(guides = "collect")
+# dev.off()
+```
+
+
