@@ -174,7 +174,27 @@ All six derived ids resolve to libraries that **are** in the atlas. The exceptio
 
 So the atlas tumours with paired ATAC currently are `mUM02`, `pUM10`, `pUM16`, `pUM23` and `pUM24` in Batch04 (quantified by `o39575_CellRangerARCCount`) and **`pUM09` in Batch03**. Six either way, which is exactly why the wrong six went unnoticed: the count is right, the membership is not. `pUM09` is in and `pUM26` is not yet.
 
-One trap in that ATAC set: `393911_5-pUM123_MU_ATAC_B10` is named for pUM123 but the final ARC run treats it as **pUM124's**. The pairing was corrected across the run series - `2025-09-08--17-11-58` pairs it with `pUM123_MU_ARC_B9_rep2`, the two `2025-09-16--09-*` runs with `pUM123_MU_GEX_B9`, and the last run `2025-09-16--14-05-05` with `395751_45-pUM124_MU_GEX_B10`. Take the last run as operative, but the demux filename still says pUM123 and data-hub inherited that, so check which you mean before joining on it.
+**`pUM123` was paired with the wrong ATAC library, and that is now confirmed and fixed.** Its GEX (`395751_44-pUM123_MU_GEX_B9`) had been run against ATAC **B10** (`393911_5-pUM123_MU_ATAC_B10`); the matching library is **B9** (`393911_4`). The corrected run settles it on the metric that cannot be argued with - ATAC fraction of high-quality fragments in cells went from **0.9 % to 85 %** (0.8473), and the call went to **13,690 cells**.
+
+| | superseded | corrected |
+|---|---|---|
+| ATAC library | `393911_5-..._ATAC_B10` | `393911_4-..._ATAC_B9` |
+| ATAC fragments in cells | 0.9 % | **85 %** |
+| cells called | - | **13,690** |
+| SUSHI dataset | 105294 | **113144** |
+
+Corrected output: [`CellRangerARC_pUM123_rerun_2026-07-01`](https://fgcz-gstore.uzh.ch/projects/p31662/Analyses_Paul/CellRangerARC_pUM123_rerun_2026-07-01/395751_44-pUM123_MU_GEX_B9_ARC_corrected/web_summary.html). So `393911_5-pUM123_MU_ATAC_B10` is **pUM124's** ATAC despite its filename, which is what the last ARC run (`o39575_CellRangerARCCount_2025-09-16--14-05-05`, pUM124 only) already reflected. The demux name and data-hub's `matched_group` both still say pUM123.
+
+Where each UM multiome ARC output lives:
+
+| samples | ARC run |
+|---|---|
+| `pUM9_S`, `pUM9_P` | `o37524_CellRangerARCCount_2025-02-19--16-15-24` |
+| `mUM102`, `pUM110`, `pUM116` | `o39575_CellRangerARCCount_2025-09-16--09-40-52` |
+| `pUM124` | `o39575_CellRangerARCCount_2025-09-16--14-05-05` |
+| `pUM123` **(corrected)** | `Analyses_Paul/CellRangerARC_pUM123_rerun_2026-07-01`, SUSHI 113144 |
+
+The rest of the cohort is unaffected by the pUM123 fix. Note SUSHI 105294 holds five samples (`mUM102`, `pUM110`, `pUM116`, `pUM123`, `pUM124`) and does **not** include `pUM9_S`/`pUM9_P`, which come from the separate o37524 run.
 
 **The atlas uses the GEX-only CellRanger + CellBender quantification of `pUM26`**, not the CellRangerMulti one. The GEX library was put through the plain route as SUSHI 114121 -> 114122 (CellRanger 9.0.0) -> 114184 (CellBender) -> **114187**, and the atlas's `nCount_RNA` *and* `nFeature_RNA` match `o41361_ScSeurat_2026-08-07--06-16-30` (114187) exactly, per barcode, for all 16,717 cells. The CellRangerMulti route matches 98.89 % of the barcodes but **0 %** of the counts.
 
