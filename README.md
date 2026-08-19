@@ -149,9 +149,19 @@ Entries marked *(deleted from gStore)* were removed after the atlas was built. T
 
 **Batch03 disagrees with the lab's August-2026 sample sheet.** That sheet records `o37319_CellBender_2025-09-23--10-10-42` -> `o37319_ScSeurat_2025-09-23--19-05-07` for Batch03. The delivered object does not agree: all 11 Batch03 libraries match the **January** run above at 100 % per barcode, and the September CellBender run at 0.8-24 %, with full barcode overlap in both. Batch03 *was* reprocessed with CellBender in September 2025; the atlas merged the January objects. Worth confirming which was intended.
 
-`pUM26` (16,717 cells) is the one library with no identifiable FGCZ parent. Its counts are ambient-corrected - they match our CellBender output for `413611_17-pUM26_GEX_A7` exactly, per barcode - but only via ScSeurat runs from **August 2026**, which postdate the atlas. No run that existed when the atlas was built reproduces them, and the o41361 CellRangerMulti output from 2026-07-01 matches 98.9 % of its barcodes with 0 % of its counts. So pUM26 went through CellBender somewhere outside these runs. It is also the only library in the atlas with no doublet score.
+### `pUM26`
 
-  Checked and ruled out for pUM26: the CellRangerMulti route (SUSHI dataset 110519, `pUM26` GEX+TCR, `o41361_CellRangerMulti_2026-03-31--12-53-03`) and the `o41361_ScMultiOmics_2026-07-01--16-59-13` run built on top of it. Both carry 98.9 % of pUM26's atlas barcodes but **0 %** of its counts, so the atlas values are not the CellRangerMulti values.
+`pUM26` (16,717 cells) is the one library whose atlas quantification did not come from the FGCZ run tree, and it needs its own paragraph because two different datasets cover it and a similarly named sample sits next to it.
+
+**`pUM26` is a GEX + TCR sample, not multiome.** SUSHI dataset 110519 (`o41361_GEX_TCR`) declares four libraries, each with a GEX and a matching TCR library: `pUM26` (primary eye tumour, `413611_17-pUM26_GEX_A7` + `413611_29-pUM26_TCR_B2`), `pUM26_LN1` (non-malignant liver), and `pUM26_LT1_dark` / `pUM26_LT1_white` (pigment-sorted liver metastasis). No ATAC. It was processed with the CellRangerMulti app because that is the app for GEX+VDJ, which is easy to misread as multiome. **Only the primary library `pUM26` is in the atlas**; LN1 and LT1 are not.
+
+**The multiome sample of the same patient is `pUM126`**, whose GEX half is the `pUM126_MU` library in the March and April runs. `_MU` is this project's marker for multiome (compare `pUM9_S_MU`, `pUM110_MU`, `pUM116_MU`, `pUM123_MU`, `mUM102_MU` in the ARC/ATAC datasets). `pUM126_MU` shares only **0.01 %** of its barcodes with the atlas's `pUM26`, so the two must never be conflated.
+
+**The atlas uses the GEX-only CellRanger + CellBender quantification of `pUM26`**, not the CellRangerMulti one. The GEX library was put through the plain route as SUSHI 114121 -> 114122 (CellRanger 9.0.0) -> 114184 (CellBender) -> **114187**, and the atlas's `nCount_RNA` *and* `nFeature_RNA` match `o41361_ScSeurat_2026-08-07--06-16-30` (114187) exactly, per barcode, for all 16,717 cells. The CellRangerMulti route matches 98.89 % of the barcodes but **0 %** of the counts.
+
+Same cells either way: the Multi route's 19,820 barcodes are a complete subset of the GEX route's 25,293, so the two differ in cell calling and quantification, not in which GEMs were sequenced.
+
+One caveat for reproducibility: FGCZ first ran that GEX-only chain on **2026-08-06**, after the atlas object (2026-07-28) and its metadata dump (2026-07-31). The quantification in the object was therefore produced outside this run tree, and 114187 reproduces it bit-for-bit because the chain is deterministic. Cite 114187 for pUM26. It is also the only library in the atlas with no doublet score, consistent with never passing an ezRun QC step.
 
 ### Per library
 
