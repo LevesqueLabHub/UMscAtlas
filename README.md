@@ -155,7 +155,17 @@ Entries marked *(deleted from gStore)* were removed after the atlas was built. T
 
 **`pUM26` is a GEX + TCR sample, not multiome.** SUSHI dataset 110519 (`o41361_GEX_TCR`) declares four libraries, each with a GEX and a matching TCR library: `pUM26` (primary eye tumour, `413611_17-pUM26_GEX_A7` + `413611_29-pUM26_TCR_B2`), `pUM26_LN1` (non-malignant liver), and `pUM26_LT1_dark` / `pUM26_LT1_white` (pigment-sorted liver metastasis). No ATAC. It was processed with the CellRangerMulti app because that is the app for GEX+VDJ, which is easy to misread as multiome. **Only the primary library `pUM26` is in the atlas**; LN1 and LT1 are not.
 
-**The multiome sample of the same TUMOUR is `pUM126`**, whose GEX half is the `pUM126_MU` library in the March and April runs. `_MU` is this project's marker for multiome (compare `pUM9_S_MU`, `pUM110_MU`, `pUM116_MU`, `pUM123_MU`, `mUM102_MU` in the ARC/ATAC datasets). `pUM126_MU` shares only **0.01 %** of its barcodes with the atlas's `pUM26`, so the two must never be conflated.
+**The multiome sample of the same TUMOUR is `pUM126`**, whose GEX half is the `pUM126_MU` library in the March and April runs. `pUM126_MU` shares only **0.01 %** of its barcodes with the atlas's `pUM26`, so the two must never be conflated - a separate 10x reaction on the same tumour.
+
+**Naming rule, worth knowing generally: a multiome sample's id is the scRNA-seq id with a `1` inserted** before the two-digit number, and `_MU` marks the library. So `1xx` maps back to `xx`:
+
+| multiome | scRNA-seq | in the atlas | | multiome | scRNA-seq | in the atlas |
+|---|---|---|---|---|---|---|
+| `pUM110` | `pUM10` | Batch04 | | `pUM124` | `pUM24` | Batch04 |
+| `pUM116` | `pUM16` | Batch04 | | `pUM126` | `pUM26` | Batch05 |
+| `pUM123` | `pUM23` | Batch04 | | `mUM102` | `mUM02` | Batch04 |
+
+All six derived ids resolve to libraries that **are** in the atlas, so those are the six atlas tumours with paired ATAC. The exception is `pUM9`, whose multiome kept the same number with a `_MU` suffix (`pUM9_S_MU`, `pUM9_P_MU`) instead of becoming `pUM109`; the atlas pads that id to `pUM09`. The pairings are queryable in [`data-hub`](https://github.com/LevesqueLabHub/data-hub) via `matched_group`.
 
 **The atlas uses the GEX-only CellRanger + CellBender quantification of `pUM26`**, not the CellRangerMulti one. The GEX library was put through the plain route as SUSHI 114121 -> 114122 (CellRanger 9.0.0) -> 114184 (CellBender) -> **114187**, and the atlas's `nCount_RNA` *and* `nFeature_RNA` match `o41361_ScSeurat_2026-08-07--06-16-30` (114187) exactly, per barcode, for all 16,717 cells. The CellRangerMulti route matches 98.89 % of the barcodes but **0 %** of the counts.
 
