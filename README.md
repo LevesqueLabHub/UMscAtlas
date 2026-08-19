@@ -1,6 +1,14 @@
 # UMscAtlas
 Analysis of healthy, primary, and metastatic uveal melanoma using scRNA-seq and Xenium spatial transcriptomics. This repository includes workflows for preprocessing, integration, cell-type annotation, and characterization of malignant and TME states.
 
+**Sample inventory lives in [`LevesqueLabHub/data-hub`](https://github.com/LevesqueLabHub/data-hub).**
+That repo is the source of truth for per-library metadata across all of the lab's FGCZ projects: one
+row per sequencing library, with patient, organ, tissue, mutation, modality, gStore path, and - for
+p31662 - the `batch` (Batch01-05) and `in_atlas` columns. Use it rather than re-deriving sample lists
+here. `metadata/UM_Atlas_allSamples_August2026.xlsx` in this repo is the lab's own 63-library
+provenance sheet for the atlas specifically (order, library, samplename, CellRanger + version,
+CellBender, ScSeurat URLs).
+
 ## Metadata variables documentation
 
 | Metadata variable | Name in figure | Explanation |
@@ -71,6 +79,8 @@ Which FGCZ gStore dataset each library's **counts** came from. Established by ma
 
 Paths are kept in full and per batch on purpose. Each batch went through a different cell-QC and ambient-removal history, and collapsing them into one path would erase exactly that.
 
+Cross-checked against `metadata/UM_Atlas_allSamples_August2026.xlsx`, the lab's own provenance sheet; the two agree except where noted below. The wider per-library inventory across all of the lab's FGCZ projects is in [`LevesqueLabHub/data-hub`](https://github.com/LevesqueLabHub/data-hub).
+
 ### Batches and cohorts
 
 One batch = one B-Fabric sequencing order.
@@ -105,6 +115,8 @@ Cohort 2 is often described as "the cohort with the healthy samples", which is o
 **Batch03 disagrees with the lab's August-2026 sample sheet.** That sheet records `o37319_CellBender_2025-09-23--10-10-42` -> `o37319_ScSeurat_2025-09-23--19-05-07` for Batch03. The delivered object does not agree: all 11 Batch03 libraries match the **January** run above at 100 % per barcode, and the September CellBender run at 0.8-24 %, with full barcode overlap in both. Batch03 *was* reprocessed with CellBender in September 2025; the atlas merged the January objects. Worth confirming which was intended.
 
 `pUM26` (16,717 cells) is the one library with no identifiable FGCZ parent. Its counts are ambient-corrected - they match our CellBender output for `413611_17-pUM26_GEX_A7` exactly, per barcode - but only via ScSeurat runs from **August 2026**, which postdate the atlas. No run that existed when the atlas was built reproduces them, and the o41361 CellRangerMulti output from 2026-07-01 matches 98.9 % of its barcodes with 0 % of its counts. So pUM26 went through CellBender somewhere outside these runs. It is also the only library in the atlas with no doublet score.
+
+  Checked and ruled out for pUM26: the CellRangerMulti route (SUSHI dataset 110519, `pUM26` GEX+TCR, `o41361_CellRangerMulti_2026-03-31--12-53-03`) and the `o41361_ScMultiOmics_2026-07-01--16-59-13` run built on top of it. Both carry 98.9 % of pUM26's atlas barcodes but **0 %** of its counts, so the atlas values are not the CellRangerMulti values.
 
 ### Per library
 
