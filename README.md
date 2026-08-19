@@ -73,6 +73,39 @@ graph TD
   C --> D[<b>Melanoma Subset</b><br/>01_integrated_melanoma_subset.qs<br/>*harmony corrected*]
 ```
 
+## Reference genome and annotation
+
+**Pinned in [`R/genome_annotation.R`](R/genome_annotation.R).** `source()` it in any script that
+filters, renames or joins genes.
+
+```
+Homo_sapiens/GENCODE/GRCh38.p13/Annotation/Release_42-2023-01-30
+```
+
+GENCODE 42 / Ensembl 108, 62,684 genes. Audited 2026-08-19 by reading `refBuild` from the
+`parameters.tsv` / `dataset.tsv` of every CellRanger, CellBender, ScSeurat and ScMultiOmics run in
+FGCZ projects `p31662` and `p28409`: **all three stages of all five batches' parent chains agree**, so
+genome build and annotation are not a batch or cohort difference. The 2022 runs on Release 37 exist but
+do not reach the atlas, because Batch01's cells come from the 2025 `o39760` re-alignment.
+
+Two things the pin exists to catch:
+
+- **The chromatin modalities are on a different build.**
+  `o39391_CellRangerATACCount_2025-08-26` and `o39575_CellRangerARCCount_2025-09-16` used
+  `GRCh38.p14 / Release_48-2025-07-03`, while `o37268_CellRangerATACCount_2025-01-07` used the atlas
+  build. Release 42 -> 48 changes the gene set and some symbols, so any ATAC or multiome join to the
+  atlas must be checked for alias drift rather than assumed to line up.
+- **Annotation packages are not part of `refBuild` but do move results.** `org.Hs.eg.db` **3.21.0** was
+  used for every GO/KEGG mapping (`Augur.R`, `Milo.R`, `CytoTRACE2.Rmd`,
+  `DEA_degPatterns_GO_KEGG_of_location.R`). `check_annotation_packages()` warns when the installed
+  version differs. `GWASTools` (`centromeres.hg38` in `CNV_Arm_Analysis.Rmd`) is not installed in the
+  FGCZ library, so its version is deliberately not asserted - add it when that Rmd is next run.
+
+`check_features_against_reference(object)` verifies a Seurat object's features against the reference and
+stops if fewer than 95 % are found, which is what a build mismatch looks like. FGCZ-only, since it reads
+`/srv/GT/reference`. Verified to pass on real Release 42 symbols and to block on both fake symbols and
+an object with no rownames.
+
 ## Input datasets used for each sample
 
 Which FGCZ gStore dataset each library's **counts** came from. Established by matching every cell's `nCount_RNA` per barcode against every candidate FGCZ run, so this is the measured parent of the merged object, not the most recent run of that order. Links are LDAP-protected (B-Fabric login).
