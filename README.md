@@ -1,7 +1,7 @@
 # UMscAtlas
 Analysis of healthy, primary, and metastatic uveal melanoma using scRNA-seq and Xenium spatial transcriptomics. This repository includes workflows for preprocessing, integration, cell-type annotation, and characterization of malignant and TME states.
 
-**Sample inventory lives in [`LevesqueLabHub/data-hub`](https://github.com/LevesqueLabHub/data-hub).**
+**Sample inventory lives in [`LevesqueLabHub/data-hub`](https://github.com/LevesqueLabHub/data-hub) (private, lab members only).**
 That repo is the source of truth for per-library metadata across all of the lab's FGCZ projects: one
 row per sequencing library, with patient, organ, tissue, mutation, modality, gStore path, and - for
 p31662 - the `batch` (Batch01-05) and `in_atlas` columns. Use it rather than re-deriving sample lists
@@ -112,7 +112,7 @@ Which FGCZ gStore dataset each library's **counts** came from. Established by ma
 
 Paths are kept in full and per batch on purpose. Each batch went through a different cell-QC and ambient-removal history, and collapsing them into one path would erase exactly that.
 
-Cross-checked against `metadata/UM_Atlas_allSamples_August2026.xlsx`, the lab's own provenance sheet; the two agree except where noted below. The wider per-library inventory across all of the lab's FGCZ projects is in [`LevesqueLabHub/data-hub`](https://github.com/LevesqueLabHub/data-hub).
+Cross-checked against `metadata/UM_Atlas_allSamples_August2026.xlsx`, the lab's own provenance sheet; the two agree except where noted below. One further disagreement, in the sample names rather than the chain: the sheet swaps `mUM13_1` and `mUM13_2`. Measured from the delivered object, `o28554_1_13-FNA_liv_bl_GEX_F9` is `mUM13_2` and `o28554_1_14-CNA_liv_bl_GEX_F10` is `mUM13_1`; the sheet also writes `mUM08_01` where the object has `mUM08_1`. This table follows the object. The wider per-library inventory across all of the lab's FGCZ projects is in [`LevesqueLabHub/data-hub`](https://github.com/LevesqueLabHub/data-hub) (private, lab members only).
 
 ### Batches and cohorts
 
@@ -141,9 +141,12 @@ Cohort 2 is often described as "the cohort with the healthy samples", which is o
 | Batch02 | 1 | o34170 | 4 | [`o34170_ScSeurat_2025-09-21--15-55-39`](https://fgcz-gstore.uzh.ch/projects/p31662/o34170_ScSeurat_2025-09-21--15-55-39/) | [`o34170_CellBender_2025-09-20--20-49-40`](https://fgcz-gstore.uzh.ch/projects/p31662/o34170_CellBender_2025-09-20--20-49-40/) | [`o34170_CellRangerMulti_2025-09-19--18-19-58`](https://fgcz-gstore.uzh.ch/projects/p31662/o34170_CellRangerMulti_2025-09-19--18-19-58/) | 9.0.0 |
 | Batch03 | 1 | o37319 | 11 | [`o37319_ScSeurat_2025-01-22--11-24-05`](https://fgcz-gstore.uzh.ch/projects/p31662/o37319_ScSeurat_2025-01-22--11-24-05/) | - | [`o37319_CellRangerCount_2025-01-14--10-38-08`](https://fgcz-gstore.uzh.ch/projects/p31662/o37319_CellRangerCount_2025-01-14--10-38-08/) | 9.0.0 |
 | Batch04 | 1 | o39575 | 32 | [`o39575_ScSeurat_2025-09-23--17-36-32`](https://fgcz-gstore.uzh.ch/projects/p31662/o39575_ScSeurat_2025-09-23--17-36-32/) | [`o39575_CellBender_2025-09-19--18-08-01`](https://fgcz-gstore.uzh.ch/projects/p31662/o39575_CellBender_2025-09-19--18-08-01/) | [`o39575_CellRangerCount_2025-09-16--09-43-07`](https://fgcz-gstore.uzh.ch/projects/p31662/o39575_CellRangerCount_2025-09-16--09-43-07/) | 9.0.0 |
-| Batch05 | 2 | o41361 | 11 | [`o41361_ScSeurat_2026-04-28--16-11-43`](https://fgcz-gstore.uzh.ch/projects/p31662/o41361_ScSeurat_2026-04-28--16-11-43/) | [`o41361_CellBender_2026-04-28--10-23-46`](https://fgcz-gstore.uzh.ch/projects/p31662/o41361_CellBender_2026-04-28--10-23-46/) | `o41361_CellRangerCount_2026-03-28--07-10-14` *(deleted from gStore)* | 8.0.1 |
+| Batch05 | 2 | o41361 | 11 | [`o41361_ScSeurat_2026-04-28--16-11-43`](https://fgcz-gstore.uzh.ch/projects/p31662/o41361_ScSeurat_2026-04-28--16-11-43/) | [`o41361_CellBender_2026-04-28--10-23-46`](https://fgcz-gstore.uzh.ch/projects/p31662/o41361_CellBender_2026-04-28--10-23-46/) | `o41361_CellRangerCount_2026-03-28--07-10-14` *(in gStore trash, `/srv/gstore/projects/trash/20260819`)* | 8.0.1 |
+| Batch05 | 2 | o41361 | 1 | [`o41361_ScSeurat_2026-08-07--06-16-30`](https://fgcz-gstore.uzh.ch/projects/p31662/o41361_ScSeurat_2026-08-07--06-16-30/) | [`o41361_CellBender_2026-08-06--15-59-30`](https://fgcz-gstore.uzh.ch/projects/p31662/o41361_CellBender_2026-08-06--15-59-30/) | [`o41361_CellRangerCount_2026-08-05--16-43-18`](https://fgcz-gstore.uzh.ch/projects/p31662/o41361_CellRangerCount_2026-08-05--16-43-18/) | 9.0.0 |
 
-Entries marked *(deleted from gStore)* were removed after the atlas was built. The atlas counts remain reproducible from the surviving downstream dataset in the same row, but the alignment step itself is no longer on disk - retrieve it by SUSHI dataset id if it is needed again.
+Entries marked *(in gStore trash)* were removed from the project tree after the atlas was built but are still on disk, complete, under the dated trash path shown. gStore purges that tree on a retention timer, so copy anything you need out rather than relying on the path.
+
+Batch05's alignment is the one such entry. It ran **CellRanger 8.0.1**, read directly from the recovered run's own `parameters.tsv`, which makes it the only atlas batch not aligned with 9.0.0. That difference does not reach the counts: `o41361_CellRangerCount_2026-08-05--16-43-18` and `o41361_CellRangerCount_2026-08-06--07-30-05` (both CellRanger 9.0.0) reproduce the 8.0.1 run's **raw** count matrices byte for byte - same dimensions, same entry count, identical `barcodes.tsv.gz`, with only the `software_version` header comment differing (checked on hCB56, hCh28 and hIr51). The *filtered* matrices do differ, because cell calling changed between CellRanger 8 and 9, but CellBender re-calls cells from the raw matrix, so nothing downstream of it moves. Either run can be cited for the Batch05 alignment.
 
 **Batch03 is the only batch whose counts did not pass through CellBender.** Ambient RNA is mitochondria-enriched, so its cells carry a higher mitochondrial fraction than the other four batches for a purely technical reason.
 
@@ -151,7 +154,7 @@ Entries marked *(deleted from gStore)* were removed after the atlas was built. T
 
 ### `pUM26`
 
-`pUM26` (16,717 cells) is the one library whose atlas quantification did not come from the FGCZ run tree, and it needs its own paragraph because two different datasets cover it and a similarly named sample sits next to it.
+`pUM26` (16,717 cells) is the one library that came through a different chain from the rest of its batch, and it needs its own paragraph because two different datasets cover it and a similarly named sample sits next to it.
 
 **`pUM26` is a GEX + TCR sample, not multiome.** SUSHI dataset 110519 (`o41361_GEX_TCR`) declares four libraries, each with a GEX and a matching TCR library: `pUM26` (primary eye tumour, `413611_17-pUM26_GEX_A7` + `413611_29-pUM26_TCR_B2`), `pUM26_LN1` (non-malignant liver), and `pUM26_LT1_dark` / `pUM26_LT1_white` (pigment-sorted liver metastasis). No ATAC. It was processed with the CellRangerMulti app because that is the app for GEX+VDJ, which is easy to misread as multiome. **Only the primary library `pUM26` is in the atlas**; LN1 and LT1 are not.
 
@@ -165,13 +168,19 @@ Entries marked *(deleted from gStore)* were removed after the atlas was built. T
 | `pUM116` | `pUM16` | Batch04 | | `pUM126` | `pUM26` | Batch05 |
 | `pUM123` | `pUM23` | Batch04 | | `mUM102` | `mUM02` | Batch04 |
 
-All six derived ids resolve to libraries that **are** in the atlas, so those are the six atlas tumours with paired ATAC. The exception is `pUM9`, whose multiome kept the same number with a `_MU` suffix (`pUM9_S_MU`, `pUM9_P_MU`) instead of becoming `pUM109`; the atlas pads that id to `pUM09`. The pairings are queryable in [`data-hub`](https://github.com/LevesqueLabHub/data-hub) via `matched_group`.
+All six derived ids resolve to libraries that **are** in the atlas. The exception to the rule is `pUM9`, whose multiome kept the same number with a `_MU` suffix (`pUM9_S_MU`, `pUM9_P_MU`) instead of becoming `pUM109`; the atlas pads that id to `pUM09` while data-hub writes `pUM9`, so a join on that id silently misses. The pairings are queryable in [`data-hub`](https://github.com/LevesqueLabHub/data-hub) via `matched_group`.
+
+**A paired multiome GEX library is not the same thing as paired ATAC.** `pUM126_MU` was sequenced GEX-only - there is no `pUM126` ATAC library anywhere in p31662 - so **`pUM26` has no paired ATAC**. The atlas tumours that do are `mUM02`, `pUM10`, `pUM16`, `pUM23` and `pUM24` in Batch04 (ATAC from o39391, quantified by `o39575_CellRangerARCCount`), and **`pUM09` in Batch03** (`372681_1/2-pUM9_ATAC_{S,P}` from o37268). Six tumours, but not the six the naming rule alone suggests.
+
+One trap in that ATAC set: `393911_5-pUM123_MU_ATAC_B10` is **pUM124's** ATAC, not pUM123's. The demux name is wrong; the pairing is proved by `o39575_CellRangerARCCount_2025-09-16--14-05-05/input_dataset.tsv`, which pairs it with `395751_45-pUM124_MU_GEX_B10`. data-hub inherited the wrong `matched_group` from the filename.
 
 **The atlas uses the GEX-only CellRanger + CellBender quantification of `pUM26`**, not the CellRangerMulti one. The GEX library was put through the plain route as SUSHI 114121 -> 114122 (CellRanger 9.0.0) -> 114184 (CellBender) -> **114187**, and the atlas's `nCount_RNA` *and* `nFeature_RNA` match `o41361_ScSeurat_2026-08-07--06-16-30` (114187) exactly, per barcode, for all 16,717 cells. The CellRangerMulti route matches 98.89 % of the barcodes but **0 %** of the counts.
 
 Same cells either way: the Multi route's 19,820 barcodes are a complete subset of the GEX route's 25,293, so the two differ in cell calling and quantification, not in which GEMs were sequenced.
 
-One caveat for reproducibility: FGCZ first ran that GEX-only chain on **2026-08-06**, after the atlas object (2026-07-28) and its metadata dump (2026-07-31). The quantification in the object was therefore produced outside this run tree, and 114187 reproduces it bit-for-bit because the chain is deterministic. Cite 114187 for pUM26. It is also the only library in the atlas with no doublet score, consistent with never passing an ezRun QC step.
+One caveat for reproducibility: FGCZ first ran that GEX-only chain on **2026-08-05** (`o41361_CellRangerCount_2026-08-05--16-43-18` -> `o41361_CellBender_2026-08-06--15-59-30` -> `o41361_ScSeurat_2026-08-07--06-16-30`), after the atlas object (2026-07-28) and its metadata dump (2026-07-31). The quantification in the object was therefore produced outside this run tree, and 114187 reproduces it bit-for-bit because the chain is deterministic. Cite 114187 for pUM26. It is also the only library in the atlas with no doublet score, consistent with never passing an ezRun QC step.
+
+`pUM26` does **not** pool its four `o41361` libraries: it is the single primary GEX library, 16,717 cells, with no duplicate barcodes. What is true is that 10,416 of those 16,717 rows carry `cellBarcode = NA` in the metadata dump, so the barcode has to be recovered from the `cell` column instead. Joining on `cellBarcode` alone drops most of the library and looks exactly like a provenance mismatch.
 
 ### Per library
 
@@ -236,7 +245,7 @@ One caveat for reproducibility: FGCZ first ran that GEX-only chain on **2026-08-
 | Batch05 | 2 | `hIr51` | hIr51 | hIr51 | 1,791 | [`o41361_ScSeurat_2026-04-28--16-11-43`](https://fgcz-gstore.uzh.ch/projects/p31662/o41361_ScSeurat_2026-04-28--16-11-43/hIr51_SCReport/) |
 | Batch05 | 2 | `hIr52` | hIr52 | hIr52 | 11,985 | [`o41361_ScSeurat_2026-04-28--16-11-43`](https://fgcz-gstore.uzh.ch/projects/p31662/o41361_ScSeurat_2026-04-28--16-11-43/hIr52_SCReport/) |
 | Batch05 | 2 | `hIr53` | hIr53 | hIr53 | 7,035 | [`o41361_ScSeurat_2026-04-28--16-11-43`](https://fgcz-gstore.uzh.ch/projects/p31662/o41361_ScSeurat_2026-04-28--16-11-43/hIr53_SCReport/) |
-| Batch05 | 2 | `pUM26` | pUM26 | pUM26 | 16,717 | **CellBender, parent run not identified** - see note |
+| Batch05 | 2 | `pUM26` | pUM26 | pUM26 | 16,717 | [`o41361_ScSeurat_2026-08-07--06-16-30`](https://fgcz-gstore.uzh.ch/projects/p31662/o41361_ScSeurat_2026-08-07--06-16-30/pUM26_SCReport/) *(post-atlas, see note)* |
 | Batch05 | 2 | `pUM27` | pUM27 | pUM27 | 3,260 | [`o41361_ScSeurat_2026-04-28--16-11-43`](https://fgcz-gstore.uzh.ch/projects/p31662/o41361_ScSeurat_2026-04-28--16-11-43/pUM27_SCReport/) |
 | Batch05 | 2 | `pUM29` | pUM29 | pUM29 | 3,378 | [`o41361_ScSeurat_2026-04-28--16-11-43`](https://fgcz-gstore.uzh.ch/projects/p31662/o41361_ScSeurat_2026-04-28--16-11-43/pUM29_SCReport/) |
 | Batch05 | 2 | `pUM32` | pUM32 | pUM32 | 835 | [`o41361_ScSeurat_2026-04-28--16-11-43`](https://fgcz-gstore.uzh.ch/projects/p31662/o41361_ScSeurat_2026-04-28--16-11-43/pUM32_SCReport/) |
