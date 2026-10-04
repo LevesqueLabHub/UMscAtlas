@@ -32,7 +32,7 @@ in the Boston Sullivan Xenium cohort from the p36005 Uveal Melanoma project.
 
 **Data Sources:**
 - CytoTRACE2 scores: p31662 (UM Atlas) - 14_Xenium_Stemness_Validation.Rmd
-- CNV scores: p36005 (Egle's project) - 06_InSituCNV_Analysis.Rmd
+- CNV scores: 06_InSituCNV_Analysis.Rmd
 
 ```{r setup, warning=FALSE, message=FALSE}
 knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 14, fig.height = 10)
