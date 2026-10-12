@@ -1,0 +1,545 @@
+---
+title: "UM Atlas - mc-ASTRA multicellular factors (October 2026 object)"
+output:
+  html_document:
+    self_contained: true
+    includes:
+      in_header: !expr system.file("templates/fgcz_header.html", package = "ezRun", lib.loc = .libPaths())
+    css: !expr system.file("templates/fgcz.css", package = "ezRun", lib.loc = .libPaths())
+    code_folding: hide
+editor_options:
+  chunk_output_type: console
+---
+
+```{r c_setup, include=FALSE}
+# Display chunks show no code; the full analysis code is reprinted, folded, in the
+# Methods tab (ref.label on every chunk whose label starts with "c_").
+# The report only READS the outputs of ../mc_astra_2026b/
+# (01_pseudobulk.R -> 02_mofacell.py -> 03/04 stability -> 05_network.py); it does not refit.
+# Publication figures: every chunk figure is also written as a vector PDF (and a 300 dpi PNG)
+# to Figures_2026b/mcASTRA/, named after its chunk, for the figure bundle.
+knitr::opts_chunk$set(dev = c("png", "cairo_pdf"), dpi = 300, fig.path = "../Figures_2026b/mcASTRA/")
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE, comment = "",
+                      fig.width = 10, fig.height = 7)
+
+library(tidyverse)
+library(patchwork)
+library(ggrepel)
+library(ggsignif)
+library(igraph)
+library(ggraph)
+
+# Victoria's palette (relative: knitr runs in the Rmd's own directory).
+source("config_colors_2026b.R")
+
+D <- "../mc_astra_2026b"
+D_JUL <- "../mc_astra"
+FACTORS <- paste0("Factor", 1:6)
+
+fmt_p <- function(p) ifelse(is.na(p), "NA", ifelse(p < 1e-4, sprintf("%.1e", p), sprintf("%.2g", p)))
+stars <- function(p) ifelse(is.na(p), "", ifelse(p < 0.001, "***", ifelse(p < 0.01, "**", ifelse(p < 0.05, "*", "ns"))))
+signif_label <- function(p) sprintf("%s  p = %s", stars(p), fmt_p(p))
+short_name <- function(x) sub("_GEX.*$", "", sub("^\\d+_\\d+-", "", x))
+batch_shapes <- c(Batch01 = 15, Batch02 = 17, Batch03 = 16, Batch04 = 18, Batch05 = 25)
+theme_rep <- theme_bw(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"), panel.grid.minor = element_blank(),
+        strip.background = element_rect(fill = "grey95"))
+```
+
+```{r c_load, include=FALSE}
+samples_all <- read_csv(file.path(D, "pb/samples.csv"), show_col_types = FALSE)
+# na.strings: pandas writes the out-of-scope covariates as empty fields, which read.csv would
+# otherwise keep as "" (a fake group in every scoped test).
+fs <- read.csv(file.path(D, "out/factor_scores.csv"), row.names = 1, check.names = FALSE,
+               na.strings = c("", "NA")) |>
+  tibble::rownames_to_column("Sample_id") |>
+  mutate(origin = factor(origin, levels = c("non-malignant", "primary", "metastasis")),
+         batch = factor(batch, levels = names(batch_shapes)))
+stopifnot("origin levels changed" = !anyNA(fs$origin), nrow(fs) > 30,
+          "scoped covariates must be NA outside their scope" =
+            all(is.na(fs$smut_pUM[fs$origin != "primary"])) && all(is.na(fs$location_nonmal[fs$origin != "non-malignant"])))
+padj <- read.csv(file.path(D, "out/factor_covariate_padj.csv"), row.names = 1, check.names = FALSE)
+ve <- read.csv(file.path(D, "out/variance_explained.csv"), row.names = 1, check.names = FALSE)
+views <- read.csv(file.path(D, "out/views_kept.csv"), row.names = 1, check.names = FALSE)
+views_jul <- read.csv(file.path(D_JUL, "out/views_kept.csv"), row.names = 1, check.names = FALSE)
+stab <- read_csv(file.path(D, "stability_summary.csv"), show_col_types = FALSE)
+jul <- read.csv(file.path(D_JUL, "out/factor_scores.csv"), row.names = 1, check.names = FALSE) |>
+  tibble::rownames_to_column("Sample_id") |>
+  mutate(short_name = short_name(Sample_id))
+
+# The origin axis = the factor with the lowest origin padj among those NOT associated with
+# batch (padj >= 0.05). Chosen after the reference fit and written to out/axis_factor.txt
+# for 04/05; the report re-derives it and stops if the two disagree.
+AXIS <- readLines(file.path(D, "out/axis_factor.txt"))
+cand <- rownames(padj)[padj$batch >= 0.05]
+stopifnot("axis_factor.txt is not the batch-free factor with the strongest origin association" =
+            AXIS == cand[which.min(padj[cand, "origin"])])
+
+n_kept <- nrow(fs)
+n_total <- nrow(samples_all)
+dropped <- samples_all |> dplyr::filter(!Sample %in% fs$Sample_id)
+n_pat_kept <- n_distinct(fs$Patient_nr)
+n_multi_lib <- sum(table(fs$Patient_nr) > 1)
+n_by_origin <- table(fs$origin)
+# Batch entanglement in the full 63-sample cohort (not only the kept samples).
+sa_prim <- dplyr::filter(samples_all, origin == "primary")
+ent <- list(met = sum(samples_all$origin == "metastasis"),
+            met_b04 = sum(samples_all$origin == "metastasis" & samples_all$Condition == "Batch04"),
+            iris = sum(sa_prim$primary_location == "iris", na.rm = TRUE),
+            iris_b03 = sum(sa_prim$primary_location == "iris" & sa_prim$Condition == "Batch03", na.rm = TRUE),
+            cb = sum(sa_prim$primary_location == "ciliary body", na.rm = TRUE),
+            cb_b03 = sum(sa_prim$primary_location == "ciliary body" & sa_prim$Condition == "Batch03", na.rm = TRUE))
+
+# Which end of the axis is metastasis?
+axis_means <- tapply(fs[[AXIS]], fs$origin, mean)
+met_sign <- sign(axis_means[["metastasis"]] - axis_means[["primary"]])
+side_label <- c(positive = ifelse(met_sign > 0, "up in metastasis", "up in non-malignant/primary"),
+                negative = ifelse(met_sign > 0, "up in non-malignant/primary", "up in metastasis"))
+
+# PROGENy on the axis loadings, per view.
+view_files <- list.files(file.path(D, "out"), pattern = "^progeny_.*_pw_acts\\.csv$")
+prog <- purrr::map_dfr(view_files, function(f) {
+  v <- sub("^progeny_(.*)_pw_acts\\.csv$", "\\1", f)
+  a <- read.csv(file.path(D, "out", f), row.names = 1, check.names = FALSE)
+  p <- read.csv(file.path(D, "out", sub("acts", "padj", f)), row.names = 1, check.names = FALSE)
+  tibble(view = sub("T NK", "T/NK", gsub("_", " ", v)), pathway = colnames(a), t = unlist(a[AXIS, ]), padj = unlist(p[AXIS, ]))
+})
+# July Factor2 PROGENy (positive = up in metastasis in July), for a direction check against October.
+prog_jul <- purrr::map_dfr(list.files(file.path(D_JUL, "out"), pattern = "^progeny_.*_pw_acts\\.csv$"), function(f) {
+  a <- read.csv(file.path(D_JUL, "out", f), row.names = 1, check.names = FALSE)
+  tibble(view = sub("T NK", "T/NK", gsub("_", " ", sub("^progeny_(.*)_pw_acts\\.csv$", "\\1", f))),
+         pathway = colnames(a), t_jul = unlist(a["Factor2", ]))
+})
+prog_cmp <- inner_join(prog |> mutate(t_met = t * met_sign), prog_jul, by = c("view", "pathway"))
+r_prog <- cor(prog_cmp$t_met, prog_cmp$t_jul)
+# Significant pathways on one side of the axis (sign of t), as "view: pathway t" text.
+prog_side <- function(s) {
+  d <- prog |> dplyr::filter(padj < 0.05, sign(t) == s) |> arrange(view, desc(abs(t)))
+  if (!nrow(d)) return("none")
+  d |> group_by(view) |> summarise(x = paste(sprintf("%s %+.1f", pathway, t), collapse = ", "), .groups = "drop") |>
+    with(paste(sprintf("%s %s", view, x), collapse = "; "))
+}
+
+# Networks: noFib (5 views) is the main one; "all" (6 views) only for the sample count.
+net_dir <- function(vs) file.path(D, "out", sprintf("network_%s_%s", AXIS, vs))
+net <- purrr::map_dfr(c("positive", "negative"), \(s) read_csv(file.path(net_dir("noFib"), sprintf("network_%s.csv", s)),
+                                                              show_col_types = FALSE) |> mutate(side = s))
+lr <- purrr::map_dfr(c("positive", "negative"), \(s) read_csv(file.path(net_dir("noFib"), sprintf("lr_%s.csv", s)),
+                                                             show_col_types = FALSE) |> mutate(side = s))
+cc <- bind_rows(read_csv(file.path(net_dir("all"), "complete_samples.csv"), show_col_types = FALSE),
+                read_csv(file.path(net_dir("noFib"), "complete_samples.csv"), show_col_types = FALSE))
+net_all <- read_csv(file.path(net_dir("all"), "network_positive.csv"), show_col_types = FALSE)
+stopifnot(all(net$n_samples == cc$n_complete[cc$viewset == "noFib"]))
+```
+
+```{r c_tests, include=FALSE}
+# The five requested groupings, each on the samples it applies to.
+groupings <- list(
+  origin        = list(label = "Origin, all samples", col = "origin", keep = rep(TRUE, nrow(fs))),
+  smut_pUM      = list(label = "Secondary mutation, all pUM", col = "smut_pUM", keep = !is.na(fs$smut_pUM)),
+  smut_chor     = list(label = "Secondary mutation, choroidal pUM", col = "smut_choroid_pUM",
+                       keep = !is.na(fs$smut_choroid_pUM)),
+  loc_pUM       = list(label = "Location, pUM", col = "location_pUM", keep = !is.na(fs$location_pUM)),
+  loc_nonmal    = list(label = "Location, non-malignant", col = "location_nonmal", keep = !is.na(fs$location_nonmal))
+)
+# Per factor x grouping: Kruskal-Wallis on the grouping, Kruskal-Wallis on batch in the same samples,
+# and an F-test of the grouping after batch (lm score ~ batch + group vs score ~ batch). The batch-adjusted
+# test is NA when the grouping is nested in batch (no within-batch contrast left).
+# Tests run on patient means: libraries of the same patient, group and batch are averaged first
+# (several patients contribute two libraries of one tumour, which would otherwise count twice).
+test_one <- function(d, f, col) {
+  d <- d |> dplyr::filter(!is.na(.data[[col]])) |>
+    group_by(Patient_nr, g = .data[[col]], b = batch) |>
+    summarise(across(all_of(f), mean), .groups = "drop") |>
+    mutate(g = factor(g), b = droplevels(factor(b)))
+  p_g <- kruskal.test(d[[f]], d$g)$p.value
+  p_b <- if (nlevels(d$b) > 1) kruskal.test(d[[f]], d$b)$p.value else NA_real_
+  p_adj <- NA_real_
+  if (nlevels(d$b) > 1) {
+    m0 <- lm(d[[f]] ~ b, data = d); m1 <- lm(d[[f]] ~ b + g, data = d)
+    if (m1$rank > m0$rank) p_adj <- anova(m0, m1)$`Pr(>F)`[2]
+  } else p_adj <- p_g
+  tibble(factor = f, n = nrow(d), groups = paste(sprintf("%s %d", levels(d$g), table(d$g)), collapse = ", "),
+         p_group = p_g, p_batch = p_b, p_group_after_batch = p_adj)
+}
+gtests <- purrr::imap_dfr(groupings, \(g, k) purrr::map_dfr(FACTORS, \(f) test_one(fs[g$keep, ], f, g$col)) |>
+                            mutate(grouping = k, label = g$label))
+write_csv(gtests, file.path(D, "report_grouping_tests.csv"))
+gt <- function(k, f = AXIS) dplyr::filter(gtests, grouping == k, factor == f)
+
+# Within-primary BAP1 vs the other called mutations (as July), plus the same after batch.
+prim <- fs |> dplyr::filter(origin == "primary") |>
+  mutate(bap1 = case_when(secondary_mutation == "BAP1" ~ "BAP1",
+                          secondary_mutation %in% c("SF3B1", "EIF1AX", "none") ~ "SF3B1/EIF1AX/none")) |>
+  dplyr::filter(!is.na(bap1)) |>
+  group_by(Patient_nr, bap1, secondary_mutation, batch) |> summarise(across(all_of(FACTORS), mean), .groups = "drop")  # patient means
+bap1_p <- setNames(sapply(FACTORS, \(f) wilcox.test(prim[[f]] ~ prim$bap1)$p.value), FACTORS)
+bap1_n <- table(prim$bap1)
+bap1_batch_tab <- table(prim$batch, prim$bap1)
+bap1_adj_p <- anova(lm(prim[[AXIS]] ~ droplevels(prim$batch)),
+                    lm(prim[[AXIS]] ~ droplevels(prim$batch) + prim$bap1))$`Pr(>F)`[2]
+bap1_min_factor <- names(which.min(bap1_p))
+top_prim <- fs |> dplyr::filter(origin == "primary") |> slice_max(.data[[AXIS]] * -met_sign, n = 4)
+jul_top <- jul |> slice_max(Factor1, n = 4) |> pull(short_name)
+jul_top_txt <- paste(jul_top, collapse = ", ")
+top_prim_txt <- with(top_prim, paste(sprintf("%s (%s, %s, primary mutation %s, %+.2f)", short_name, batch, primary_location, primary_mutation, top_prim[[AXIS]]), collapse = ", "))
+
+# Within Batch04 (the one batch with all three origins).
+b04 <- fs |> dplyr::filter(batch == "Batch04") |>
+  group_by(Patient_nr, origin) |> summarise(across(all_of(FACTORS), mean), .groups = "drop")  # patient means
+b04_p <- kruskal.test(b04[[AXIS]], b04$origin)$p.value
+b04_n <- table(b04$origin)
+b04_pmp <- wilcox.test(b04[[AXIS]][b04$origin == "metastasis"], b04[[AXIS]][b04$origin == "primary"])$p.value
+
+# One library per patient (the one with most cells), origin test again.
+one_pp <- fs |> group_by(Patient_nr, origin) |> slice_max(n_cells, n = 1, with_ties = FALSE) |> ungroup() |>
+  group_by(Patient_nr) |> slice_max(n_cells, n = 1, with_ties = FALSE) |> ungroup()
+one_pp_p <- kruskal.test(one_pp[[AXIS]], one_pp$origin)$p.value
+
+# Correlation of the axis with cell number, and with the July axis.
+r_ncells <- cor(fs[[AXIS]], fs$log_ncells)
+shared <- inner_join(fs |> dplyr::select(short_name, origin, batch, all_of(FACTORS)),
+                     jul |> dplyr::select(short_name, July_F1 = Factor1, July_F2 = Factor2), by = "short_name")
+r_jul <- sapply(FACTORS, \(f) cor(shared[[f]], shared$July_F2))
+r_jul_axis <- r_jul[[AXIS]]
+jul_best <- names(which.max(abs(r_jul)))
+r_jul_f1_axis <- cor(shared[[AXIS]], shared$July_F1)
+
+stab_ok <- stab |> dplyr::filter(status == "ok")
+n_stab <- nrow(stab_ok)
+n_recovered <- sum(abs(stab_ok$r_scores) >= 0.8)
+```
+
+```{r c_figdata, include=FALSE}
+# Covariate heatmap: -log10 BH padj (per covariate across the 6 factors, mc-ASTRA get_pval_matrix).
+cov_lab <- c(batch = "Batch (Condition)", enrich16S = "16S-enriched library", log_ncells = "Cell number (log10)",
+             origin = "Origin", organ = "Organ", primary_mutation = "Primary mutation",
+             secondary_BAP1 = "BAP1 vs other, all", smut_pUM = "Secondary mutation, pUM",
+             smut_choroid_pUM = "Secondary mutation, choroidal pUM", location_pUM = "Location, pUM",
+             location_nonmal = "Location, non-malignant", Gender = "Sex", Age_atDiagnosisY = "Age at diagnosis")
+stopifnot(all(colnames(padj) %in% names(cov_lab)))
+hm <- padj |> tibble::rownames_to_column("factor") |>
+  pivot_longer(-factor, names_to = "cov", values_to = "padj") |>
+  mutate(cov = factor(cov_lab[cov], levels = rev(cov_lab)), mlog = -log10(padj),
+         lab = sprintf("%.1f%s", mlog, ifelse(padj < 0.05, "*", "")),
+         technical = cov %in% cov_lab[c("batch", "enrich16S", "log_ncells")])
+cov_n <- sapply(names(cov_lab), \(k) sum(!is.na(fs[[k]])))
+```
+
+mc-ASTRA (MOFAcell) on the October 2026 UM atlas: which cell-type programmes vary together across samples, and do they follow origin, mutation, location or batch?
+
+<style>
+/* Cap figure size so plots do not blow up in a full-screen window (retina + dpi 300 gives ~150 px per inch). */
+.main-container img { max-width: min(100%, 1400px) !important; height: auto !important; display: block; margin: 0 auto; }
+.main-container .html-widget { max-width: 1400px; margin: 0 auto; }
+</style>
+
+# {.tabset}
+
+## Overview
+
+- mc-ASTRA sums the counts of each cell type in each sample (pseudobulk), treats every cell type as one view, and fits a factor model (MOFA-FLEX, `r length(FACTORS)` factors) whose factors are shared by all views. A factor is a sample-level score; its loadings say which genes in which cell type move with it.
+- Kept: `r n_kept` of `r n_total` samples (`r n_by_origin[["non-malignant"]]` non-malignant, `r n_by_origin[["primary"]]` primary, `r n_by_origin[["metastasis"]]` metastasis) from `r n_pat_kept` patients, and `r nrow(views)` views: `r paste(sprintf("%s (%d samples)", sub("T_NK", "T/NK", rownames(views)), views$samples), collapse = ", ")`. July's rule (a view must cover 40 % of samples) now drops B/Plasma cells and keeps fibroblasts.
+- Each cell is one test of a factor against a covariate: ANOVA or Pearson on the samples the covariate applies to, BH-adjusted across the 6 factors. `r n_multi_lib` patients contribute more than one library, so samples are not fully independent.
+- **`r AXIS` is the origin axis** (origin padj `r fmt_p(padj[AXIS, "origin"])`, batch padj `r fmt_p(padj[AXIS, "batch"])`). Batch is entangled with the groupings: in the full cohort `r ent$met_b04` of `r ent$met` metastases are Batch04, and `r ent$iris_b03` of `r ent$iris` iris and `r ent$cb_b03` of `r ent$cb` ciliary-body primaries are Batch03. Read every column next to the batch column. Batch03 counts are CellBender-derived like the others, so batch here means sequencing/processing batch.
+
+```{r overview_heatmap, fig.width=10, fig.height=7.5}
+p_hm <- ggplot(hm, aes(factor, cov, fill = pmin(mlog, 5))) +
+  geom_tile(colour = "white", linewidth = 0.6) +
+  geom_text(aes(label = lab), size = 3.6) +
+  geom_hline(yintercept = length(cov_lab) - 2.5, linewidth = 0.6) +
+  scale_fill_gradient(low = "white", high = "#B2182B", limits = c(0, 5), name = "-log10 padj\n(capped at 5)") +
+  scale_y_discrete(labels = function(x) sprintf("%s (n = %d)", x, cov_n[match(x, cov_lab)])) +
+  labs(title = "Which covariates does each factor track?",
+       subtitle = "Number = -log10 BH padj, * padj < 0.05. Above the line: technical covariates.",
+       x = NULL, y = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid = element_blank(), plot.title = element_text(face = "bold"),
+        axis.text = element_text(face = "bold"), plot.title.position = "plot")
+ggsave(file.path(D, "report_factor_covariate_heatmap.png"), p_hm, width = 10, height = 7.5, dpi = 300, bg = "white")
+print(p_hm)
+```
+
+The values are in `mc_astra_2026b/out/factor_covariate_padj.csv`. `r dplyr::filter(hm, padj < 0.05, factor != AXIS) |> distinct(factor) |> nrow()` other factors have at least one hit; their causes are in the Factors tab.
+
+## Factors {.tabset}
+
+### Origin and mutation
+
+One point per sample, colour = group, shape = batch. Panel title: Kruskal-Wallis p for the grouping, then for batch in the same samples. Every metastasis is outside the eye, so origin and organ are the same contrast here.
+
+```{r c_scoreplot, include=FALSE}
+score_panel <- function(k, colours) {
+  g <- groupings[[k]]
+  d <- fs[g$keep, ] |> mutate(grp = factor(.data[[g$col]])) |>
+    pivot_longer(all_of(FACTORS), names_to = "factor", values_to = "score")
+  stopifnot(nrow(d) > 0)
+  lab <- gtests |> dplyr::filter(grouping == k) |>
+    mutate(strip = sprintf("%s\ngroup p = %s\nbatch p = %s", factor, fmt_p(p_group), fmt_p(p_batch)))
+  d <- d |> left_join(dplyr::select(lab, factor, strip), by = "factor")
+  ns <- table(fs[g$keep, g$col])
+  ggplot(d, aes(grp, score)) +
+    geom_boxplot(outlier.shape = NA, width = 0.55, colour = "grey55") +
+    geom_jitter(aes(fill = grp, shape = batch), width = 0.15, height = 0, size = 2.3, colour = "black", stroke = 0.3,
+                show.legend = TRUE) +
+    scale_fill_manual(values = colours, guide = "none") +
+    scale_shape_manual(values = c(Batch01 = 22, Batch02 = 24, Batch03 = 21, Batch04 = 23, Batch05 = 25), drop = FALSE) +
+    guides(shape = guide_legend(override.aes = list(fill = "grey70"))) +
+    scale_x_discrete(labels = function(x) sprintf("%s\n(%d)", x, ns[x])) +
+    facet_wrap(~strip, nrow = 1, scales = "free_y") +
+    labs(title = g$label, x = NULL, y = "Factor score", shape = "Batch") +
+    theme_rep + theme(axis.text.x = element_text(size = 8.5))
+}
+col_origin <- origin_colors
+col_mut <- second_mutations_col
+col_loc <- primary_location_colors
+col_hloc <- setNames(healthy_location_colors, sub("non-malignant ", "", names(healthy_location_colors)))
+```
+
+```{r scores_origin_mut, fig.width=17, fig.height=13.5}
+p_om <- score_panel("origin", col_origin) / score_panel("smut_pUM", col_mut) / score_panel("smut_chor", col_mut) +
+  plot_layout(guides = "collect")
+ggsave(file.path(D, "report_scores_origin_mutation.png"), p_om, width = 17, height = 13.5, dpi = 200, bg = "white")
+print(p_om)
+```
+
+Choroidal SF3B1 primaries are all Batch04 and choroidal BAP1 primaries are Batch03 or Batch05, so the choroid-only mutation contrast is also a batch contrast. Batch-adjusted p for the axis factor (`r AXIS`, F-test of the grouping after batch): origin `r fmt_p(gt("origin")$p_group_after_batch)`, secondary mutation in pUM `r fmt_p(gt("smut_pUM")$p_group_after_batch)`, in choroidal pUM `r fmt_p(gt("smut_chor")$p_group_after_batch)`. All tests are in `mc_astra_2026b/report_grouping_tests.csv`.
+
+### Location
+
+Primaries by intra-ocular location (the one ciliochoroidal tumour is left out), and non-malignant uvea by site. Iris primaries are mostly Batch03, and the non-malignant samples come from Batch04 and Batch05 only.
+
+```{r scores_location, fig.width=17, fig.height=9}
+p_loc <- score_panel("loc_pUM", col_loc) / score_panel("loc_nonmal", col_hloc) + plot_layout(guides = "collect")
+ggsave(file.path(D, "report_scores_location.png"), p_loc, width = 17, height = 9, dpi = 200, bg = "white")
+print(p_loc)
+```
+
+`r AXIS`: location in pUM p = `r fmt_p(gt("loc_pUM")$p_group)` (after batch `r fmt_p(gt("loc_pUM")$p_group_after_batch)`), location in non-malignant p = `r fmt_p(gt("loc_nonmal")$p_group)` (after batch `r fmt_p(gt("loc_nonmal")$p_group_after_batch)`). The pUM location result rests on the iris libraries of `r n_distinct(top_prim$Patient_nr)` Batch03 patients with unknown mutations (Origin axis tab), so it is not read as a location effect.
+
+### Variance explained
+
+Share of each view's variance explained by each factor (R2 from the model). A factor that explains much of one view and little elsewhere is a cell-type programme rather than a multicellular one.
+
+```{r variance_explained, fig.width=9, fig.height=5.5}
+ve_df <- ve |> tibble::rownames_to_column("factor") |> pivot_longer(-factor, names_to = "view", values_to = "R2")
+p_ve <- ggplot(ve_df, aes(factor, view, fill = 100 * R2)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = sprintf("%.1f", 100 * R2)), size = 3.6) +
+  scale_fill_gradient(low = "white", high = "#2166AC", name = "% variance") +
+  labs(title = "Variance explained per view and factor", x = NULL, y = NULL) +
+  theme_minimal(base_size = 12) + theme(panel.grid = element_blank(), plot.title = element_text(face = "bold"))
+ggsave(file.path(D, "report_variance_explained.png"), p_ve, width = 9, height = 5.5, dpi = 300, bg = "white")
+print(p_ve)
+```
+
+`r AXIS` explains `r sprintf("%.1f", 100 * min(ve[AXIS, ]))`-`r sprintf("%.1f", 100 * max(ve[AXIS, ]))` % per view, most in `r colnames(ve)[which.max(ve[AXIS, ])]`.
+
+## Origin axis {.tabset}
+
+### Mutation and batch
+
+Mean `r AXIS` score: metastasis `r sprintf("%+.2f", axis_means[["metastasis"]])`, primary `r sprintf("%+.2f", axis_means[["primary"]])`, non-malignant `r sprintf("%+.2f", axis_means[["non-malignant"]])`. It does not track batch (padj `r fmt_p(padj[AXIS, "batch"])`) or cell number (padj `r fmt_p(padj[AXIS, "log_ncells"])`, r = `r sprintf("%.2f", r_ncells)`).
+
+- **Within primaries, BAP1 does not separate on `r AXIS`**: BAP1 (n = `r bap1_n[["BAP1"]]`) vs SF3B1/EIF1AX/none (n = `r bap1_n[["SF3B1/EIF1AX/none"]]`), Wilcoxon p = `r fmt_p(bap1_p[[AXIS]])`; after batch p = `r fmt_p(bap1_adj_p)`. The factor closest to a within-primary BAP1 effect is `r bap1_min_factor` (p = `r fmt_p(bap1_p[[bap1_min_factor]])`). `r AXIS`'s all-sample BAP1 hit (padj `r fmt_p(padj[AXIS, "secondary_BAP1"])`) comes from the metastases, which are BAP1.
+- **Its primary-mutation and pUM-location hits** (padj `r fmt_p(padj[AXIS, "primary_mutation"])` and `r fmt_p(padj[AXIS, "location_pUM"])`) come from the top-scoring primaries: `r top_prim_txt`. These `r nrow(top_prim)` libraries come from `r n_distinct(top_prim$Patient_nr)` patients; July's Factor1, read as a run artifact, was carried by `r jul_top_txt`. `r if (setequal(top_prim$short_name, jul_top)) 'Same libraries: in October they sit on the origin axis instead, so the location-in-pUM result is these patients, not a location effect.' else 'Not the same libraries.'`
+- **Within Batch04** (`r paste(sprintf("%s %d", names(b04_n), b04_n), collapse = ", ")`) the origin effect holds: Kruskal-Wallis p = `r fmt_p(b04_p)`, metastasis vs primary p = `r fmt_p(b04_pmp)`.
+- **One library per patient** (`r nrow(one_pp)` samples): origin p = `r fmt_p(one_pp_p)`.
+- A within-batch BAP1 check is not possible: primaries with BAP1 vs other called mutations per batch are `r paste(sprintf("%s %d/%d", rownames(bap1_batch_tab), bap1_batch_tab[, "BAP1"], bap1_batch_tab[, "SF3B1/EIF1AX/none"]), collapse = ", ")`.
+
+```{r axis_checks, fig.width=16, fig.height=6}
+pa <- ggplot(prim, aes(bap1, .data[[AXIS]])) +
+  geom_boxplot(outlier.shape = NA, width = 0.5, colour = "grey55") +
+  geom_jitter(aes(fill = secondary_mutation, shape = batch), width = 0.12, height = 0, size = 2.8, stroke = 0.3,
+              show.legend = TRUE) +
+  geom_signif(comparisons = list(c("BAP1", "SF3B1/EIF1AX/none")), test = "wilcox.test",
+              map_signif_level = signif_label, tip_length = 0.01, textsize = 3.5) +
+  scale_fill_manual(values = col_mut) +
+  scale_shape_manual(values = c(Batch01 = 22, Batch02 = 24, Batch03 = 21, Batch04 = 23, Batch05 = 25), drop = FALSE) +
+  scale_x_discrete(labels = function(x) sprintf("%s\n(n = %d)", x, bap1_n[x])) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.15))) +
+  guides(fill = guide_legend(override.aes = list(shape = 21)), shape = guide_legend(override.aes = list(fill = "grey70"))) +
+  labs(title = "Primaries: BAP1 vs other (patient means)", x = NULL, y = paste(AXIS, "score"), fill = "Mutation", shape = "Batch") +
+  theme_rep
+pb4 <- ggplot(b04, aes(origin, .data[[AXIS]])) +
+  geom_boxplot(outlier.shape = NA, width = 0.5, colour = "grey55") +
+  geom_jitter(aes(colour = origin), width = 0.12, height = 0, size = 2.6) +
+  geom_signif(comparisons = list(c("primary", "metastasis"), c("non-malignant", "primary")), test = "wilcox.test",
+              map_signif_level = signif_label, step_increase = 0.12, tip_length = 0.01, textsize = 3.5) +
+  scale_colour_manual(values = col_origin, guide = "none") +
+  scale_x_discrete(labels = function(x) sprintf("%s\n(n = %d)", x, b04_n[x])) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.2))) +
+  labs(title = "Within Batch04 (patient means)", subtitle = sprintf("Kruskal-Wallis p = %s", fmt_p(b04_p)), x = NULL, y = NULL) +
+  theme_rep
+pbt <- ggplot(fs, aes(batch, .data[[AXIS]])) +
+  geom_boxplot(outlier.shape = NA, width = 0.55, colour = "grey55") +
+  geom_jitter(aes(colour = origin), width = 0.15, height = 0, size = 2.4) +
+  scale_colour_manual(values = col_origin) +
+  scale_x_discrete(labels = function(x) sprintf("%s\n(n = %d)", x, table(fs$batch)[x])) +
+  labs(title = "All samples by batch", subtitle = sprintf("Batch padj = %s", fmt_p(padj[AXIS, "batch"])),
+       x = NULL, y = NULL, colour = "Origin") +
+  theme_rep
+p_ax <- pa + pb4 + pbt + plot_layout(widths = c(1, 1.1, 1.4))
+ggsave(file.path(D, "report_axis_checks.png"), p_ax, width = 16, height = 6, dpi = 200, bg = "white")
+print(p_ax)
+```
+
+### Pathways
+
+PROGENy pathway activity (decoupler ULM, top 500 genes per pathway) on the `r AXIS` gene loadings of each view. Positive t = the pathway's target genes load positively, i.e. are `r side_label[["positive"]]`. Value = t, * BH padj < 0.05.
+
+```{r progeny, fig.width=11, fig.height=5}
+p_prog <- ggplot(prog, aes(pathway, view, fill = t)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = sprintf("%.1f%s", t, ifelse(padj < 0.05, "*", ""))), size = 3.2) +
+  scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B", midpoint = 0, name = "t") +
+  labs(title = sprintf("PROGENy on %s loadings", AXIS),
+       subtitle = sprintf("Red = %s, blue = %s", side_label[["positive"]], side_label[["negative"]]),
+       x = NULL, y = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid = element_blank(), plot.title = element_text(face = "bold"),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+ggsave(file.path(D, "report_progeny_axis.png"), p_prog, width = 11, height = 5, dpi = 300, bg = "white")
+print(p_prog)
+```
+
+`r sum(prog$padj < 0.05)` of `r nrow(prog)` view x pathway tests have padj < 0.05. Up in metastasis: `r prog_side(met_sign)`. Up in non-malignant/primary: `r prog_side(-met_sign)`.
+
+### Stability
+
+`r n_stab` refits (seeds 1-5 x 4, 6 or 8 factors), each matched to the reference `r AXIS` by the factor whose sample scores correlate best. Recovered (|r| >= 0.8) in `r n_recovered` of `r n_stab`. This is optimisation stability on the same `r n_kept` samples, not replication.
+
+```{r stability, fig.width=15, fig.height=5.5}
+st <- stab_ok |> mutate(K = factor(sub("_seed.*", "", run), levels = c("K4", "K6", "K8")),
+                        seed = sub(".*_seed", "", run))
+ps1 <- ggplot(st, aes(K, abs(r_scores))) +
+  geom_jitter(aes(colour = "best match"), width = 0.12, height = 0, size = 2.6) +
+  geom_jitter(aes(y = second_best_abs_r, colour = "runner-up"), width = 0.12, height = 0, size = 2.6) +
+  geom_hline(yintercept = 0.8, linetype = 2, colour = "grey50") +
+  scale_colour_manual(values = c("best match" = "#B00068", "runner-up" = "grey60"), name = NULL) +
+  coord_cartesian(ylim = c(0, 1)) +
+  labs(title = sprintf("Is %s recovered?", AXIS), y = "|r| with reference scores", x = "Number of factors") +
+  theme_rep + theme(legend.position = "bottom")
+st_p <- st |> dplyr::select(K, seed, Origin = padj_origin, `BAP1 vs other, all` = padj_BAP1,
+                            Batch = padj_batch, `BAP1 within primaries` = p_primary_BAP1) |>
+  pivot_longer(-c(K, seed), names_to = "test", values_to = "p") |>
+  mutate(test = factor(test, levels = c("Origin", "BAP1 vs other, all", "BAP1 within primaries", "Batch")))
+ps2 <- ggplot(st_p, aes(test, -log10(p), colour = K)) +
+  geom_jitter(width = 0.15, height = 0, size = 2.4) +
+  geom_hline(yintercept = -log10(0.05), linetype = 2, colour = "grey50") +
+  scale_colour_manual(values = c(K4 = "#4E79A7", K6 = "#B00068", K8 = "#F28E2B")) +
+  labs(title = "Associations of the matched factor", subtitle = "Dashed line: 0.05. Within primaries: Wilcoxon p; others: BH padj",
+       x = NULL, y = "-log10 p") +
+  theme_rep + theme(axis.text.x = element_text(angle = 20, hjust = 1))
+p_st <- ps1 + ps2 + plot_layout(widths = c(1, 1.6))
+ggsave(file.path(D, "report_stability.png"), p_st, width = 15, height = 5.5, dpi = 200, bg = "white")
+print(p_st)
+```
+
+Across refits: origin padj < 0.05 in `r sum(st$padj_origin < 0.05)` of `r n_stab`, batch padj < 0.05 in `r sum(st$padj_batch < 0.05)`, within-primary BAP1 p < 0.05 in `r sum(st$p_primary_BAP1 < 0.05)` (range `r fmt_p(min(st$p_primary_BAP1))`-`r fmt_p(max(st$p_primary_BAP1))`). Gene-loading r per view: `r sprintf("%.2f", min(dplyr::select(st, starts_with("r_load"))))`-`r sprintf("%.2f", max(dplyr::select(st, starts_with("r_load"))))`. The full table is `mc_astra_2026b/stability_summary.csv`.
+
+## Network {.tabset}
+
+### Coordination maps
+
+For each view, a cell-type score is built from the `r AXIS` loadings; then each view's score is regressed on the others (OLS). An arrow A -> B means A's score predicts B's. The OLS needs complete samples: with all `r nrow(views)` views only **`r cc$n_complete[cc$viewset == "all"]` samples** have every view (`r cc$n_primary[cc$viewset == "all"]` primary, `r cc$n_metastasis[cc$viewset == "all"]` metastasis), R2 `r sprintf("%.2f", min(net_all$R2))`-`r sprintf("%.2f", max(net_all$R2))`, which is overfit. The maps below drop the sparse fibroblast view: **`r cc$n_complete[cc$viewset == "noFib"]` complete samples** (`r cc$n_primary[cc$viewset == "noFib"]` primary, `r cc$n_metastasis[cc$viewset == "noFib"]` metastasis, `r cc[["n_non-malignant"]][cc$viewset == "noFib"]` non-malignant). Edges with standardised estimate > 0.2.
+
+```{r c_netplot, include=FALSE}
+net_plot <- function(s) {
+  e <- net |> dplyr::filter(side == s, cor_estimate > 0.2) |>
+    transmute(from = predictor, to = target, w = cor_estimate)
+  nodes <- tibble(name = sort(unique(c(net$target, net$predictor))))
+  g <- graph_from_data_frame(e, vertices = nodes)
+  ggraph(g, layout = "circle") +
+    geom_edge_fan(aes(width = w, label = sprintf("%.2f", w)), colour = "#6A3D9A", alpha = 0.75,
+                  arrow = arrow(length = unit(3.5, "mm"), type = "closed"), end_cap = circle(14, "mm"),
+                  start_cap = circle(14, "mm"), label_size = 3.4, angle_calc = "along", label_dodge = unit(3, "mm")) +
+    geom_node_label(aes(label = sub("T_NK", "T/NK", sub(" cells$", "", name))), size = 3.8, fontface = "bold", fill = "grey92",
+                    label.padding = unit(2.5, "mm"), label.r = unit(3, "mm")) +
+    scale_edge_width(range = c(0.6, 3.5), guide = "none") +
+    coord_cartesian(xlim = c(-1.4, 1.4), ylim = c(-1.3, 1.3), clip = "off") +
+    labs(title = sprintf("%s side (%s)", tools::toTitleCase(s), side_label[[s]]),
+         subtitle = sprintf("%d edges > 0.2, %d samples", nrow(e), unique(net$n_samples))) +
+    theme_void(base_size = 12) +
+    theme(plot.title = element_text(face = "bold"), plot.margin = margin(10, 20, 10, 20))
+}
+top_edges <- function(s, k = 3) net |> dplyr::filter(side == s) |> slice_max(cor_estimate, n = k) |>
+  with(gsub("T_NK", "T/NK", paste(sprintf("%s -> %s %.2f", predictor, target, cor_estimate), collapse = ", ")))
+```
+
+```{r networks, fig.width=15, fig.height=7.5}
+p_net <- net_plot("positive") + net_plot("negative")
+ggsave(file.path(D, "report_networks.png"), p_net, width = 15, height = 7.5, dpi = 200, bg = "white")
+print(p_net)
+```
+
+Strongest edges. Positive side: `r top_edges("positive")`. Negative side: `r top_edges("negative")`. Every cell-type score is built from the same factor, so the cell types correlate by construction; the map ranks which cell type best predicts the others along an axis already defined as coordinated.
+
+### Ligand-receptor
+
+Ligand-receptor pairs (LIANA consensus) whose ligand loads in the sender and receptor in the receiver with the same sign, on edges of the map above. Score = mean of the two loadings. Top 15 per side shown, out of `r sum(lr$side == "positive")` (positive) and `r sum(lr$side == "negative")` (negative).
+
+```{r lr_overview, fig.width=15, fig.height=7}
+lr_top <- lr |> group_by(side) |> slice_max(lr_score, n = 15, with_ties = FALSE) |> ungroup() |>
+  mutate(pair = gsub("T_NK", "T/NK", sprintf("%s -> %s", sub(" cells$", "", source), sub(" cells$", "", target))))
+lr_panel <- function(s) {
+  d <- dplyr::filter(lr_top, side == s)
+  ggplot(d, aes(pair, fct_reorder(interaction, lr_score))) +
+    geom_point(aes(size = lr_score, colour = lr_score)) +
+    geom_text(aes(label = sprintf("%.2f", lr_score)), nudge_x = 0.32, size = 3) +
+    scale_colour_gradient(low = "#C7B8E0", high = "#3F007D", guide = "none") +
+    scale_size_continuous(range = c(2, 6), guide = "none") +
+    labs(title = sprintf("%s side (%s)", tools::toTitleCase(s), side_label[[s]]), x = "Sender -> receiver", y = NULL) +
+    theme_rep + theme(axis.text.x = element_text(angle = 35, hjust = 1))
+}
+p_lr <- lr_panel("positive") + lr_panel("negative")
+ggsave(file.path(D, "report_lr_overview.png"), p_lr, width = 15, height = 7, dpi = 200, bg = "white")
+print(p_lr)
+```
+
+These are pseudobulk loading coherence only, with no spatial or protein check. The full lists are `lr_positive.csv` / `lr_negative.csv` in mc_astra_2026b/out/network\_`r AXIS`\_noFib/.
+
+## Comparison with July
+
+The July run (`mc_astra/`, same parameters, July object) found the axis in Factor2 (origin and BAP1 padj < 1e-4, within-primary BAP1 p = 0.007, 15/15 refits). On the `r nrow(shared)` samples in both runs, July Factor2 correlates best with October `r jul_best` (r = `r sprintf("%.2f", r_jul[[jul_best]])`), and with `r AXIS` at r = `r sprintf("%.2f", r_jul_axis)`. Views changed under the same 40 % rule: July `r paste(rownames(views_jul), collapse = ", ")`; October `r paste(rownames(views), collapse = ", ")`.
+
+```{r july_compare, fig.width=14, fig.height=6}
+pj1 <- ggplot(shared, aes(July_F2, .data[[AXIS]], colour = origin)) +
+  geom_hline(yintercept = 0, colour = "grey80") + geom_vline(xintercept = 0, colour = "grey80") +
+  geom_point(size = 2.6) +
+  scale_colour_manual(values = col_origin) +
+  labs(title = sprintf("July Factor2 vs October %s", AXIS), subtitle = sprintf("r = %.2f, n = %d shared samples", r_jul_axis, nrow(shared)),
+       x = "July Factor2 score", y = sprintf("October %s score", AXIS), colour = "Origin") +
+  theme_rep + theme(aspect.ratio = 1)
+rj <- tibble(factor = names(r_jul), r = r_jul) |> mutate(is_axis = factor == AXIS)
+pj2 <- ggplot(rj, aes(factor, r, fill = is_axis)) +
+  geom_col(width = 0.65) +
+  geom_text(aes(label = sprintf("%.2f", r), vjust = ifelse(r >= 0, -0.4, 1.3)), size = 3.6) +
+  geom_hline(yintercept = 0) +
+  scale_fill_manual(values = c(`TRUE` = "#B00068", `FALSE` = "grey65"), guide = "none") +
+  scale_y_continuous(limits = c(-1, 1)) +
+  labs(title = "July Factor2 vs each October factor", subtitle = "Pearson r on shared samples", x = NULL, y = "r") +
+  theme_rep
+p_j <- pj1 + pj2 + plot_layout(widths = c(1, 1.2))
+ggsave(file.path(D, "report_july_comparison.png"), p_j, width = 14, height = 6, dpi = 200, bg = "white")
+print(p_j)
+```
+
+October `r AXIS` also correlates with July Factor1 (r = `r sprintf("%.2f", r_jul_f1_axis)`), the July run-artifact factor, so the July origin signal is now split across factors. Pathways: PROGENy t-values of `r AXIS` (signed so that positive = up in metastasis) correlate with July Factor2's at r = `r sprintf("%.2f", r_prog)` over the `r nrow(prog_cmp)` view x pathway pairs of the `r n_distinct(prog_cmp$view)` shared views. Across the stability refits, the best |r| with July Factor2 is `r sprintf("%.2f", min(st$july_F2_abs_r))`-`r sprintf("%.2f", max(st$july_F2_abs_r))`.
+
+## Methods and session info
+
+**Input.** `final_Subtyping_iCNV_reclustered.qs2` (October 2026, Levesque lab), RNA counts summed per `Sample` x `majority_celltype` (`01_pseudobulk.R`, `r nrow(samples_all)` samples). Covariates from the object metadata; batch = `Condition` (Batch01-05), one-to-one with the library-prefix "run" used in July (checked in `02_mofacell.py`).
+
+**Model.** mc-ASTRA 0.1.0 + MOFA-FLEX (`02_mofacell.py`), unchanged from July: contaminant genes removed per cell type; a view needs at least 20 cells per sample and must cover at least 40 % of samples (`r floor(0.4 * n_total)` of `r n_total`); genes with at least 20 counts in 40 % of samples; at least 100 genes per view; CPM + log + centring; HVG filter; samples kept with at least 4 views (the tutorial's 5 would drop most non-malignant samples); 6 factors, spike-and-slab prior, PCA init, seed 42, lr 0.01, early stopping (patience 1000, max 10,000 epochs). `r nrow(dropped)` samples were dropped by the filters: `r paste(short_name(dropped$Sample), collapse = ", ")`.
+
+**Covariate tests.** mc-ASTRA `get_pval_matrix` (one-way ANOVA or Pearson per factor, BH across the 6 factors). Scoped covariates are missing outside their scope (secondary mutation: primaries with BAP1/SF3B1/EIF1AX; location: choroid/iris/ciliary body primaries, or non-malignant sites). In the report every test runs on patient means (libraries of the same patient, group and batch averaged; n = patients): Kruskal-Wallis per grouping and per batch in the same samples; batch-adjusted F-test (`lm(score ~ batch + group)` vs `lm(score ~ batch)`); within-primary BAP1 vs SF3B1/EIF1AX/none, Wilcoxon (as July); one library per patient (most cells). p-values in the report are not adjusted unless called padj.
+
+**Stability** (`03_stability.sh`, `04_stability_summary.py`): seeds 1-5 x K = 4/6/8, SLURM array with OMP/MKL/OpenBLAS threads pinned to the allocation. **Network** (`05_network.py`): mc-ASTRA `get_multicell_net` (OLS, standardised, complete cases), `lr_usage` with the LIANA consensus resource. **PROGENy**: decoupler ULM, human, top 500.
+
+**Software.** `r R.version.string`; `r paste(sprintf("%s %s", c("ggplot2", "patchwork", "ggraph", "igraph"), sapply(c("ggplot2", "patchwork", "ggraph", "igraph"), \(x) as.character(packageVersion(x)))), collapse = ", ")`. Python side: uv env `mc_astra/.venv` (Python 3.13). Rendered `r format(Sys.time(), "%Y-%m-%d")`.
+
+**Analysis code** (folded):
+
+```{r code_appendix, ref.label=grep("^c_", knitr::all_labels(), value = TRUE), eval=FALSE, echo=TRUE}
+```

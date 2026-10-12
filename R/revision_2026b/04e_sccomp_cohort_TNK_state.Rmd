@@ -1,0 +1,138 @@
+---
+title: "UM Atlas - sccomp on T/NK states across the whole cohort"
+output:
+  html_document:
+    self_contained: true
+    includes:
+      in_header: !expr system.file("templates/fgcz_header.html", package = "ezRun", lib.loc = .libPaths())
+    css: !expr system.file("templates/fgcz.css", package = "ezRun", lib.loc = .libPaths())
+    code_folding: hide
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+# Publication figures: every chunk figure is also written as PDF + 300 dpi PNG to Figures_2026b/sccomp_cohort_TNK_state/.
+knitr::opts_chunk$set(dev = c("png", "cairo_pdf"), dpi = 300,
+                      fig.path = "../Figures_2026b/sccomp_cohort_TNK_state/",
+                      echo = TRUE, message = FALSE, warning = FALSE, comment = "", fig.width = 10, fig.height = 5)
+library(data.table)
+library(tidyverse)
+library(ggsignif)
+source("config_colors_2026b.R")
+# Fits come from 04e_sccomp_cohort_TNK_state.R (counts from the TME metadata of the October 2026 object).
+OUT <- "../Outputs/sccomp_paired_TNK_2026b"
+res <- fread(file.path(OUT, "cohort_state_tests.csv"))
+shares <- fread(file.path(OUT, "cohort_state_shares.csv"))
+nn <- fread(file.path(OUT, "cohort_state_n.csv"))
+per_sample <- fread(file.path(OUT, "cohort_state_tnk_per_sample.csv"))
+d04d <- fread(file.path(OUT, "tnk_groups_paired.csv"))[grouping == "state"]
+orig_lv <- c("non-malignant", "primary", "metastasis")
+ctr_lv <- c("primary vs non-malignant", "metastasis vs non-malignant", "metastasis vs primary")
+stopifnot(setequal(res$contrast, ctr_lv), nrow(res) == 21)
+kept <- per_sample[kept == TRUE]
+n_by_origin <- kept[, .(samples = .N, patients = uniqueN(Patient_nr), cells = sum(N)), by = origin][match(orig_lv, origin)]
+dropped <- per_sample[kept == FALSE]
+
+stars <- function(p) as.character(cut(p, c(-Inf, 0.001, 0.01, 0.05, Inf), c("***", "**", "*", "ns")))
+fmt_p <- function(p) ifelse(p < 0.001, "< 0.001", sprintf("= %.3f", p))  # returns the operator too: "p " + fmt_p(p)
+hit <- function(ct) {
+  x <- res[contrast == ct & c_pH0 < 0.05][order(c_pH0)]
+  if (!nrow(x)) return("none")
+  paste(sprintf("%s (%s in %s, sccomp p %s, patient-level rank-sum p %s)", x$cell_group, ifelse(x$c_effect > 0, "up", "down"),
+                sub(" vs .*", "", ct), fmt_p(x$c_pH0), fmt_p(x$rank_sum_p)), collapse = "; ")
+}
+cells_txt <- function(g) {
+  x <- nn[cell_group == g][match(orig_lv, origin)]
+  paste(sprintf("%s %s cells in %d patients (largest patient %.0f%%)", x$origin, format(x$cells, big.mark = ","), x$patients, 100 * x$top_patient_share), collapse = "; ")
+}
+```
+
+<style>
+.main-container img { max-width: min(100%, 1400px) !important; height: auto !important; display: block; margin: 0 auto; }
+.main-container .html-widget { max-width: 1400px; margin: 0 auto; }
+</style>
+
+Follow-up to the paired T/NK report (04d): the same seven T/NK state groups, now on every sample with enough T/NK cells, so the unpaired non-malignant, primary and metastasis samples count too.
+
+# {.tabset}
+
+## Overview
+
+- **Samples used**: `r paste(sprintf("%s %d samples from %d patients", n_by_origin$origin, n_by_origin$samples, n_by_origin$patients), collapse = "; ")` (at least 30 T/NK cells per sample; `r nrow(dropped)` samples below that are left out, mostly early primaries and small non-malignant samples).
+- **Model**: sccomp `~ origin + (1 | Patient_nr)`, full MCMC. The patient term carries the 7 tumour-normal pairs and the repeat libraries of one tumour, and the unpaired samples inform the origin effect. No patient has both a primary and a metastasis, so metastasis vs primary is an unpaired comparison and can be confounded by tissue.
+- **Primary vs non-malignant**, p < 0.05: `r hit("primary vs non-malignant")`.
+- **Metastasis vs non-malignant**, p < 0.05: `r hit("metastasis vs non-malignant")`.
+- **Metastasis vs primary**, p < 0.05: `r hit("metastasis vs primary")`.
+- **Against the 7-pair fit (04d)**, naive was p `r fmt_p(d04d[cell_group == "Naive", c_pH0])` and exhausted p `r fmt_p(d04d[cell_group == "Exhausted", c_pH0])`; with the whole cohort they are p `r fmt_p(res[contrast == "primary vs non-malignant" & cell_group == "Naive", c_pH0])` and p `r fmt_p(res[contrast == "primary vs non-malignant" & cell_group == "Exhausted", c_pH0])`.
+- **What the exhausted and naive groups rest on**: exhausted, `r cells_txt("Exhausted")`. Naive, `r cells_txt("Naive")`.
+- **sccomp vs the patient-level cross-check**: for primary vs non-malignant, `r paste(res[contrast == "primary vs non-malignant" & c_pH0 < 0.05 & rank_sum_p >= 0.05][order(c_pH0), cell_group], collapse = ", ")` are called by sccomp but not by the patient-level rank-sum (p >= 0.05); only `r paste(res[contrast == "primary vs non-malignant" & c_pH0 < 0.05 & rank_sum_p < 0.05, cell_group], collapse = ", ")` holds in both. sccomp uses the cell counts and the pairing and the rank-sum uses one share per patient, so the rank-sum has less power, but the sccomp-only calls are the less certain ones.
+- **Limits.** Seven groups and three contrasts make 21 tests; sccomp's FDR is within a contrast only. The state grouping was chosen after the 14-subtype result (04d). The patient-level rank-sum is a cross-check that ignores the pairing.
+
+## State change
+
+Origin effect per T/NK state (log-odds with 95% credible interval), one panel per contrast. Stars and p are sccomp's.
+
+```{r forest, fig.width = 12, fig.height = 5}
+fd <- res |> mutate(contrast = factor(contrast, levels = ctr_lv),
+                    cell_group = factor(cell_group, levels = res[contrast == ctr_lv[1]][order(c_effect), cell_group]),
+                    lab = sprintf("%s  p %s", stars(c_pH0), fmt_p(c_pH0)))
+ggplot(fd, aes(c_effect, cell_group)) +
+  geom_vline(xintercept = 0, colour = "grey50") +
+  geom_errorbarh(aes(xmin = c_lower, xmax = c_upper), height = 0.2) +
+  geom_point(aes(colour = c_effect > 0), size = 2.8) +
+  geom_text(aes(x = max(c_upper) + 0.15, label = lab), hjust = 0, size = 3) +
+  facet_wrap(~ contrast, nrow = 1) +
+  scale_colour_manual(values = c(`TRUE` = "#B2182B", `FALSE` = "#2166AC"),
+                      labels = c(`TRUE` = "higher in the first group", `FALSE` = "higher in the second group"), name = NULL) +
+  coord_cartesian(xlim = c(min(fd$c_lower), max(fd$c_upper) + 3.3), clip = "off") +
+  labs(x = "log-odds (95% credible interval)", y = NULL) +
+  theme_bw(base_size = 10) + theme(legend.position = "bottom", plot.margin = margin(5.5, 20, 5.5, 5.5), strip.text = element_text(size = 9))
+```
+
+## Per sample
+
+Share of T/NK cells per sample, by origin. Brackets show sccomp's p for each contrast (stars and p). Samples of one patient share a patient intercept in the model.
+
+```{r per_sample, fig.width = 13, fig.height = 7}
+sd <- shares |> mutate(origin = factor(origin, levels = orig_lv))
+top <- sd[, .(top = max(share)), by = grp]
+ann <- res |> mutate(grp = cell_group, i = match(contrast, ctr_lv), xmin = c(1, 1, 2)[i], xmax = c(2, 3, 3)[i]) |>
+  left_join(top, by = "grp") |>
+  mutate(y_position = top * (1.04 + 0.11 * (i - 1)), annotations = sprintf("%s  p %s", stars(c_pH0), fmt_p(c_pH0)))
+ggplot(sd, aes(origin, share)) +
+  geom_boxplot(aes(fill = origin), outlier.shape = NA, alpha = 0.35, width = 0.6) +
+  geom_jitter(aes(colour = origin), width = 0.15, height = 0, size = 1.4) +
+  geom_signif(data = ann, aes(xmin = xmin, xmax = xmax, annotations = annotations, y_position = y_position),
+              manual = TRUE, inherit.aes = FALSE, tip_length = 0.01, textsize = 2.6, vjust = 0) +
+  facet_wrap(~ grp, scales = "free_y", ncol = 4) +
+  scale_fill_manual(values = origin_colors, guide = "none") + scale_colour_manual(values = origin_colors, guide = "none") +
+  scale_y_continuous(labels = function(x) ifelse(x > 1, "", scales::percent(x)), expand = expansion(mult = c(0.02, 0.2))) +
+  labs(x = NULL, y = "Share of T/NK cells",
+       title = paste(sprintf("%s n = %d", n_by_origin$origin, n_by_origin$samples), collapse = ";  ")) +
+  theme_bw(base_size = 10) + theme(strip.text = element_text(size = 9), axis.text.x = element_text(angle = 25, hjust = 1))
+```
+
+## Cells behind each result
+
+T/NK cells per state and origin (log scale). Labels: cells, number of patients with at least one cell, and the share of the largest patient. A group with a few cells in one origin, or one patient holding most of them, supports a weaker conclusion than its p suggests.
+
+```{r cells, fig.width = 12, fig.height = 5.5}
+nd <- nn |> mutate(origin = factor(origin, levels = orig_lv),
+                   cell_group = factor(cell_group, levels = res[contrast == ctr_lv[1]][order(c_effect), cell_group]),
+                   lab = sprintf("%s\n%d pt, top %.0f%%", format(cells, big.mark = ","), patients, 100 * top_patient_share))
+ggplot(nd, aes(cell_group, pmax(cells, 1), fill = origin)) +
+  geom_col(position = position_dodge(width = 0.85), width = 0.8) +
+  geom_text(aes(label = lab), position = position_dodge(width = 0.85), vjust = -0.25, size = 2.5, lineheight = 0.9) +
+  scale_y_log10(breaks = c(1, 10, 100, 1000, 10000), labels = scales::comma, expand = expansion(mult = c(0, 0.3))) +
+  scale_fill_manual(values = origin_colors, name = NULL) +
+  labs(x = NULL, y = "T/NK cells (log scale)") +
+  theme_bw(base_size = 10) + theme(legend.position = "bottom")
+```
+
+## Methods
+
+- **Data**: October 2026 TME object (149,062 cells, 63 libraries, 45 patients), per-sample counts of the 14 T/NK `SubTyping` levels from its metadata, summed into the 7 state groups of 04d (naive = CD4_N + CD8_N; memory/effector = CD4_EM, CD8_EM, CD8_EMRA, CD8_RM; exhausted = CD4_EX + CD8_EX; Treg = CD4_REG; MAIT + gdT; NK = NK_REST + NK_CYTO; proliferating T). Samples with fewer than 30 T/NK cells are left out.
+- **Model**: `sccomp_estimate(~ origin + (1 | Patient_nr))`, `inference_method = "hmc"`, `bimodal_mean_variability_association = TRUE`, `sccomp_remove_outliers`, then `sccomp_test` with the three contrasts; p = `c_pH0`, seed 20261005, as in 04c and 04d.
+- **Cross-check**: per patient the mean share over its samples, then an unpaired two-sided rank-sum test between origins. It ignores the pairing and is unadjusted.
+- sccomp `r packageVersion("sccomp")`. Script `04e_sccomp_cohort_TNK_state.R`; tables `cohort_state_*.csv` in `Outputs/sccomp_paired_TNK_2026b/`.
