@@ -1,0 +1,622 @@
+---
+title: "UM Atlas - sccomp Compositional Analysis of UM TME"
+output:
+  html_document:
+    self_contained: true
+    includes:
+      in_header: !expr system.file("templates/fgcz_header.html", package = "ezRun", lib.loc = .libPaths())
+    css: !expr system.file("templates/fgcz.css", package = "ezRun", lib.loc = .libPaths())
+    code_folding: hide
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+# Publication figures: every chunk figure is also written as a vector PDF (and a 300 dpi PNG)
+# to Figures_2026b/sccomp/, named after its chunk, for the figure bundle.
+knitr::opts_chunk$set(dev = c("png", "cairo_pdf"), dpi = 300, fig.path = "../Figures_2026b/sccomp/")
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  comment = "",
+  fig.width = 10,
+  fig.height = 8
+)
+
+library(Seurat)
+library(sccomp)
+library(qs2)
+library(tidyverse)
+library(ComplexHeatmap)
+library(circlize)
+library(grid)
+library(DT)
+
+# sccomp compiles a Stan model and needs a working cmdstan. CMDSTAN comes from
+# ~/.Renviron, which means it is silently ABSENT under `Rscript --vanilla`
+# (--vanilla implies --no-environ). Fail loudly here rather than let sccomp die
+# deep in a chunk, and NEVER wrap sccomp in a tryCatch that falls back to
+# propeller: propeller is fixed-effect, cannot fit (1 | Patient_nr), and inflates
+# effect sizes several-fold at this N.
+stopifnot("CMDSTAN is unset - was R started with --vanilla?" = nzchar(Sys.getenv("CMDSTAN")))
+cmdstan_ver <- tryCatch(cmdstanr::cmdstan_version(), error = function(e) NA_character_)
+stopifnot("cmdstan not usable - sccomp cannot run" = !is.na(cmdstan_ver))
+
+# sccomp's default Stan seed is sample(1e5, 1), so each render fit different posteriors:
+# 2-4 of 154 tests (c_pH0 0.02-0.08) changed side of 0.05 between renders. A set.seed()
+# here did not fix it, so every sccomp_estimate / sccomp_remove_outliers also gets this
+# seed explicitly and each model chunk re-seeds R right before fitting. Even so, two
+# renders still differ slightly (2 of 154 tests flipped, in a different analysis each
+# time; 2026-10-05), while two fits with the same seed on the small Q4b counts were
+# identical. Likely cause: multi-threaded cmdstan (cores = 8). cores = 1 is untested.
+sccomp_seed <- 20261005L
+
+output_dir <- "../sccomp_Outputs_2026b"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+# sccomp/cmdstan write the posterior draws as multi-GB CSVs. Its default is a relative
+# "sccomp_draws_files" in the working directory, i.e. the repo on the shared home mount
+# (4 GB per render; contributed to a quota failure). Keep them on the analysis disk.
+draws_dir <- file.path(output_dir, "sccomp_draws_files")
+dir.create(draws_dir, showWarnings = FALSE, recursive = TRUE)
+
+# ---- Data ---------------------------------------------------------------------------
+# nthreads = 1: multi-threaded qs2 reads of multi-GB Seurat objects can deadlock silently.
+tme <- qs_read("../new_data_2026b/Objects/TME/TMESubset_Revision.qs2", nthreads = 1)
+stopifnot("not the October 2026 TME object (expected 63 samples / 149,062 cells)" =
+            length(unique(tme$Sample)) == 63 && ncol(tme) == 149062)
+n_cells_all <- ncol(tme)
+n_samples_all <- length(unique(tme$Sample))
+n_patients_all <- length(unique(tme$Patient_nr))
+
+# Keep cell types present in >=10% of samples
+ct_freq <- tme@meta.data |>
+  group_by(majority_celltype) |>
+  summarise(n_cells = n(), n_samples = n_distinct(Sample), .groups = "drop") |>
+  mutate(pct_samples = 100 * n_samples / n_samples_all)
+keep_ct <- ct_freq |> filter(pct_samples >= 10) |> pull(majority_celltype)
+dropped_ct <- ct_freq |> filter(pct_samples < 10)
+tme <- subset(tme, majority_celltype %in% keep_ct)
+
+tme$origin <- factor(tme$origin, levels = c("non-malignant", "primary", "metastasis"))
+stopifnot("origin levels changed again - all cells would be NA" = !all(is.na(tme$origin)))
+
+# Q2: paired patients, derived from the data (a hard-coded list silently drops new pairs)
+paired_patients <- tme@meta.data |>
+  dplyr::distinct(Patient_nr, origin) |>
+  dplyr::filter(origin %in% c("non-malignant", "primary")) |>
+  dplyr::count(Patient_nr) |>
+  dplyr::filter(n == 2) |>
+  dplyr::pull(Patient_nr) |>
+  as.character() |>
+  sort()
+tme_paired <- subset(tme, Patient_nr %in% paired_patients & origin %in% c("non-malignant", "primary"))
+# Drop the empty "metastasis" level: left in, sccomp adds a design column with no samples
+# behind it (an "originmetastasis" coefficient estimated from the prior alone).
+tme_paired$origin <- droplevels(tme_paired$origin)
+
+# Q3: primary tumours with a known secondary mutation
+tme_secondary <- subset(tme, origin == "primary" & secondary_mutation %in% c("BAP1", "SF3B1", "EIF1AX"))
+tme_secondary$secondary_mutation <- factor(tme_secondary$secondary_mutation, levels = c("BAP1", "SF3B1", "EIF1AX"))
+
+# Q3b: choroidal primaries only
+tme_chor <- subset(tme, origin == "primary" & primary_location == "choroid" &
+                     secondary_mutation %in% c("BAP1", "SF3B1", "EIF1AX"))
+tme_chor$secondary_mutation <- factor(tme_chor$secondary_mutation, levels = c("BAP1", "SF3B1", "EIF1AX"))
+stopifnot("choroid subset is empty" = ncol(tme_chor) > 0)
+
+# Q4: primary tumour location.
+# We deliberately use `primary_location`, NOT `LocationPrimaryTumor`: the latter is
+# case-split by origin group ("Choroid" vs "choroid"), and a lowercase filter on it
+# matched zero primary cells. Ciliochoroidal (1 sample) is excluded: a mixed location,
+# Aizhan asked for it out, and a group of one is untestable.
+tme_location <- subset(tme, origin == "primary" & primary_location %in% c("choroid", "iris", "ciliary body"))
+stopifnot("location subset is empty - check primary_location levels" = ncol(tme_location) > 0)
+tme_location$LocationPrimaryTumor <- factor(tme_location$primary_location, levels = c("choroid", "iris", "ciliary body"))
+stopifnot("location factor is all NA" = !all(is.na(tme_location$LocationPrimaryTumor)))
+
+# Q4b: non-malignant samples by location
+tme_nm <- subset(tme, origin == "non-malignant" & healthy_location %in% c("choroid", "iris", "ciliary body"))
+stopifnot("non-malignant subset is empty - check healthy_location levels" = ncol(tme_nm) > 0)
+tme_nm$healthy_location <- factor(tme_nm$healthy_location, levels = c("choroid", "iris", "ciliary body"))
+
+# Q5: SubTyping categories present in >=10% of samples
+subtype_freq <- tme@meta.data |>
+  group_by(SubTyping) |>
+  summarise(n_samples = n_distinct(Sample), .groups = "drop") |>
+  mutate(pct_samples = 100 * n_samples / n_samples_all)
+keep_subtype <- subtype_freq |> filter(pct_samples >= 10) |> pull(SubTyping)
+tme_subtype <- subset(tme, SubTyping %in% keep_subtype)
+
+# ---- Sample counts per group (used in titles and text) --------------------------------
+n_per_group <- function(obj, col) {
+  x <- obj@meta.data |> distinct(Sample, .data[[col]]) |> count(.data[[col]])
+  stopifnot("a sample maps to several groups" = sum(x$n) == length(unique(obj$Sample)))
+  setNames(x$n, as.character(x[[1]]))
+}
+fmt_n <- function(n) paste(names(n), n, collapse = ", ")
+n_origin <- n_per_group(tme, "origin")
+n_sec    <- n_per_group(tme_secondary, "secondary_mutation")
+n_chor   <- n_per_group(tme_chor, "secondary_mutation")
+n_loc    <- n_per_group(tme_location, "LocationPrimaryTumor")
+n_nm     <- n_per_group(tme_nm, "healthy_location")
+stopifnot("a choroid mutation group has <3 samples - contrast not estimable" = all(n_chor >= 3))
+stopifnot("a non-malignant location has <3 samples - contrast not estimable" = all(n_nm >= 3))
+
+# ---- Helpers ------------------------------------------------------------------------
+# Keep the fixed-effect contrasts listed in `labels` (names = sccomp parameter, values =
+# display label). With (1 | Patient_nr) sccomp also returns one "(Intercept)___<patient>"
+# row per patient, and covariates add their own rows; neither belongs in the results.
+# `family` asserts that every parameter of the tested factor is accounted for.
+tidy_res <- function(res, cell_col, labels, family = ".") {
+  stopifnot("unexpected or missing contrasts" =
+              setequal(grep(family, unique(res$parameter), value = TRUE), names(labels)))
+  res |>
+    filter(parameter %in% names(labels)) |>
+    transmute(cell_group = .data[[cell_col]],
+              parameter = factor(unname(labels[parameter]), levels = unname(labels)),
+              c_effect, c_lower, c_upper, c_pH0, c_FDR,
+              significant = c_pH0 < 0.05) |>
+    arrange(parameter, c_pH0)
+}
+
+# Row-name widths are measured in a different font than the render node draws, so the
+# longest label ("Retinal Pigmented Epithelial cells") ran into the legend; widen the gap.
+ht_opt$HEATMAP_LEGEND_PADDING <- unit(10, "mm")
+star_legend <- Legend(title = "c_pH0", labels = c("*  < 0.05", "**  < 0.01", "***  < 0.001"),
+                      legend_gp = gpar(fill = "white"), border = FALSE)
+
+# Effect heatmap with significance stars; rows ordered by the first contrast. Saves a
+# 300-dpi PNG at the chunk's figure size and draws the same figure into the report.
+draw_fc <- function(df, title, file, split = FALSE) {
+  wide <- function(v) df |>
+    select(cell_group, parameter, all_of(v)) |>
+    pivot_wider(names_from = parameter, values_from = all_of(v), names_sort = TRUE) |>
+    column_to_rownames("cell_group") |>
+    as.matrix()
+  fc <- wide("c_effect")
+  ph0 <- wide("c_pH0")
+  stars <- ifelse(is.na(ph0), "",
+           ifelse(ph0 < 0.001, "***", ifelse(ph0 < 0.01, "**", ifelse(ph0 < 0.05, "*", ""))))
+  grp <- sub(": .*", "", colnames(fc))
+  ht <- Heatmap(
+    fc, name = "Effect (logit)",
+    col = colorRamp2(c(-2, 0, 2), c("#2166AC", "white", "#B2182B")),
+    na_col = "grey90",
+    rect_gp = gpar(col = "white", lwd = 1),
+    cell_fun = function(j, i, x, y, width, height, fill) {
+      grid.text(stars[i, j], x, y, gp = gpar(fontsize = 11, fontface = "bold"))
+    },
+    row_order = order(fc[, 1], decreasing = TRUE, na.last = TRUE),
+    cluster_rows = FALSE, cluster_columns = FALSE,
+    # Summary: one split per analysis, contrasts as rotated column names. Single
+    # analysis: each contrast is its own split, so its two-line label is drawn as the
+    # split title (multi-line column names overlap the body when not rotated).
+    column_split = factor(if (split) grp else colnames(fc), levels = unique(if (split) grp else colnames(fc))),
+    column_title = if (split) unique(grp) else sub(" vs ", "\nvs ", colnames(fc)),
+    show_column_names = split,
+    column_labels = sub("^[^:]*: ", "", colnames(fc)),
+    column_names_rot = 40,
+    column_names_gp = gpar(fontsize = 10),
+    column_title_gp = gpar(fontsize = 10, fontface = "bold"),
+    row_names_gp = gpar(fontsize = if (nrow(fc) > 20) 8 else 10),
+    # the 6 cm default clips "Retinal Pigmented Epithelial cells" into the legend
+    row_names_max_width = max_text_width(rownames(fc), gp = gpar(fontsize = 10)),
+    width = unit((if (split) 1.6 else 4) * ncol(fc), "cm")
+  )
+  render <- function() draw(ht, column_title = title,
+                            column_title_gp = gpar(fontsize = 12, fontface = "bold"),
+                            annotation_legend_list = list(star_legend), merge_legend = TRUE,
+                            padding = unit(c(15, 5, 5, 5), "mm"))  # rotated column labels touched the bottom
+  png(file, width = knitr::opts_current$get("fig.width"),
+      height = knitr::opts_current$get("fig.height"), units = "in", res = 300)
+  render()
+  invisible(dev.off())
+  render()
+  invisible(NULL)
+}
+
+draw_intervals <- function(res, labels, file) {
+  p <- res |> filter(parameter %in% names(labels)) |> plot_1D_intervals()
+  ggsave(file, p, width = knitr::opts_current$get("fig.width"),
+         height = knitr::opts_current$get("fig.height"), dpi = 300, bg = "white")
+  print(p)
+  invisible(NULL)
+}
+
+sig_line <- function(df) {
+  s <- df |>
+    filter(significant) |>
+    group_by(parameter) |>
+    summarise(txt = paste0(cell_group, ifelse(c_effect > 0, " (up)", " (down)"), collapse = ", "),
+              .groups = "drop")
+  if (nrow(s) == 0) return("no cell type reaches c_pH0 < 0.05.")
+  paste0("**", s$parameter, "**: ", s$txt, collapse = "; ")
+}
+
+res_dt <- function(df, caption) {
+  DT::datatable(df |> mutate(across(where(is.numeric), ~ signif(., 3))),
+                caption = caption, rownames = FALSE, filter = "top",
+                options = list(pageLength = 15, dom = "tip"))
+}
+
+save_boxplot <- function(res, factor, file, width = 14, height = 10) {
+  p <- sccomp_boxplot(res, factor = factor, remove_unwanted_effects = TRUE)
+  ggsave(file, p, width = width, height = height, dpi = 300, bg = "white")
+}
+```
+
+Cell-type composition of the uveal melanoma tumour microenvironment (October 2026 TME subset), tested with sccomp.
+
+<style>
+/* Cap figure size so plots do not blow up in a full-screen window (retina + dpi 300 gives ~150 px per inch). */
+.main-container img { max-width: min(100%, 1400px) !important; height: auto !important; display: block; margin: 0 auto; }
+.main-container .html-widget { max-width: 1400px; margin: 0 auto; }
+</style>
+
+# {.tabset}
+
+## Overview
+
+- **Data**: October 2026 reprocessed TME subset, `r format(n_cells_all, big.mark = ",")` cells, `r n_samples_all` samples, `r n_patients_all` patients.
+- **Method**: sccomp (Mangiola et al., 2023) models the cell counts of each sample with a Bayesian beta-binomial model and estimates how each cell type's proportion shifts between groups, using all cell types jointly. Effects are on the logit scale (positive = more of that cell type).
+- **Cell types**: `r length(keep_ct)` cell types present in at least 10% of samples are tested; dropped: `r if (nrow(dropped_ct)) paste0(dropped_ct$majority_celltype, " (", dropped_ct$n_samples, " samples)", collapse = ", ") else "none"`.
+- **Significance**: stars in the heatmaps are sccomp's per-test c_pH0 (posterior probability of no effect) < 0.05, without multiplicity adjustment. The interval plots colour by sccomp's Bayesian FDR (c_FDR < 0.05), which is slightly more permissive. Both values are in every table.
+- **Group sizes are small** (samples per group):
+    - Origin: `r fmt_n(n_origin)`
+    - Paired non-malignant / primary: `r length(paired_patients)` patients
+    - Secondary mutation, all pUM: `r fmt_n(n_sec)`
+    - Secondary mutation, choroidal pUM: `r fmt_n(n_chor)`
+    - Location, pUM: `r fmt_n(n_loc)`
+    - Location, non-malignant: `r fmt_n(n_nm)`
+
+Each tab shows the effect heatmap, the credible intervals, and the full results table.
+
+## Requested groupings {.tabset}
+
+### Origin
+
+Non-malignant vs primary vs metastasis, with a patient random effect (several patients contribute more than one sample).
+
+```{r q1-model, results='hide'}
+set.seed(sccomp_seed)
+res_origin <- tme |>
+  sccomp_estimate(
+    output_directory = draws_dir,
+    formula_composition = ~ origin + (1 | Patient_nr),
+    sample = "Sample",
+    cell_group = "majority_celltype",
+    bimodal_mean_variability_association = TRUE,
+    mcmc_seed = sccomp_seed,
+    cores = 8
+  ) |>
+  sccomp_remove_outliers(cores = 8, mcmc_seed = sccomp_seed) |>
+  sccomp_test(contrasts = c(
+    "originprimary",
+    "originmetastasis",
+    "originmetastasis - originprimary"
+  ))
+saveRDS(res_origin, file.path(output_dir, "sccomp_origin_results.rds"))
+save_boxplot(res_origin, "origin", file.path(output_dir, "boxplot_origin.png"))
+
+lab_origin <- c(originprimary = "Primary vs Non-malignant",
+                originmetastasis = "Met vs Non-malignant",
+                "originmetastasis - originprimary" = "Met vs Primary")
+res_origin_df <- tidy_res(res_origin, "majority_celltype", lab_origin)
+```
+
+```{r q1-heatmap, fig.width=10, fig.height=6.5}
+draw_fc(res_origin_df, paste0("Origin\n", fmt_n(n_origin), " samples"),
+        file.path(output_dir, "heatmap_origin_fc.png"))
+```
+
+```{r q1-intervals, fig.width=12, fig.height=11}
+draw_intervals(res_origin, lab_origin, file.path(output_dir, "intervals_origin.png"))
+```
+
+c_pH0 < 0.05: `r sig_line(res_origin_df)`
+
+```{r q1-table}
+res_dt(res_origin_df, "Origin contrasts")
+```
+
+### Secondary mutation, all pUM
+
+Primary tumours with a known secondary mutation (`r fmt_n(n_sec)` samples), adjusted for primary mutation; BAP1 is the reference.
+
+```{r q3-model, results='hide'}
+set.seed(sccomp_seed)
+res_secondary <- tme_secondary |>
+  sccomp_estimate(
+    output_directory = draws_dir,
+    # (1 | Patient_nr): 5 Batch03 patients contribute 2 libraries of the same tumour.
+    formula_composition = ~ secondary_mutation + primary_mutation + (1 | Patient_nr),
+    sample = "Sample",
+    cell_group = "majority_celltype",
+    bimodal_mean_variability_association = TRUE,
+    mcmc_seed = sccomp_seed,
+    cores = 8
+  ) |>
+  sccomp_remove_outliers(cores = 8, mcmc_seed = sccomp_seed) |>
+  sccomp_test()
+saveRDS(res_secondary, file.path(output_dir, "sccomp_secondary_mutation_results.rds"))
+save_boxplot(res_secondary, "secondary_mutation", file.path(output_dir, "boxplot_secondary.png"))
+
+lab_sec <- c(secondary_mutationSF3B1 = "SF3B1 vs BAP1", secondary_mutationEIF1AX = "EIF1AX vs BAP1")
+res_secondary_df <- tidy_res(res_secondary, "majority_celltype", lab_sec, family = "^secondary_mutation")
+```
+
+```{r q3-heatmap, fig.width=8, fig.height=6.5}
+draw_fc(res_secondary_df, paste0("Secondary mutation, all pUM\n", fmt_n(n_sec), " samples"),
+        file.path(output_dir, "heatmap_secondary_fc.png"))
+```
+
+```{r q3-intervals, fig.width=12, fig.height=6.5}
+draw_intervals(res_secondary, lab_sec, file.path(output_dir, "intervals_secondary.png"))
+```
+
+c_pH0 < 0.05: `r sig_line(res_secondary_df)`
+
+```{r q3-table}
+res_dt(res_secondary_df, "Secondary mutation contrasts vs BAP1, all primary tumours")
+```
+
+### Secondary mutation, choroidal pUM
+
+Choroid is the only location with all three mutations (iris primaries are BAP1 or unknown only; ciliary body has a single SF3B1 tumour). Patient P7 contributes two BAP1 samples, so the model has a patient random effect. Primary mutation is not a covariate: with `r sum(n_chor)` samples it would use most of the degrees of freedom.
+
+```{r q3b-model, results='hide'}
+set.seed(sccomp_seed)
+res_chor <- tme_chor |>
+  sccomp_estimate(
+    output_directory = draws_dir,
+    formula_composition = ~ secondary_mutation + (1 | Patient_nr),
+    sample = "Sample",
+    cell_group = "majority_celltype",
+    bimodal_mean_variability_association = TRUE,
+    mcmc_seed = sccomp_seed,
+    cores = 8
+  ) |>
+  sccomp_remove_outliers(cores = 8, mcmc_seed = sccomp_seed) |>
+  sccomp_test()
+saveRDS(res_chor, file.path(output_dir, "sccomp_secondary_mutation_choroid_results.rds"))
+save_boxplot(res_chor, "secondary_mutation", file.path(output_dir, "boxplot_secondary_choroid.png"))
+
+res_chor_df <- tidy_res(res_chor, "majority_celltype", lab_sec, family = "^secondary_mutation")
+```
+
+```{r q3b-heatmap, fig.width=8, fig.height=6.5}
+draw_fc(res_chor_df, paste0("Secondary mutation, choroidal pUM\n", fmt_n(n_chor), " samples"),
+        file.path(output_dir, "heatmap_secondary_choroid_fc.png"))
+```
+
+```{r q3b-intervals, fig.width=12, fig.height=6.5}
+draw_intervals(res_chor, lab_sec, file.path(output_dir, "intervals_secondary_choroid.png"))
+```
+
+c_pH0 < 0.05: `r sig_line(res_chor_df)`
+
+```{r q3b-table}
+res_dt(res_chor_df, "Secondary mutation contrasts vs BAP1, choroidal primary tumours")
+```
+
+### Location, pUM
+
+Primary tumours by location (`r fmt_n(n_loc)` samples; the one ciliochoroidal sample is excluded), adjusted for secondary mutation. Iris and ciliary body are each compared with choroid.
+
+```{r q4-model, results='hide'}
+# Cell-means coding (~ 0 + location): each location gets its own coefficient, so the
+# comparisons with choroid must be requested as explicit contrasts. Without them
+# sccomp_test tests each location's mean against zero, which is not a location effect.
+set.seed(sccomp_seed)
+res_location <- tme_location |>
+  sccomp_estimate(
+    output_directory = draws_dir,
+    formula_composition = ~ 0 + LocationPrimaryTumor + secondary_mutation + (1 | Patient_nr),
+    sample = "Sample",
+    cell_group = "majority_celltype",
+    bimodal_mean_variability_association = TRUE,
+    mcmc_seed = sccomp_seed,
+    cores = 8
+  ) |>
+  sccomp_remove_outliers(cores = 8, mcmc_seed = sccomp_seed) |>
+  sccomp_test(contrasts = c(
+    "LocationPrimaryTumoriris - LocationPrimaryTumorchoroid",
+    "`LocationPrimaryTumorciliary body` - LocationPrimaryTumorchoroid"
+  ))
+saveRDS(res_location, file.path(output_dir, "sccomp_location_results.rds"))
+save_boxplot(res_location, "LocationPrimaryTumor", file.path(output_dir, "boxplot_location.png"))
+
+lab_loc <- c("LocationPrimaryTumoriris - LocationPrimaryTumorchoroid" = "Iris vs Choroid",
+             "`LocationPrimaryTumorciliary body` - LocationPrimaryTumorchoroid" = "Ciliary body vs Choroid")
+res_location_df <- tidy_res(res_location, "majority_celltype", lab_loc, family = " - ")
+```
+
+```{r q4-heatmap, fig.width=8, fig.height=6.5}
+draw_fc(res_location_df, paste0("Location, pUM\n", fmt_n(n_loc), " samples"),
+        file.path(output_dir, "heatmap_location_fc.png"))
+```
+
+```{r q4-intervals, fig.width=12, fig.height=6.5}
+draw_intervals(res_location, lab_loc, file.path(output_dir, "intervals_location.png"))
+```
+
+c_pH0 < 0.05: `r sig_line(res_location_df)`
+
+```{r q4-table}
+res_dt(res_location_df, "Location contrasts vs choroid, primary tumours")
+```
+
+### Location, non-malignant
+
+Non-malignant uveal samples by tissue of origin (`r fmt_n(n_nm)` samples). Patient P38 contributes two samples, so the model has a patient random effect.
+
+```{r q4b-model, results='hide'}
+# Treatment coding with choroid as reference: iris - choroid and ciliary body - choroid, as in Q4.
+set.seed(sccomp_seed)
+res_nm <- tme_nm |>
+  sccomp_estimate(
+    output_directory = draws_dir,
+    formula_composition = ~ healthy_location + (1 | Patient_nr),
+    sample = "Sample",
+    cell_group = "majority_celltype",
+    bimodal_mean_variability_association = TRUE,
+    mcmc_seed = sccomp_seed,
+    cores = 8
+  ) |>
+  sccomp_remove_outliers(cores = 8, mcmc_seed = sccomp_seed) |>
+  sccomp_test()
+saveRDS(res_nm, file.path(output_dir, "sccomp_location_nonmalignant_results.rds"))
+save_boxplot(res_nm, "healthy_location", file.path(output_dir, "boxplot_location_nonmalignant.png"))
+
+lab_nm <- c(healthy_locationiris = "Iris vs Choroid", "healthy_locationciliary body" = "Ciliary body vs Choroid")
+res_nm_df <- tidy_res(res_nm, "majority_celltype", lab_nm, family = "^healthy_location")
+```
+
+```{r q4b-heatmap, fig.width=8, fig.height=6.5}
+draw_fc(res_nm_df, paste0("Location, non-malignant\n", fmt_n(n_nm), " samples"),
+        file.path(output_dir, "heatmap_location_nonmalignant_fc.png"))
+```
+
+```{r q4b-intervals, fig.width=12, fig.height=6.5}
+draw_intervals(res_nm, lab_nm, file.path(output_dir, "intervals_location_nonmalignant.png"))
+```
+
+c_pH0 < 0.05: `r sig_line(res_nm_df)`
+
+```{r q4b-table}
+res_dt(res_nm_df, "Location contrasts vs choroid, non-malignant samples")
+```
+
+## Other analyses {.tabset}
+
+### Paired non-malignant vs primary
+
+The `r length(paired_patients)` patients with both a non-malignant and a primary sample (`r paste(paired_patients, collapse = ", ")`), with a patient random effect.
+
+```{r q2-model, results='hide'}
+set.seed(sccomp_seed)
+res_paired <- tme_paired |>
+  sccomp_estimate(
+    output_directory = draws_dir,
+    formula_composition = ~ origin + (1 | Patient_nr),
+    sample = "Sample",
+    cell_group = "majority_celltype",
+    bimodal_mean_variability_association = TRUE,
+    mcmc_seed = sccomp_seed,
+    cores = 8
+  ) |>
+  sccomp_remove_outliers(cores = 8, mcmc_seed = sccomp_seed) |>
+  sccomp_test()
+saveRDS(res_paired, file.path(output_dir, "sccomp_paired_results.rds"))
+save_boxplot(res_paired, "origin", file.path(output_dir, "boxplot_paired.png"))
+
+lab_paired <- c(originprimary = "Primary vs Non-malignant")
+res_paired_df <- tidy_res(res_paired, "majority_celltype", lab_paired, family = "^origin")
+```
+
+```{r q2-heatmap, fig.width=6, fig.height=6.5}
+draw_fc(res_paired_df, sprintf("Paired, %d patients", length(paired_patients)),
+        file.path(output_dir, "heatmap_paired_fc.png"))
+```
+
+```{r q2-intervals, fig.width=10, fig.height=6.5}
+draw_intervals(res_paired, lab_paired, file.path(output_dir, "intervals_paired.png"))
+```
+
+c_pH0 < 0.05: `r sig_line(res_paired_df)`
+
+```{r q2-table}
+res_dt(res_paired_df, "Paired primary vs non-malignant")
+```
+
+### Origin by SubTyping
+
+Same origin model as the Origin tab, on the finer `SubTyping` annotation: `r length(keep_subtype)` of `r nrow(subtype_freq)` subtypes present in at least 10% of samples are tested.
+
+```{r q5-model, results='hide'}
+stopifnot("origin levels changed again" = !all(is.na(tme_subtype$origin)))
+set.seed(sccomp_seed)
+res_subtype <- tme_subtype |>
+  sccomp_estimate(
+    output_directory = draws_dir,
+    formula_composition = ~ origin + (1 | Patient_nr),
+    sample = "Sample",
+    cell_group = "SubTyping",
+    bimodal_mean_variability_association = TRUE,
+    mcmc_seed = sccomp_seed,
+    cores = 8
+  ) |>
+  sccomp_remove_outliers(cores = 8, mcmc_seed = sccomp_seed) |>
+  sccomp_test(contrasts = c(
+    "originprimary",
+    "originmetastasis",
+    "originmetastasis - originprimary"
+  ))
+saveRDS(res_subtype, file.path(output_dir, "sccomp_subtyping_results.rds"))
+save_boxplot(res_subtype, "origin", file.path(output_dir, "boxplot_subtyping.png"), width = 16, height = 14)
+
+res_subtype_df <- tidy_res(res_subtype, "SubTyping", lab_origin)
+```
+
+```{r q5-heatmap, fig.width=10, fig.height=11}
+draw_fc(res_subtype_df, paste0("Origin by SubTyping\n", fmt_n(n_origin), " samples"),
+        file.path(output_dir, "heatmap_subtyping_fc.png"))
+```
+
+```{r q5-intervals, fig.width=14, fig.height=16}
+draw_intervals(res_subtype, lab_origin, file.path(output_dir, "intervals_subtyping.png"))
+```
+
+c_pH0 < 0.05: `r sig_line(res_subtype_df)`
+
+```{r q5-table}
+res_dt(res_subtype_df, "Origin contrasts by SubTyping")
+```
+
+## Summary across groupings
+
+All `majority_celltype` contrasts side by side (SubTyping not included). Grey tiles: cell type not present in that subset.
+
+```{r combined-heatmap, fig.width=14, fig.height=8}
+all_results <- bind_rows(
+  "Origin" = res_origin_df,
+  "Paired" = res_paired_df,
+  "Mutation\nall pUM" = res_secondary_df,
+  "Mutation\nchoroid pUM" = res_chor_df,
+  "Location\npUM" = res_location_df,
+  "Location\nnon-malignant" = res_nm_df,
+  .id = "Analysis"
+) |>
+  mutate(Comparison = paste(Analysis, parameter, sep = ": "),
+         Comparison = factor(Comparison, levels = unique(Comparison)))
+stopifnot("duplicate cell type x comparison rows" = !anyDuplicated(all_results[c("cell_group", "Comparison")]))
+write_csv(all_results |> mutate(across(c(Analysis, Comparison), ~ gsub("\n", " ", .))),
+          file.path(output_dir, "sccomp_all_results.csv"))
+
+draw_fc(all_results |> mutate(parameter = Comparison), "sccomp summary, UM TME",
+        file.path(output_dir, "heatmap_combined_summary.png"), split = TRUE)
+```
+
+## Methods and session info
+
+- sccomp `r packageVersion("sccomp")` with cmdstan `r cmdstan_ver`. Each model: `sccomp_estimate(bimodal_mean_variability_association = TRUE)`, then `sccomp_remove_outliers()` (refit without outlier observations), then `sccomp_test()`.
+- sccomp fits by approximate inference (pathfinder) with a fixed seed (`r sccomp_seed`). Results with c_pH0 between about 0.02 and 0.08 are borderline: between test renders, 2 to 4 of the 154 summary tests changed side of 0.05.
+- Intervals are 95% credible intervals of the composition effect. c_pH0 is the posterior probability that the effect is within sccomp's default null interval; c_FDR is sccomp's Bayesian FDR.
+- Per-sample boxplots (`sccomp_boxplot`, unwanted effects removed), all figures at 300 dpi, the fitted models (`.rds`) and the combined table `sccomp_all_results.csv` are in `sccomp_Outputs_2026b/`.
+
+| Analysis | Samples | Formula | Tested |
+|---|---|---|---|
+| Origin | all | `~ origin + (1 \| Patient_nr)` | primary, metastasis, metastasis - primary |
+| Secondary mutation, all pUM | pUM, BAP1/SF3B1/EIF1AX | `~ secondary_mutation + primary_mutation + (1 \| Patient_nr)` | SF3B1, EIF1AX vs BAP1 |
+| Secondary mutation, choroidal pUM | choroidal pUM, BAP1/SF3B1/EIF1AX | `~ secondary_mutation + (1 \| Patient_nr)` | SF3B1, EIF1AX vs BAP1 |
+| Location, pUM | pUM, choroid/iris/ciliary body | `~ 0 + LocationPrimaryTumor + secondary_mutation + (1 \| Patient_nr)` | iris - choroid, ciliary body - choroid |
+| Location, non-malignant | non-malignant, choroid/iris/ciliary body | `~ healthy_location + (1 \| Patient_nr)` | iris, ciliary body vs choroid |
+| Paired | paired patients, non-malignant + primary | `~ origin + (1 \| Patient_nr)` | primary vs non-malignant |
+| Origin by SubTyping | all | `~ origin + (1 \| Patient_nr)` | as Origin |
+
+Changes from the previous version of this report: the all-pUM secondary mutation and pUM location models now include the patient random effect, because 5 patients contribute two libraries of the same tumour; this lowers the number of location calls; the pUM location comparison now tests iris and ciliary body against choroid (it previously showed each location's mean against zero); the paired table no longer includes the per-patient intercept rows; both choroid-only and non-malignant analyses now have interval plots and are in the summary heatmap.
+
+```{r session}
+sessionInfo()
+```

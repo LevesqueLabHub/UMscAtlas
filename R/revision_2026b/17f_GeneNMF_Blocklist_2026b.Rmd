@@ -1,0 +1,303 @@
+---
+title: "UM Atlas - GeneNMF meta-programs without ribosomal and mitochondrial genes"
+output:
+  html_document:
+    self_contained: true
+    includes:
+      in_header: !expr system.file("templates/fgcz_header.html", package = "ezRun", lib.loc = .libPaths())
+    css: !expr system.file("templates/fgcz.css", package = "ezRun", lib.loc = .libPaths())
+    code_folding: hide
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(dev = c("png", "cairo_pdf"), dpi = 300,
+                      fig.path = "../Figures_2026b/GeneNMF_blocklist/")
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, comment = "", fig.width = 12, fig.height = 8)
+library(ggsignif)
+library(viridis)
+library(patchwork)
+library(tidyverse)
+source("config_colors_2026b.R")
+theme_set(theme_minimal(base_size = 13))
+
+gn <- "../Outputs/GeneNMF_2026b"
+rep_dir <- file.path(gn, "blocklist_report")
+run_dirs <- c(ribo_mito = "blocklist_test_ribo_mito", ribo_mito_stress = "blocklist_test")
+run_names <- c(ribo_mito = "ribosomal + mitochondrial genes removed",
+               ribo_mito_stress = "ribosomal + mitochondrial + immediate-early / heat-shock genes removed")
+cuts <- c(3L, 6L)
+
+samples <- read_csv(file.path(rep_dir, "scores_per_sample.csv"), show_col_types = FALSE)
+metrics <- read_csv(file.path(rep_dir, "mp_metrics.csv"), show_col_types = FALSE)
+ann <- read_csv(file.path(rep_dir, "mp_genes_annotated.csv"), show_col_types = FALSE)
+blocklists <- lapply(run_dirs, function(d) readLines(file.path(gn, d, "blocklist.txt")))
+stopifnot(all(samples$origin %in% c("primary", "metastasis")), !anyNA(samples$chr3_loss))
+```
+
+```{r derive, include=FALSE}
+# ---- unit of replication: the patient (repeat libraries of one tumour are averaged) ----
+score_cols <- setdiff(names(samples), c("orig.ident", "Patient_nr", "origin", "secondary_mutation", "primary_location",
+                                        "n_cells", "chr3_loss", "chr8_gain"))
+patients <- samples %>%
+  group_by(Patient_nr, origin, secondary_mutation, primary_location) %>%
+  summarise(n_samples = n(), across(c(chr3_loss, chr8_gain, all_of(score_cols)), mean), .groups = "drop") %>%
+  mutate(chr3 = factor(ifelse(chr3_loss >= 0.5, "monosomy 3", "disomy 3"), levels = c("disomy 3", "monosomy 3")))
+stopifnot("a patient with two metadata rows" = !anyDuplicated(patients[, c("Patient_nr", "origin")]))
+pum <- dplyr::filter(patients, origin == "primary")
+mut_levels <- c("BAP1", "SF3B1", "EIF1AX")
+loc_levels <- c("choroid", "iris", "ciliary body")
+
+signif_label <- function(p) sprintf("%s  p %s",
+  as.character(cut(p, c(-Inf, 0.001, 0.01, 0.05, Inf), c("***", "**", "*", "ns"))),
+  ifelse(p < 2.2e-16, "< 2.2e-16", paste("=", formatC(p, digits = 2, format = "g"))))
+fmt_p <- function(p) formatC(p, digits = 2, format = "g")
+n_labels <- function(d, var, lv) { n <- table(factor(d[[var]], levels = lv)); setNames(sprintf("%s\n(n = %d)", lv, n), lv) }
+
+# ---- uveal melanoma knowledge used to read the programs (sources in the References tab) ----
+long_kb <- 100
+categories <- list(
+  "HLA / antigen presentation" = function(g) grepl("^HLA-", g) | g %in% c("B2M", "CD74", "TAP1", "TAP2", "PSMB8", "PSMB9"),
+  "MIF" = function(g) g == "MIF",
+  "UM aggressiveness / prognosis" = function(g) g %in% c("PRAME", "CITED1", "EMP1", "EMP3", "SDCBP", "SPARC", "CDH1", "SERPINF1"),
+  "melanocytic / S100" = function(g) g %in% c("MITF", "PMEL", "TYR", "DCT", "MLANA", "TYRP1", "GPNMB", "OCA2") | grepl("^S100", g),
+  "immediate-early / heat shock" = function(g) grepl("^HSP[ABDEH]|^HSP90|^DNAJ", g) |
+    g %in% c("FOS", "FOSB", "JUN", "JUNB", "JUND", "EGR1", "EGR2", "EGR3", "IER2", "IER3", "ATF3", "ZFP36", "DUSP1",
+             "NR4A1", "NR4A2", "KLF2", "KLF4", "KLF6", "PPP1R15A", "GADD45B", "BTG2", "BAG3", "CRYAB"),
+  "p53 / DNA damage stress" = function(g) g %in% c("CDKN1A", "H2AX", "GDF15", "SERTAD1", "PLK2", "TP53INP1", "MDM2", "SESN1", "SESN2"),
+  "oxidative phosphorylation" = function(g) grepl("^COX[0-9]|^NDUF|^UQCR|^ATP5|^MT-", g),
+  "ribosome / translation" = function(g) grepl("^RP[SL]|^EEF|^EIF[0-9]", g))
+cat_cols <- c("HLA / antigen presentation" = "#D55E00", "MIF" = "#CC79A7", "UM aggressiveness / prognosis" = "#E69F00",
+              "melanocytic / S100" = "#56B4E9", "immediate-early / heat shock" = "#B2182B", "p53 / DNA damage stress" = "#F4A582",
+              "oxidative phosphorylation" = "#009E73", "ribosome / translation" = "#7FBF7B",
+              "long gene (> 100 kb)" = "grey55", "other" = "grey93")
+gene_category <- function(g, span) {
+  out <- rep("other", length(g))
+  for (k in rev(names(categories))) out[categories[[k]](g)] <- k
+  out[out == "other" & !is.na(span) & span > long_kb] <- "long gene (> 100 kb)"
+  out
+}
+ref_cols <- c(ref_HLA_class_I = "HLA class I", ref_HLA_class_II = "HLA class II", ref_PRAME = "PRAME", ref_MIF = "MIF",
+              ref_melanocytic = "melanocytic genes", chr3_loss = "chr3 loss (iCNV)", chr8_gain = "chr8 gain (iCNV)")
+
+# ---- positive controls: the known associations must show up in this cohort at patient level ----
+pc_prame <- wilcox.test(ref_PRAME ~ I(secondary_mutation == "SF3B1"), data = dplyr::filter(pum, secondary_mutation %in% mut_levels))
+pc_hla <- wilcox.test(ref_HLA_class_I ~ chr3, data = pum)
+pc_bap1_chr3 <- table(dplyr::filter(patients, secondary_mutation %in% c("BAP1", "SF3B1", "EIF1AX")) %>%
+                        transmute(BAP1 = secondary_mutation == "BAP1", chr3))
+
+# ---- per run x cut: everything one report section needs ----
+prep <- function(run, n) {
+  m <- dplyr::filter(metrics, run == !!run, nMP == n)
+  ids <- m$id; short <- setNames(m$MP, ids)
+  mp_obj <- qs2::qs_read(file.path(gn, run_dirs[[run]], sprintf("geneNMF_metaprograms_blocklist_nMP%d.qs2", n)), nthreads = 1)
+  weights <- setNames(mp_obj$metaprograms.genes.weights[unname(short)], ids)
+  stopifnot("MP weights missing" = !any(sapply(weights, is.null)))
+  a <- dplyr::filter(ann, id %in% ids) %>% mutate(category = gene_category(gene, span_kb), MP = short[id])
+  top3 <- a %>% dplyr::filter(rank <= 3) %>% group_by(id) %>% summarise(t = paste(gene, collapse = ", "))
+  label <- setNames(sprintf("%s (%s)", short[top3$id], top3$t), top3$id)[ids]
+  cat_share <- a %>% dplyr::filter(rank <= 50) %>% count(MP, category) %>% group_by(MP) %>% mutate(share = n / sum(n)) %>% ungroup()
+  chr3_share <- a %>% group_by(MP) %>% summarise(chr3 = mean(chr == "3", na.rm = TRUE))
+
+  # per-patient tests. chr3 within primaries only: nearly every metastasis is monosomy 3, so across all tumours
+  # a chr3 test is a primary-vs-metastasis test in disguise.
+  tests <- bind_rows(lapply(ids, function(k) {
+    d_mut <- dplyr::filter(pum, secondary_mutation %in% mut_levels)
+    d_loc <- dplyr::filter(pum, primary_location %in% loc_levels)
+    tibble(id = k, test = c("secondary mutation (pUM)", "BAP1 vs SF3B1 + EIF1AX (pUM)", "monosomy 3 vs disomy 3 (pUM)",
+                            "location (pUM)", "primary vs metastasis"),
+           p = c(kruskal.test(d_mut[[k]], factor(d_mut$secondary_mutation))$p.value,
+                 wilcox.test(d_mut[[k]] ~ I(d_mut$secondary_mutation == "BAP1"))$p.value,
+                 wilcox.test(pum[[k]] ~ pum$chr3)$p.value,
+                 kruskal.test(d_loc[[k]], factor(d_loc$primary_location))$p.value,
+                 wilcox.test(patients[[k]] ~ patients$origin)$p.value))
+  })) %>% group_by(test) %>% mutate(p_adj = p.adjust(p, "BH")) %>% ungroup() %>% mutate(MP = short[id])
+  cors <- expand_grid(id = ids, ref = names(ref_cols)) %>% rowwise() %>%
+    mutate(rho = cor(patients[[id]], patients[[ref]], method = "spearman"),
+           p = cor.test(patients[[id]], patients[[ref]], method = "spearman", exact = FALSE)$p.value) %>% ungroup() %>%
+    mutate(MP = short[id], ref = factor(ref_cols[ref], levels = ref_cols))
+
+  enr <- read_csv(file.path(gn, run_dirs[[run]], "mp_enrichment_ora_vs_goseq.csv"), show_col_types = FALSE) %>%
+    dplyr::filter(run == sprintf("blocklist nMP%d", n)) %>%
+    mutate(padj_ora = replace_na(padj_ora, 1), padj_goseq = replace_na(padj_goseq, 1))
+  top_enr <- enr %>% dplyr::filter(pmin(padj_ora, padj_goseq) < 0.05) %>% group_by(MP) %>%
+    slice_min(pmin(padj_ora, padj_goseq), n = 8, with_ties = FALSE) %>% ungroup() %>%
+    mutate(term = str_to_sentence(gsub("_", " ", sub("^(GOBP|HALLMARK|REACTOME)_", "", term))),
+           term = gsub("(?i)\\b(Uv|Sasp|Tnfa|Nfkb|P53|Hsf1|Atp|Tgf|Notch1|Notch|Hlh|Myc|Dna|Rna|Mtorc1|Kras|E2f|G2m|Il2|Il6|Stat3|Stat5|Jak|Mapk|Ngf|Hla|Mhc|Nk|Tp53|Gtse1|G2|Ifn|Rho|Gtpase|Er)\\b", "\\U\\1", term, perl = TRUE),
+           term = paste0(str_trunc(term, 55), " [", source, "]"))
+  orig <- qs2::qs_read(file.path(gn, sprintf("geneNMF_metaprograms_nMP%d.qs2", n)), nthreads = 1)$metaprograms.genes
+  new <- split(a$gene, a$MP)[unname(short)]
+  jac <- outer(names(new), names(orig), Vectorize(function(x, y)
+    length(intersect(new[[x]], orig[[y]])) / length(union(new[[x]], orig[[y]])))) |> `dimnames<-`(list(names(new), names(orig)))
+  list(run = run, n = n, m = m, ids = ids, weights = weights, short = short, label = label, a = a, cat_share = cat_share,
+       chr3_share = chr3_share, tests = tests, cors = cors, enr = enr, top_enr = top_enr, jac = jac)
+}
+keys <- as.vector(outer(names(run_dirs), cuts, function(r, n) paste0(r, "_nMP", n)))
+S <- setNames(lapply(keys, function(k) prep(sub("_nMP[0-9]+$", "", k), as.integer(sub(".*_nMP", "", k)))), keys)
+
+# ---- plot helpers ----
+gene_map <- function(s, top = 30) {
+  d <- s$a %>% dplyr::filter(rank <= top) %>% mutate(MP = factor(s$label[id], levels = s$label),
+                                                    category = factor(category, levels = names(cat_cols)))
+  ggplot(d, aes(MP, rank, fill = category)) + geom_tile(colour = "white", linewidth = 0.6) +
+    geom_text(aes(label = gene), size = 3) + scale_y_reverse(breaks = c(1, 10, 20, 30), expand = c(0, 0)) +
+    scale_x_discrete(position = "top", labels = function(x) str_wrap(x, 22)) +
+    scale_fill_manual(values = cat_cols, drop = FALSE, name = NULL) +
+    labs(x = NULL, y = "rank in MP") + theme(panel.grid = element_blank(), legend.position = "bottom") +
+    guides(fill = guide_legend(nrow = 3))
+}
+patient_box <- function(s, d, var, lv, cols, comparisons, title) {
+  long <- d %>% dplyr::filter(.data[[var]] %in% lv) %>% select(Patient_nr, origin, all_of(var), all_of(s$ids)) %>%
+    pivot_longer(all_of(s$ids), names_to = "id", values_to = "score") %>%
+    mutate(MP = factor(s$label[id], levels = s$label), grp = factor(.data[[var]], levels = lv))
+  stopifnot(nrow(long) > 0)
+  ggplot(long, aes(grp, score, fill = grp)) + geom_boxplot(outlier.shape = NA, alpha = 0.75) +
+    geom_jitter(aes(shape = origin), width = 0.15, size = 2) +
+    geom_signif(comparisons = comparisons, test = "wilcox.test", map_signif_level = signif_label,
+                step_increase = 0.12, tip_length = 0.01, textsize = 3) +
+    facet_wrap(~ MP, scales = "free_y", ncol = 3, labeller = label_wrap_gen(35)) +
+    scale_fill_manual(values = cols, guide = "none") + scale_x_discrete(labels = n_labels(dplyr::filter(d, .data[[var]] %in% lv), var, lv)) +
+    scale_y_continuous(expand = expansion(mult = c(0.05, 0.25))) + scale_shape_manual(values = c(primary = 16, metastasis = 17)) +
+    labs(x = NULL, y = "MP score (PLAID), mean per patient", title = title)
+}
+chr3_cols <- c("disomy 3" = "grey70", "monosomy 3" = "#B2182B")
+left_room <- theme(plot.margin = margin(10, 10, 5.5, 60))
+```
+
+This report repeats the GeneNMF meta-program (MP) analysis of report 17 with two gene blocklists. The first removes ribosomal and mitochondrial genes, as Victoria and Aizhan asked. The second also removes immediate-early and heat-shock genes. Each MP is then read against what is known about uveal melanoma: HLA class I, MIF, PRAME, monosomy 3 and BAP1.
+
+<style>
+.main-container img { max-width: min(100%, 1400px) !important; height: auto !important; display: block; margin: 0 auto; }
+.main-container .html-widget { max-width: 1400px; margin: 0 auto; }
+</style>
+
+# {.tabset}
+
+## Overview
+
+```{r overview_text, include=FALSE}
+hits <- bind_rows(lapply(S, function(s) s$tests %>% mutate(section = sprintf("%s, nMP = %d", run_names[[s$run]], s$n),
+                                                          label = s$label[id]))) %>% dplyr::filter(p_adj < 0.05)
+hit_txt <- if (!nrow(hits)) "No MP differs between the groups after BH correction (within each test and cut)." else
+  paste0("MPs that differ after BH correction: ", paste(sprintf("%s, %s: %s (adj. p %s)", hits$section, hits$label, hits$test, fmt_p(hits$p_adj)), collapse = "; "), ".")
+n_pat <- nrow(patients); n_pum <- nrow(pum)
+min_genetic_p <- min(bind_rows(lapply(S, function(x) x$tests)) %>% dplyr::filter(grepl("chr3|BAP1|secondary", test)) %>% pull(p_adj))
+```
+
+- **Data**: `r format(sum(samples$n_cells), big.mark = ",")` malignant cells from `r nrow(samples)` tumour samples with more than 500 malignant cells, the same cells as report 17. They come from `r n_pat` patient-tumours (`r n_pum` primaries). Every test uses one value per patient.
+- **Blocklists**: `r length(blocklists$ribo_mito)` ribosomal and mitochondrial genes, then `r length(blocklists$ribo_mito_stress)` once the immediate-early and heat-shock genes are added. The NMF was rerun on the same samples, seed and cells as report 17. The blocklist is the only change.
+- **Positive controls**: PRAME is higher in SF3B1 tumours (p `r fmt_p(pc_prame$p.value)`) and HLA class I is higher in monosomy 3 primaries (p `r fmt_p(pc_hla$p.value)`). These are known associations, so they show whether the cohort can detect such a difference at patient level. See the Positive controls tab.
+- **Monosomy 3 and BAP1**: across both blocklists and both cuts, the lowest adjusted p for any MP is `r fmt_p(min_genetic_p)` (chr3, BAP1 and secondary-mutation tests within primaries). The HLA class I gene set alone separates monosomy 3 primaries (positive control), but no MP does, including the one led by HLA-A/B/C. In the MPs, those genes are diluted among about 100-200 others.
+- `r hit_txt` Primary vs metastasis is the only contrast where several MPs differ. Metastases also differ in tissue, biopsy type and processing, so that contrast does not isolate tumour biology.
+
+## Positive controls
+
+Two associations from the literature, tested exactly as the MPs are (one value per patient). PRAME is linked to SF3B1 mutation (Field 2016). HLA class I expression is higher in monosomy 3 tumours, as part of the "inflammatory phenotype" (Maat 2008). Monosomy 3 is called per tumour from the iCNV chr3-loss calls, as at least half of the malignant cells with chr3 loss. Chromosome 3 tests use primaries only: `r sum(patients$origin == "metastasis" & patients$chr3 == "monosomy 3")` of `r sum(patients$origin == "metastasis")` metastases are monosomy 3, so across all tumours a chr3 test mostly compares primaries with metastases.
+
+```{r positive_controls, fig.width = 12, fig.height = 5.5}
+p1 <- ggplot(dplyr::filter(pum, secondary_mutation %in% mut_levels) %>% mutate(g = factor(secondary_mutation, mut_levels)),
+             aes(g, ref_PRAME, fill = g)) + geom_boxplot(outlier.shape = NA, alpha = 0.75) + geom_jitter(width = 0.15, size = 2) +
+  geom_signif(comparisons = list(c("BAP1", "SF3B1"), c("SF3B1", "EIF1AX")), test = "wilcox.test", map_signif_level = signif_label,
+              step_increase = 0.12, textsize = 3) +
+  scale_fill_manual(values = second_mutations_col, guide = "none") +
+  scale_x_discrete(labels = n_labels(dplyr::filter(pum, secondary_mutation %in% mut_levels), "secondary_mutation", mut_levels)) +
+  labs(x = NULL, y = "PRAME (PLAID), mean per patient", title = "PRAME by mutation (pUM)")
+p2 <- ggplot(pum, aes(chr3, ref_HLA_class_I, fill = chr3)) + geom_boxplot(outlier.shape = NA, alpha = 0.75) +
+  geom_jitter(aes(shape = origin), width = 0.15, size = 2) +
+  geom_signif(comparisons = list(c("disomy 3", "monosomy 3")), test = "wilcox.test", map_signif_level = signif_label, textsize = 3) +
+  scale_fill_manual(values = chr3_cols, guide = "none") + scale_shape_manual(values = c(primary = 16, metastasis = 17)) +
+  scale_x_discrete(labels = n_labels(pum, "chr3", levels(pum$chr3))) +
+  labs(x = NULL, y = "HLA class I (PLAID), mean per patient", title = "HLA class I by chr3 (pUM)")
+p3 <- ggplot(patients, aes(chr3_loss, fill = secondary_mutation)) + geom_histogram(bins = 20, colour = "white") +
+  geom_vline(xintercept = 0.5, linetype = 2) + scale_fill_manual(values = second_mutations_col) +
+  labs(x = "share of malignant cells with chr3 loss (iCNV)", y = "patients", fill = NULL, title = "chr3 loss per tumour")
+p1 + p2 + p3
+```
+
+Of the tumours with a BAP1 call, `r pc_bap1_chr3["TRUE", "monosomy 3"]` of `r sum(pc_bap1_chr3["TRUE", ])` are monosomy 3. Of the SF3B1 or EIF1AX tumours, `r pc_bap1_chr3["FALSE", "monosomy 3"]` of `r sum(pc_bap1_chr3["FALSE", ])` are. So the iCNV chr3 call agrees with the mutation calls, as expected (BAP1 sits on chromosome 3).
+
+```{r sections_setup, include = FALSE}
+sec_child <- setNames(lapply(keys, function(k) {
+  f <- file.path(tempdir(), sprintf("17f_section_%s.Rmd", k))
+  writeLines(knitr::knit_expand("17f_section.Rmd", key = k, n = sub(".*_nMP", "", k)), f); f
+}), keys)
+```
+
+## Ribosomal + mitochondrial removed {.tabset}
+
+The blocklist Victoria and Aizhan asked for: `r length(blocklists$ribo_mito)` genes (RPS/RPL/RPLP, MRPS/MRPL, MT-). Stress genes are kept.
+
+```{r set_ribo_mito_nMP3, include = FALSE}
+s <- S[["ribo_mito_nMP3"]]
+```
+
+```{r section_ribo_mito_nMP3, child = sec_child[["ribo_mito_nMP3"]]}
+```
+
+```{r set_ribo_mito_nMP6, include = FALSE}
+s <- S[["ribo_mito_nMP6"]]
+```
+
+```{r section_ribo_mito_nMP6, child = sec_child[["ribo_mito_nMP6"]]}
+```
+
+## + stress genes removed {.tabset}
+
+The same blocklist plus immediate-early and heat-shock genes (HSP*, DNAJ*, FOS/JUN/EGR, ZFP36, DUSP1, ATF3, NR4A and others): `r length(blocklists$ribo_mito_stress)` genes in total. This tests whether a stress program survives without the genes most often attributed to tissue dissociation.
+
+```{r set_ribo_mito_stress_nMP3, include = FALSE}
+s <- S[["ribo_mito_stress_nMP3"]]
+```
+
+```{r section_ribo_mito_stress_nMP3, child = sec_child[["ribo_mito_stress_nMP3"]]}
+```
+
+```{r set_ribo_mito_stress_nMP6, include = FALSE}
+s <- S[["ribo_mito_stress_nMP6"]]
+```
+
+```{r section_ribo_mito_stress_nMP6, child = sec_child[["ribo_mito_stress_nMP6"]]}
+```
+
+## nMP choice
+
+```{r sweep_plot, fig.width = 11, fig.height = 4.5}
+sw <- bind_rows(lapply(names(run_dirs), function(r) read_csv(file.path(gn, run_dirs[[r]], "nMP_sweep_blocklist.csv"), show_col_types = FALSE) %>%
+  mutate(run = run_names[[r]]))) %>% group_by(run, nMP) %>%
+  summarise(`mean silhouette` = mean(silhouette), `MPs with negative silhouette` = sum(silhouette < 0),
+            `lowest sample coverage` = min(sampleCoverage), .groups = "drop") %>%
+  pivot_longer(-c(run, nMP))
+ggplot(sw, aes(nMP, value, colour = str_wrap(run, 40))) + geom_line() + geom_point() + facet_wrap(~ name, scales = "free_y") +
+  scale_x_continuous(breaks = 3:10) + labs(colour = NULL, y = NULL) + theme(legend.position = "bottom")
+```
+
+GeneNMF metrics for nMP = 3 to 10 on each new program pool. nMP = 3 is the only cut where every MP has a positive silhouette in both runs.
+
+## Methods
+
+- **Blocklists**: genes matching `^RP[SL][0-9]`, `^RPLP`, `^MRP[SL][0-9]` and `^MT-` (ribosomal and mitochondrial). The second run also blocks `^HSP[ABDEH]`, `^HSP90`, `^DNAJ` and a list of `r length(blocklists$ribo_mito_stress) - length(blocklists$ribo_mito)` immediate-early and stress genes (full lists: `blocklist.txt` in each run folder). The blocklist goes to `GeneNMF::multiNMF(hvg.blocklist = )`, which removes the genes before the variable-gene selection.
+- **NMF**: `multiNMF(assay = "RNA", k = 4:9, min.exp = 0.05)` on each sample with at least 300 malignant cells, 500 random cells per sample (seed 42), as in report 17; `getMetaPrograms(nMP = 3)` and `(nMP = 6)`. Script `17e_NMF_blocklist_goseq.R`.
+- **Scores**: PLAID (mean z-score of log1p CP10k over the MP genes) on the malignant cells of samples with more than 500 malignant cells. All MPs and reference sets were scored in one call, so they share a scale. Script `17f_blocklist_scores.R`.
+- **Statistics**: one value per patient (mean over that patient's samples); Kruskal-Wallis for three groups, Wilcoxon for two, Spearman for correlations; BH correction across the MPs of one cut within each test. Monosomy 3 means at least half of a tumour's malignant cells carry an iCNV chr3-loss call; chr3 tests use primaries only (metastases are nearly all monosomy 3).
+- **Enrichment**: GO BP, Hallmark and Reactome (msigdbr), with the atlas genes minus the blocklist as universe, tested two ways. One is plain over-representation (`clusterProfiler::enricher`). The other is `goseq` (Wallenius) with gene span (Ensembl v86) as bias covariate, which corrects for the long-gene bias found in report 17.
+- **Gene categories** on the gene maps are a reading aid from the literature, not a test.
+
+## References
+
+Literature used to read the programs (retrieved from PubMed):
+
+- Maat W et al. Monosomy of chromosome 3 and an inflammatory phenotype occur together in uveal melanoma. IOVS 2008. [doi:10.1167/iovs.07-0786](https://doi.org/10.1167/iovs.07-0786)
+- Repp AC et al. Human uveal melanoma cells produce macrophage migration-inhibitory factor to prevent lysis by NK cells. J Immunol 2000. [doi:10.4049/jimmunol.165.2.710](https://doi.org/10.4049/jimmunol.165.2.710)
+- Ambrosini G et al. Uveal melanoma exosomes induce a prometastatic microenvironment through macrophage migration inhibitory factor. Mol Cancer Res 2022. [doi:10.1158/1541-7786.MCR-21-0526](https://doi.org/10.1158/1541-7786.MCR-21-0526)
+- Field MG et al. PRAME as an independent biomarker for metastasis in uveal melanoma. Clin Cancer Res 2016. [doi:10.1158/1078-0432.CCR-15-2071](https://doi.org/10.1158/1078-0432.CCR-15-2071)
+- Field MG et al. Epigenetic reprogramming and aberrant expression of PRAME are associated with increased metastatic risk in Class 1 and Class 2 uveal melanomas. Oncotarget 2016. [doi:10.18632/oncotarget.10962](https://doi.org/10.18632/oncotarget.10962)
+- Kaochar S et al. ICG-001 exerts potent anticancer activity against uveal melanoma cells (CITED1, EMP1, EMP3, SDCBP, SPARC, CDH1 as genes associated with aggressiveness). IOVS 2018. [doi:10.1167/iovs.17-22454](https://doi.org/10.1167/iovs.17-22454)
+- Jones NM et al. Natural killer cells and pigment epithelial-derived factor control the infiltrative and nodular growth of hepatic metastases in an orthotopic murine model of ocular melanoma. BMC Cancer 2019. [doi:10.1186/s12885-019-5712-3](https://doi.org/10.1186/s12885-019-5712-3)
+- Mandelbaum R et al. Recurrent functional misinterpretation of RNA-seq data caused by sample-specific gene length bias. PLoS Biol 2019. [doi:10.1371/journal.pbio.3000481](https://doi.org/10.1371/journal.pbio.3000481)
+
+## Session info
+
+```{r session_info}
+sessionInfo()
+```

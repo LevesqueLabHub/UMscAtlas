@@ -1,0 +1,1118 @@
+---
+title: "UM Atlas - GloScope sample-level divergence (October 2026 object)"
+output:
+  html_document:
+    self_contained: true
+    includes:
+      in_header: !expr system.file("templates/fgcz_header.html", package = "ezRun", lib.loc = .libPaths())
+    css: !expr system.file("templates/fgcz.css", package = "ezRun", lib.loc = .libPaths())
+    code_folding: hide
+editor_options:
+  chunk_output_type: console
+---
+
+```{r c_setup, include=FALSE}
+# Display chunks show no code; the full analysis code is reprinted, folded, in the
+# Methods tab (ref.label on every chunk whose label starts with "c_").
+# Publication figures: every chunk figure is also written as a vector PDF (and a 300 dpi PNG)
+# to Figures_2026b/GloScope/, named after its chunk, for the figure bundle.
+knitr::opts_chunk$set(dev = c("png", "cairo_pdf"), dpi = 300, fig.path = "../Figures_2026b/GloScope/")
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE, comment = "",
+                      fig.width = 10, fig.height = 8)
+
+library(Seurat)
+library(qs2)
+library(tidyverse)
+library(patchwork)
+library(GloScope)
+library(ComplexHeatmap)
+library(circlize)
+library(vegan)
+library(BiocParallel)
+library(scECODA)
+
+# Victoria's palette. Relative on purpose: knitr sets the working directory to the Rmd's
+# own directory, so this resolves in a git worktree as well as in the main checkout.
+source("config_colors_2026b.R")
+
+# progressbar = FALSE: GloScope progress bars used to land in the HTML.
+bpparam <- MulticoreParam(workers = 24, progressbar = FALSE)
+register(bpparam)
+
+# MUST be a cohort-specific directory: run_gloscope_cached() keys its cache on the FILENAME
+# only, so pointing this at an older directory silently reloads another cohort's matrices.
+# 2026b = the October 2026 reprocessed object (63 samples, different cells from July).
+output_dir <- "../GloScope_Full_Outputs_2026b/"
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+N_PERM <- 999
+
+# ANOSIM on the samples with a non-NA group. Seeded per call, so every p-value is
+# reproducible and independent of how many tests ran before it.
+safe_anosim <- function(dist_mat, grouping, permutations = N_PERM) {
+  d <- as.matrix(dist_mat)
+  n <- nrow(d)
+  if (length(grouping) < n) {
+    grouping <- c(grouping, rep(NA, n - length(grouping)))
+  } else if (length(grouping) > n) {
+    grouping <- grouping[seq_len(n)]
+  }
+  keep <- !is.na(grouping)
+  if (sum(keep) < 3 || length(unique(grouping[keep])) < 2) {
+    return(list(statistic = NA_real_, signif = NA_real_))
+  }
+  set.seed(42)
+  vegan::anosim(as.dist(d[keep, keep]), grouping[keep], permutations = permutations)
+}
+
+# GloScope's kNN-KL divergence is an ESTIMATE and can come out slightly negative for two
+# near-identical samples (e.g. the two libraries of one tumour with few malignant cells:
+# pUM12 vs pUM12_16S = -0.28 on the October object). MASS::isoMDS, which plotMDS calls,
+# aborts on a zero or negative distance. This mask floors such entries at a tiny positive
+# value for the MDS only; the stored matrices and the ANOSIM tests use the unmodified
+# values. The floored pairs are returned as an attribute and printed under the panel.
+plotMDS <- function(dist_mat, ...) {
+  m <- as.matrix(dist_mat)
+  off <- row(m) != col(m)
+  bad <- off & m <= 0
+  floored <- NULL
+  if (any(bad)) {
+    eps <- min(m[off & m > 0]) / 100
+    floored <- paste(unique(apply(which(bad & upper.tri(m), arr.ind = TRUE), 1,
+                                  function(ix) paste(rownames(m)[ix[1]], "/", rownames(m)[ix[2]]))),
+                     collapse = "; ")
+    m[bad] <- eps
+  }
+  res <- GloScope::plotMDS(dist_mat = m, ...)
+  attr(res, "floored") <- floored
+  res
+}
+
+set.seed(42)
+
+# Short sample names for labels: strip the library prefix and the _GEX suffix
+# (unique for all 63 samples).
+short_name <- function(x) sub("_GEX.*$", "", sub("^\\d+_\\d+-", "", x))
+fmt_p <- function(p) ifelse(is.na(p), "p = NA", sprintf("p = %.3g", p))
+# <= 0.001 is the permutation floor (999 permutations), so it gets the top mark
+p_stars <- function(p) as.character(cut(p, c(-Inf, 0.001, 0.01, 0.05, Inf), c("***", "**", "*", "ns")))
+
+# Panel keys per tab, and figure sizes derived from the panel count.
+k_origin <- c("origin_all", "origin_mal", "origin_mel")
+k_smut   <- c("smut_pUM", "smut_mal", "smut_all", "smut_all_mal")
+k_chor   <- c("chor", "chor_mal")
+k_loc    <- c("loc_pUM", "loc_mal")
+k_hs     <- c("hsites", "hs_mel", "hs_prim")
+k_pmut   <- c("pmut_all", "pmut_pUM", "pmut_mal")
+k_organ  <- c("organ_all", "organ_mal", "organ_mel")
+k_gender <- c("gender_all", "gender_pUM", "gender_mal", "gender_mel")
+k_age    <- c("age_all", "age_pUM", "age_mal")
+grid_ncol <- function(n) if (n == 4) 2 else n
+fig_w <- function(keys) 5.5 * grid_ncol(length(keys)) + 0.5
+fig_h <- function(keys) 6.2 * ceiling(length(keys) / grid_ncol(length(keys)))
+```
+
+```{r c_load, include=FALSE}
+# nthreads = 1: multi-threaded qs2 reads of multi-GB Seurat objects can deadlock silently.
+um_atlas <- qs2::qs_read('../new_data_2026b/Objects/full Dataset/final_Subtyping_iCNV_reclustered.qs2',
+                         nthreads = 1)
+stopifnot("not the October 2026 object (expected 63 samples / 349,696 cells)" =
+            length(unique(um_atlas$Sample)) == 63 && ncol(um_atlas) == 349696)
+stopifnot("no pca reduction in the object" = "pca" %in% names(um_atlas@reductions))
+
+# Uncorrected PCA, 50 PCs: GloScope should see every source of sample-to-sample
+# variation, so no Harmony/integration embedding is used.
+embedding_matrix <- Embeddings(um_atlas, reduction = "pca")[, 1:50]
+
+n_cells_total <- ncol(um_atlas)
+n_samples_total <- length(unique(um_atlas$Sample))
+n_patients_total <- length(unique(um_atlas$Patient_nr))
+```
+
+```{r c_metadata, include=FALSE}
+# Three column contracts changed in the 2026 objects; each fails SILENTLY if not handled:
+#   1. `origin` level "healthy" was renamed "non-malignant" (an old factor() would turn
+#      all non-malignant cells into NA and drop 16 samples without an error).
+#   2. `LocationPrimaryTumor` is case-inconsistent; the clean `primary_location` is used.
+#   3. `healthy_location` (choroid / iris / ciliary body) defines the non-malignant sites.
+cell_metadata <- um_atlas@meta.data %>%
+  tibble::rownames_to_column("cell_id") %>%
+  dplyr::select(cell_id, Sample, Patient_nr, origin, organ,
+                primary_mutation, secondary_mutation,
+                primary_location, healthy_location,
+                majority_celltype, Malignant, Gender, Age_atDiagnosisY) %>%
+  dplyr::mutate(
+    # "GNA1Q" (July object, pUM27) was fixed at source in October; kept as a no-op guard.
+    primary_mutation = ifelse(primary_mutation %in% c("GANQ", "GNA1Q"),
+                              "GNAQ", primary_mutation),
+    origin_clean = factor(origin, levels = c("non-malignant", "primary", "metastasis")),
+    secondary_mut_clean = case_when(
+      secondary_mutation %in% c("BAP1", "SF3B1", "EIF1AX") ~ secondary_mutation,
+      TRUE ~ "none/unknown"
+    ),
+    location_clean = case_when(
+      primary_location %in% c("choroid", "ciliary body", "iris") ~ primary_location,
+      TRUE ~ "other/NA"
+    )
+  )
+
+# Fail loudly if the origin rename ever moves again.
+stopifnot(
+  "origin_clean is all NA - the `origin` levels changed again" =
+    any(!is.na(cell_metadata$origin_clean)),
+  "no non-malignant cells after factor() - check the origin level name" =
+    sum(cell_metadata$origin_clean == "non-malignant", na.rm = TRUE) > 0
+)
+if (anyNA(cell_metadata$origin_clean)) {
+  stop("Unmapped `origin` levels: ",
+       paste(setdiff(unique(um_atlas$origin),
+                     c("non-malignant", "primary", "metastasis")), collapse = ", "))
+}
+
+sample_metadata <- cell_metadata %>%
+  group_by(Sample) %>%
+  summarise(
+    Patient_nr = first(Patient_nr),
+    origin = first(origin_clean),
+    organ = first(organ),
+    primary_mutation = first(primary_mutation),
+    secondary_mutation = first(secondary_mut_clean),
+    LocationPrimaryTumor = first(location_clean),
+    primary_location = first(primary_location),
+    healthy_location = first(healthy_location),
+    Gender = first(Gender),
+    Age_numeric = as.numeric(first(Age_atDiagnosisY)),
+    n_cells = n(),
+    pct_malignant = 100 * mean(Malignant == "Malignant", na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Age_group = case_when(
+      is.na(Age_numeric) ~ "Unknown",
+      Age_numeric < 40 ~ "Young",
+      Age_numeric >= 40 & Age_numeric < 60 ~ "Middle",
+      Age_numeric >= 60 ~ "Old",
+      TRUE ~ "Unknown"
+    ),
+    # One label for the non-malignant-vs-primary MDS: site for non-malignant samples,
+    # tumour location for primaries.
+    site_label = ifelse(origin == "non-malignant",
+                        paste("non-malignant", healthy_location),
+                        as.character(LocationPrimaryTumor))
+  ) %>%
+  arrange(origin, organ, Sample)
+
+write_csv(sample_metadata, file.path(output_dir, "sample_metadata.csv"))
+
+organ_colors_all <- organ_colors
+pmut_colors <- c(primary_mutations_col, "NA" = "#CCCCCC")
+smut_colors <- c(second_mutations_col, "none/unknown" = "#CCCCCC", "NA" = "#CCCCCC")
+gender_colors <- gender_col
+patientID_col <- patient_cols
+healthy_site_colors <- setNames(
+  healthy_location_colors[paste("non-malignant", c("choroid", "iris", "ciliary body"))],
+  c("choroid", "iris", "ciliary body")
+)
+age_colors <- c(ageGroup_col, "Unknown" = "#E1E1E1FF")
+site_label_colors <- c(location_colors, "other/NA" = "#CCCCCC")
+```
+
+```{r c_gloscope_functions, include=FALSE}
+# Load the divergence matrix from the cohort cache, or compute and cache it.
+# Computing is refused unless GLOSCOPE_ALLOW_COMPUTE=1, so a filename typo cannot start
+# an hour-long recompute and write a new cache file next to the real one.
+run_gloscope_cached <- function(embedding_subset, sample_labels, cache_file, analysis_name) {
+  cache_qs2 <- file.path(output_dir, sub("\\.rds$", ".qs2", cache_file))
+  cache_rds <- file.path(output_dir, cache_file)
+  if (file.exists(cache_qs2)) return(qs2::qs_read(cache_qs2, nthreads = 1))
+  if (file.exists(cache_rds)) return(readRDS(cache_rds))
+  if (Sys.getenv("GLOSCOPE_ALLOW_COMPUTE") != "1") {
+    stop("No cached divergence matrix ", basename(cache_qs2), " for '", analysis_name,
+         "'. Set GLOSCOPE_ALLOW_COMPUTE=1 to compute it.")
+  }
+  knn_div <- gloscope(embedding_matrix = embedding_subset, cell_sample_ids = sample_labels,
+                      dens = "KNN", dist_mat = "KL", k = 50, BPPARAM = bpparam)
+  qs2::qs_save(knn_div, cache_qs2, nthreads = 1)
+  knn_div
+}
+
+# One GloScope comparison: keep cells passing `cell_ok` in `samples`, drop samples with
+# fewer than `min_cells` of them, require `min_samples` samples, then divergence matrix,
+# ANOSIM on `group_col`, MDS, and the per-comparison CSV. Results go to the registry `gs`.
+gs <- list()
+run_comparison <- function(key, samples, cache_file, group_col, comparison_id, csv_file,
+                           subset_label, row, col, palette,
+                           cell_ok = TRUE, min_cells = 1, min_samples = 0, gate = TRUE,
+                           colour_col = group_col, shape_col = NULL, note = NULL) {
+  base <- list(key = key, subset = subset_label, row = row, col = col,
+               comparison = comparison_id, group_col = group_col)
+  ok <- cell_ok & cell_metadata$Sample %in% samples
+  n_per <- table(cell_metadata$Sample[ok])
+  valid <- names(n_per)[n_per >= min_cells]
+  if (!gate || length(valid) < min_samples) {
+    gs[[key]] <<- c(base, list(skipped = sprintf("Not run: %d samples pass the filter, %d needed.",
+                                                 length(valid), min_samples)))
+    return(invisible(NULL))
+  }
+  ok <- ok & cell_metadata$Sample %in% valid
+  div <- run_gloscope_cached(embedding_matrix[cell_metadata$cell_id[ok], , drop = FALSE],
+                             cell_metadata$Sample[ok], cache_file, key)
+  meta <- data.frame(Sample = rownames(div)) %>% left_join(sample_metadata, by = "Sample")
+  a <- safe_anosim(as.dist(div), grouping = meta[[group_col]])
+  mds <- plotMDS(dist_mat = div, metadata_df = meta, sample_id = "Sample",
+                 group_id = colour_col, k = 2)
+  write_csv(data.frame(comparison = comparison_id, statistic = a$statistic, p_value = a$signif,
+                       n_samples = nrow(div), permutations = N_PERM),
+            file.path(output_dir, csv_file))
+  gs[[key]] <<- c(base, list(div = div, mds = mds$mds, R = unname(a$statistic), p = a$signif,
+                             n = nrow(div), colour_col = colour_col, shape_col = shape_col,
+                             palette = palette, floored = attr(mds, "floored"), note = note))
+}
+```
+
+```{r c_comparisons, include=FALSE}
+is_mal   <- cell_metadata$Malignant %in% "Malignant"
+# Three melanocytic definitions, kept as they were in the original analyses:
+# iCNV malignant + annotated melanocytes (organ / gender), majority_celltype melanocytes +
+# melanoma cells (origin), and healthy melanocytes alone (non-malignant sites).
+is_hmel  <- cell_metadata$majority_celltype %in% "Melanocytes"
+is_mel   <- is_mal | is_hmel
+is_melct <- cell_metadata$majority_celltype %in% c("Melanocytes", "Melanoma cells")
+# Tumours hold no healthy melanocytes, so in tumour-only rows (secondary mutation,
+# location pUM, primary mutation, age) "melanocytic" is the malignant set again and is
+# not run separately. Fail if a future object breaks that.
+stopifnot("annotated Melanocytes found in a tumour sample" =
+            !any(is_hmel & cell_metadata$origin_clean != "non-malignant"),
+          "malignant cells found in a non-malignant sample" =
+            !any(is_mal & cell_metadata$origin_clean == "non-malignant"))
+n_hmel_cells <- sum(is_hmel)
+
+# Heatmap columns. "All samples" = every sample the row's grouping applies to.
+C_ALL <- "All cells, all samples"; C_PRIM <- "All cells, primaries only"
+C_MAL <- "Malignant cells";        C_MEL  <- "Melanocytic cells"
+
+sm <- sample_metadata
+s_all     <- sm$Sample
+s_pUM     <- sm$Sample[sm$origin %in% "primary"]
+s_pmut    <- sm$Sample[sm$primary_mutation %in% c("GNAQ", "GNA11", "PLCB4")]
+s_gender  <- sm$Sample[sm$Gender %in% c("M", "F")]
+s_age     <- sm$Sample[!is.na(sm$Age_group) & sm$Age_group != "Unknown"]
+s_smut    <- sm$Sample[sm$secondary_mutation %in% c("BAP1", "SF3B1", "EIF1AX")]
+s_smutpUM <- intersect(s_pUM, s_smut)
+s_loc     <- intersect(s_pUM, sm$Sample[sm$LocationPrimaryTumor %in% c("choroid", "iris", "ciliary body")])
+s_chor    <- intersect(s_smutpUM, sm$Sample[sm$LocationPrimaryTumor %in% "choroid"])
+s_hs      <- sm$Sample[sm$origin %in% "non-malignant" & !is.na(sm$healthy_location)]
+s_hsprim  <- sm$Sample[sm$origin %in% c("non-malignant", "primary")]
+s_organ   <- sm %>% group_by(organ) %>% dplyr::filter(n() >= 2) %>% ungroup() %>% pull(Sample)
+
+chor_counts <- table(sm$secondary_mutation[match(s_chor, sm$Sample)])
+gate_chor <- length(s_chor) >= 6 && length(chor_counts) >= 2 && min(chor_counts) >= 2
+gate_hs   <- length(s_hs) >= 3 && length(unique(sm$healthy_location[match(s_hs, sm$Sample)])) >= 2
+
+# ---- the five requested groupings ----
+run_comparison("origin_all", s_all, "divergence_origin_full_cohort.rds", "origin",
+               "disease_origin_full", "anosim_origin_full.csv",
+               "All cells", "Origin", C_ALL, origin_colors)
+run_comparison("origin_mal", s_all, "divergence_origin_malignant_full.rds", "origin",
+               "disease_origin_malignant_full", "anosim_origin_malignant_full.csv",
+               "Malignant cells (>= 100 per sample)", "Origin", C_MAL, origin_colors,
+               cell_ok = is_mal, min_cells = 100, min_samples = 6)
+run_comparison("origin_mel", s_all, "divergence_origin_melanocytic_full.rds", "origin",
+               "disease_origin_melanocytic_full", "anosim_origin_melanocytic_full.csv",
+               "Melanocytes + melanoma cells (>= 100)", "Origin", C_MEL, origin_colors,
+               cell_ok = is_melct, min_cells = 100, min_samples = 6)
+run_comparison("hs_prim", s_hsprim, "divergence_healthy_vs_primary.rds", "origin",
+               "healthy_vs_primary", "anosim_healthy_vs_primary.csv",
+               "Non-malignant + primary, all cells", "Non-malignant vs primary", C_ALL,
+               site_label_colors, min_samples = 3, colour_col = "site_label")
+
+run_comparison("smut_pUM", s_pUM, "divergence_secondary_mutation_pUM_full.rds", "secondary_mutation",
+               "secondary_mutation_pUM_full", "anosim_secondary_mutation_pUM_full.csv",
+               "All primaries, all cells", "Secondary mutation (pUM)", C_PRIM, smut_colors,
+               min_samples = 6)
+run_comparison("smut_mal", s_smutpUM, "divergence_secondary_mutation_malignant_full.rds", "secondary_mutation",
+               "secondary_mutation_malignant_full", "anosim_secondary_mutation_malignant_full.csv",
+               "Malignant cells (>= 100), called mutation", "Secondary mutation (pUM)",
+               C_MAL, smut_colors,
+               cell_ok = is_mal, min_cells = 100, min_samples = 6, gate = length(s_smutpUM) >= 6)
+run_comparison("smut_all", s_smut, "divergence_secondary_mutation_full.rds", "secondary_mutation",
+               "secondary_mutation_full", "anosim_secondary_mutation_full.csv",
+               "Any origin, called mutation, all cells", "Secondary mutation (any origin)",
+               C_ALL, smut_colors)
+met_smut <- sm$secondary_mutation[sm$Sample %in% s_smut & sm$origin %in% "metastasis"]
+run_comparison("smut_all_mal", s_smut, "divergence_secondary_mutation_any_origin_malignant.rds",
+               "secondary_mutation", "secondary_mutation_any_origin_malignant",
+               "anosim_secondary_mutation_any_origin_malignant.csv",
+               "Any origin, called mutation, malignant cells (>= 100)", "Secondary mutation (any origin)",
+               C_MAL, smut_colors, cell_ok = is_mal, min_cells = 100, min_samples = 6,
+               shape_col = "origin",
+               note = if (length(met_smut) > 0 && all(met_smut == "BAP1"))
+                 sprintf("Shape = origin. All %d metastases are BAP1, so this contrast also separates metastasis from primary.",
+                         length(met_smut)))
+# Before the scECODA chunk on purpose: the composition comparison needs this matrix.
+run_comparison("chor", s_chor, "divergence_secondary_mutation_choroid_only.rds", "secondary_mutation",
+               "secondary_mutation_choroid_only", "anosim_secondary_mutation_choroid_only.csv",
+               "Choroidal primaries, all cells", "Secondary mutation (choroidal pUM)", C_PRIM,
+               smut_colors, gate = gate_chor)
+run_comparison("chor_mal", s_chor, "divergence_secondary_mutation_choroid_malignant.rds",
+               "secondary_mutation", "secondary_mutation_choroid_malignant",
+               "anosim_secondary_mutation_choroid_malignant.csv",
+               "Choroidal primaries, malignant cells (>= 100)", "Secondary mutation (choroidal pUM)",
+               C_MAL, smut_colors, cell_ok = is_mal, min_cells = 100, min_samples = 6, gate = gate_chor)
+
+run_comparison("loc_pUM", s_loc, "divergence_location_pUM_full.rds", "LocationPrimaryTumor",
+               "anatomical_location_pUM_full", "anosim_location_pUM_full.csv",
+               "Primary tumours, all cells", "Location (pUM)", C_PRIM, primary_location_colors, min_samples = 6)
+run_comparison("loc_mal", s_loc, "divergence_location_malignant.rds", "LocationPrimaryTumor",
+               "location_malignant_full", "anosim_location_malignant_full.csv",
+               "Malignant cells (>= 50)", "Location (pUM)", C_MAL, primary_location_colors,
+               cell_ok = is_mal, min_cells = 50, min_samples = 4)
+
+run_comparison("hsites", s_hs, "divergence_healthy_uveal_sites.rds", "healthy_location",
+               "healthy_uveal_sites_all_cells", "anosim_healthy_uveal_sites.csv",
+               "Non-malignant samples, all cells", "Location (non-malignant)", C_ALL,
+               healthy_site_colors, gate = gate_hs)
+run_comparison("hs_mel", s_hs, "divergence_healthy_uveal_sites_melanocytes.rds", "healthy_location",
+               "healthy_uveal_sites_melanocytes", "anosim_healthy_uveal_sites_melanocytes.csv",
+               "Healthy melanocytes only (>= 100)", "Location (non-malignant)",
+               C_MEL, healthy_site_colors, cell_ok = is_hmel, min_cells = 100, min_samples = 6,
+               gate = gate_hs)
+if (!is.null(gs$hs_mel$div)) {
+  n_cb <- sum(gs$hs_mel$mds$healthy_location %in% "ciliary body")
+  gs$hs_mel$note <- sprintf("Ciliary body n = %d: ANOSIM still tests all three sites, read that group as descriptive.", n_cb)
+}
+
+# ---- other covariates ----
+run_comparison("pmut_all", s_pmut, "divergence_primary_mutation_full.rds", "primary_mutation",
+               "primary_mutation_full", "anosim_primary_mutation_full.csv",
+               "All cells", "Primary mutation", C_ALL, pmut_colors)
+run_comparison("pmut_pUM", intersect(s_pUM, s_pmut), "divergence_primary_mutation_pUM.rds", "primary_mutation",
+               "primary_mutation_pUM_full", "anosim_primary_mutation_pUM_full.csv",
+               "Primary tumours, all cells", "Primary mutation", C_PRIM, pmut_colors,
+               min_samples = 4)
+run_comparison("pmut_mal", s_pmut, "divergence_primary_mutation_malignant.rds", "primary_mutation",
+               "primary_mutation_malignant_full", "anosim_primary_mutation_malignant_full.csv",
+               "Malignant cells (>= 50)", "Primary mutation", C_MAL, pmut_colors,
+               cell_ok = is_mal, min_cells = 50, min_samples = 4)
+
+run_comparison("organ_all", s_organ, "divergence_organ_full_cohort.rds", "organ",
+               "organ_full", "anosim_organ_full.csv",
+               "All cells", "Organ", C_ALL, organ_colors_all, shape_col = "origin")
+run_comparison("organ_mal", s_organ, "divergence_organ_malignant.rds", "organ",
+               "organ_malignant_full", "anosim_organ_malignant_full.csv",
+               "Malignant cells (>= 50)", "Organ", C_MAL, organ_colors_all,
+               cell_ok = is_mal, min_cells = 50, min_samples = 4, shape_col = "origin")
+run_comparison("organ_mel", s_organ, "divergence_organ_melanocytic.rds", "organ",
+               "organ_melanocytic_full", "anosim_organ_melanocytic_full.csv",
+               "Malignant + melanocytes (>= 50)", "Organ", C_MEL, organ_colors_all,
+               cell_ok = is_mel, min_cells = 50, min_samples = 4, shape_col = "origin")
+
+run_comparison("gender_all", s_gender, "divergence_gender_full_cohort.rds", "Gender",
+               "gender_full", "anosim_gender_full.csv",
+               "All cells", "Gender", C_ALL, gender_colors)
+run_comparison("gender_pUM", intersect(s_pUM, s_gender), "divergence_gender_pUM.rds", "Gender",
+               "gender_pUM_full", "anosim_gender_pUM_full.csv",
+               "Primary tumours, all cells", "Gender", C_PRIM, gender_colors,
+               min_samples = 4)
+run_comparison("gender_mal", s_gender, "divergence_gender_malignant.rds", "Gender",
+               "gender_malignant", "anosim_gender_malignant_full.csv",
+               "Malignant cells (>= 100)", "Gender", C_MAL, gender_colors,
+               cell_ok = is_mal, min_cells = 100, min_samples = 6)
+run_comparison("gender_mel", s_gender, "divergence_gender_melanocytic.rds", "Gender",
+               "gender_melanocytic_full", "anosim_gender_melanocytic_full.csv",
+               "Malignant + melanocytes (>= 50)", "Gender", C_MEL, gender_colors,
+               cell_ok = is_mel, min_cells = 50, min_samples = 4)
+
+run_comparison("age_all", s_age, "divergence_age_full_cohort.rds", "Age_group",
+               "age_full", "anosim_age_full.csv",
+               "All cells", "Age", C_ALL, age_colors)
+run_comparison("age_pUM", intersect(s_pUM, s_age), "divergence_age_pUM.rds", "Age_group",
+               "age_pUM_full", "anosim_age_pUM_full.csv",
+               "Primary tumours, all cells", "Age", C_PRIM, age_colors,
+               min_samples = 4)
+run_comparison("age_mal", s_age, "divergence_age_malignant.rds", "Age_group",
+               "age_malignant", "anosim_age_malignant_full.csv",
+               "Malignant cells (>= 100)", "Age", C_MAL, age_colors,
+               cell_ok = is_mal, min_cells = 100, min_samples = 6)
+# No melanocytic run for location pUM, primary mutation or age: their samples are all
+# tumours, which hold no healthy melanocytes (checked above), so it would be the malignant
+# set again. The earlier caches divergence_{location,age}_melanocytic.qs2 stay on disk.
+stopifnot("a tumour-only sample set contains a non-malignant sample" =
+            all(sm$origin[match(c(s_pUM, s_pmut, s_age), sm$Sample)] != "non-malignant"))
+
+stopifnot("a comparison key has no panel slot" =
+            all(c(k_origin, k_smut, k_chor, k_loc, k_hs, k_pmut, k_organ, k_gender, k_age) %in% names(gs)))
+```
+
+```{r c_summary, include=FALSE}
+row_order <- c("Origin", "Non-malignant vs primary", "Secondary mutation (pUM)",
+               "Secondary mutation (choroidal pUM)", "Secondary mutation (any origin)",
+               "Location (pUM)", "Location (non-malignant)",
+               "Primary mutation", "Organ", "Gender", "Age")
+col_order <- c(C_ALL, C_PRIM, C_MAL, C_MEL)
+
+# Every heatmap cell without a result needs a reason. One code per reason.
+nm_smut <- short_name(sm$Sample[sm$Sample %in% s_smut & sm$origin %in% "non-malignant"])
+na_reasons <- c(
+  A = "origin is constant within primaries",
+  B = "row is defined on primaries only (the any-origin version is its own row)",
+  C = "non-malignant samples have no malignant cells",
+  D = sprintf("tumours have no healthy melanocytes (all %s are in non-malignant samples), so melanocytic = malignant",
+              format(n_hmel_cells, big.mark = ",")),
+  E = "row is defined on non-malignant samples only",
+  F = "every primary is from the eye",
+  G = "the primaries-only version is the Secondary mutation (pUM) row",
+  H = sprintf("only %s adds healthy melanocytes, so it would be the malignant result plus %d sample",
+              paste(nm_smut, collapse = ", "), length(nm_smut)),
+  I = "covered by Origin, melanocytic cells (same cells, plus metastases)"
+)
+na_cells <- tibble::tribble(
+  ~Comparison_Clean,                    ~Analysis_Group, ~code,
+  "Origin",                             C_PRIM,          "A",
+  "Non-malignant vs primary",           C_PRIM,          "A",
+  "Non-malignant vs primary",           C_MAL,           "C",
+  "Non-malignant vs primary",           C_MEL,           "I",
+  "Secondary mutation (pUM)",           C_ALL,           "B",
+  "Secondary mutation (pUM)",           C_MEL,           "D",
+  "Secondary mutation (choroidal pUM)", C_ALL,           "B",
+  "Secondary mutation (choroidal pUM)", C_MEL,           "D",
+  "Secondary mutation (any origin)",    C_PRIM,          "G",
+  "Secondary mutation (any origin)",    C_MEL,           "H",
+  "Location (pUM)",                     C_ALL,           "B",
+  "Location (pUM)",                     C_MEL,           "D",
+  "Location (non-malignant)",           C_PRIM,          "E",
+  "Location (non-malignant)",           C_MAL,           "C",
+  "Primary mutation",                   C_MEL,           "D",
+  "Organ",                              C_PRIM,          "F",
+  "Age",                                C_MEL,           "D"
+)
+
+anosim_summary <- purrr::map_dfr(gs, function(r) {
+  if (is.null(r$div)) return(NULL)
+  tibble(key = r$key, comparison = r$comparison, statistic = r$R, p_value = r$p,
+         n_samples = r$n, permutations = N_PERM,
+         Analysis_Group = r$col, Comparison_Clean = r$row)
+}) %>%
+  mutate(R_statistic = round(statistic, 4),
+         Significance = case_when(p_value < 0.001 ~ "***", p_value < 0.01 ~ "**",
+                                  p_value < 0.05 ~ "*", TRUE ~ "ns"))
+stopifnot(all(anosim_summary$Comparison_Clean %in% row_order),
+          all(anosim_summary$Analysis_Group %in% col_order),
+          "two results in one heatmap cell" =
+            !anyDuplicated(anosim_summary[c("Comparison_Clean", "Analysis_Group")]))
+# Each of the rows x columns cells holds exactly one result or one n/a reason.
+hm_grid <- tidyr::expand_grid(Comparison_Clean = row_order, Analysis_Group = col_order) %>%
+  left_join(anosim_summary, by = c("Comparison_Clean", "Analysis_Group")) %>%
+  left_join(na_cells, by = c("Comparison_Clean", "Analysis_Group"))
+stopifnot("heatmap cell with both a result and an n/a reason" =
+            !any(!is.na(hm_grid$statistic) & !is.na(hm_grid$code)),
+          "heatmap cell empty without a stated reason" =
+            !any(is.na(hm_grid$statistic) & is.na(hm_grid$code)),
+          all(na_cells$code %in% names(na_reasons)))
+write_csv(anosim_summary, file.path(output_dir, "anosim_summary_full_cohort.csv"))
+
+n_tests <- sum(!is.na(anosim_summary$p_value))
+n_sig <- sum(anosim_summary$p_value < 0.05, na.rm = TRUE)
+```
+
+```{r c_heatmap_origin, include=FALSE}
+knn_div_origin <- gs$origin_all$div
+# Intra-ocular location: site for non-malignant samples, tumour location for primaries.
+sample_metadata_hm <- sample_metadata %>%
+  mutate(eye_location = case_when(origin == "metastasis" ~ "metastasis", origin == "non-malignant" ~ site_label,
+                                  TRUE ~ primary_location))  # primary_location keeps ciliochoroidal (pUM06)
+loc_colors <- c(location_colors[c("non-malignant choroid", "non-malignant iris", "non-malignant ciliary body",
+                                  "choroid", "iris", "ciliary body", "ciliochoroidal")], metastasis = "grey85")
+stopifnot("intra-ocular location without a colour" = all(sample_metadata_hm$eye_location %in% names(loc_colors)))
+sample_order <- sample_metadata_hm %>% arrange(origin, organ, eye_location) %>% pull(Sample)
+knn_div_ordered <- knn_div_origin[sample_order, sample_order]
+anno_data_clean <- sample_metadata_hm[match(sample_order, sample_metadata_hm$Sample), ] %>%
+  dplyr::mutate(
+    Gender = replace(as.character(Gender), is.na(Gender) | Gender == "NA", "Unknown"),
+    Age_group = replace(as.character(Age_group), is.na(Age_group) | Age_group == "NA", "Unknown")
+  )
+all_patients <- unique(anno_data_clean$Patient_nr)
+patient_colors_full <- patientID_col[all_patients]
+missing_patients <- all_patients[is.na(patient_colors_full)]
+if (length(missing_patients) > 0) {
+  patient_colors_full <- c(patientID_col,
+                           setNames(scales::hue_pal()(length(missing_patients)), missing_patients))
+}
+patient_colors_full <- patient_colors_full[!is.na(names(patient_colors_full))]
+
+ht_origin <- Heatmap(
+  knn_div_ordered,
+  name = "KL divergence",
+  col = colorRamp2(c(0, median(knn_div_origin), max(knn_div_origin)), c("white", "orange", "red")),
+  top_annotation = HeatmapAnnotation(
+    Patient = anno_data_clean$Patient_nr,
+    Origin = anno_data_clean$origin,
+    Organ = anno_data_clean$organ,
+    `Intra-ocular location` = anno_data_clean$eye_location,
+    `Secondary mutation` = anno_data_clean$secondary_mutation,
+    col = list(Patient = patient_colors_full, Origin = origin_colors, Organ = organ_colors_all,
+               `Intra-ocular location` = loc_colors[unique(anno_data_clean$eye_location)],
+               `Secondary mutation` = smut_colors),
+    annotation_name_gp = gpar(fontsize = 10),
+    show_legend = c(Patient = FALSE, Origin = TRUE, Organ = TRUE, `Intra-ocular location` = TRUE, `Secondary mutation` = TRUE)
+  ),
+  show_row_names = FALSE, show_column_names = FALSE,
+  cluster_rows = FALSE, cluster_columns = FALSE,
+  column_title = "KL divergence between samples, all cells\n(ordered by origin, organ, intra-ocular location)",
+  column_title_gp = gpar(fontsize = 12, fontface = "bold")
+)
+png(file.path(output_dir, "heatmap_origin_full_cohort.png"), width = 3000, height = 2800, res = 300)
+draw(ht_origin)
+invisible(dev.off())
+qs2::qs_save(list(ht = ht_origin, div_matrix = knn_div_ordered, anno_data = anno_data_clean),
+             file.path(output_dir, "gloscope_heatmap_all_cells_objects.qs2"), nthreads = 1)
+```
+
+```{r c_composition, include=FALSE}
+# (1) Does the plotted origin MDS track cell-type composition? Uses the same isoMDS
+#     coordinates that are drawn.
+rr_comp <- cell_metadata %>%
+  count(Sample, majority_celltype, name = "n") %>%
+  group_by(Sample) %>% mutate(frac = n / sum(n)) %>% ungroup()
+rr_comp_wide <- rr_comp %>%
+  dplyr::select(Sample, majority_celltype, frac) %>%
+  tidyr::pivot_wider(names_from = majority_celltype, values_from = frac, values_fill = 0)
+rr_coords <- gs$origin_all$mds %>%
+  dplyr::select(Sample, Coordinate1, Coordinate2) %>%
+  left_join(rr_comp_wide, by = "Sample")
+rr_celltypes <- setdiff(names(rr_comp_wide), "Sample")
+rr_cor <- purrr::map_dfr(rr_celltypes, function(ct) {
+  x <- rr_coords[[ct]]
+  tibble(cell_type = ct,
+         rho_MDS1 = suppressWarnings(cor(rr_coords$Coordinate1, x, method = "spearman")),
+         p_MDS1   = suppressWarnings(cor.test(rr_coords$Coordinate1, x, method = "spearman")$p.value),
+         rho_MDS2 = suppressWarnings(cor(rr_coords$Coordinate2, x, method = "spearman")),
+         p_MDS2   = suppressWarnings(cor.test(rr_coords$Coordinate2, x, method = "spearman")$p.value))
+}) %>%
+  mutate(padj_MDS1 = p.adjust(p_MDS1, "BH"), padj_MDS2 = p.adjust(p_MDS2, "BH")) %>%
+  arrange(desc(abs(rho_MDS1)))
+rr_r2 <- function(axis) {
+  df <- rr_coords %>% dplyr::select(all_of(rr_celltypes))
+  df <- df[, vapply(df, function(z) stats::sd(z) > 0, logical(1)), drop = FALSE]
+  summary(stats::lm(rr_coords[[axis]] ~ ., data = df))$r.squared
+}
+rr_r2_mds1 <- rr_r2("Coordinate1")
+rr_r2_mds2 <- rr_r2("Coordinate2")
+write_csv(rr_cor, file.path(output_dir, "mds_vs_composition_correlations.csv"))
+
+# (2) scECODA: same ANOSIM, same samples, on a composition-only representation
+#     (centred-log-ratio of cell-type abundances).
+rr_counts <- get_celltype_counts(as.data.frame(cell_metadata),
+                                 sample_col = "Sample", celltype_col = "majority_celltype")
+rr_clr <- as.matrix(calc_clr(replace_zeros(rr_counts)))
+if (!all(rownames(rr_clr) %in% sample_metadata$Sample)) rr_clr <- t(rr_clr)
+stopifnot("CLR matrix rows are not samples" = all(rownames(rr_clr) %in% sample_metadata$Sample))
+
+rr_jobs <- tibble::tribble(
+  ~key,         ~label,
+  "origin_all", "Origin (all cells)",
+  "origin_mal", "Origin (malignant)",
+  "origin_mel", "Origin (melanocytic)",
+  "hs_prim",    "Non-malignant vs primary",
+  "smut_pUM",   "Secondary mutation (pUM)",
+  "chor",       "Secondary mutation (choroidal pUM)",
+  "smut_all",   "Secondary mutation (any origin)",
+  "loc_pUM",    "Location (pUM)",
+  "hsites",     "Location (non-malignant)",
+  "pmut_all",   "Primary mutation",
+  "organ_all",  "Organ",
+  "gender_all", "Gender",
+  "age_all",    "Age group"
+)
+rr_comp_res <- purrr::map_dfr(seq_len(nrow(rr_jobs)), function(i) {
+  r <- gs[[rr_jobs$key[i]]]
+  if (is.null(r$div)) return(NULL)
+  s <- rownames(r$div)
+  g <- sample_metadata[[r$group_col]][match(s, sample_metadata$Sample)]
+  keep <- !is.na(g) & s %in% rownames(rr_clr)
+  s <- s[keep]; g <- as.character(g[keep])
+  if (length(unique(g)) < 2 || length(s) < 4) return(NULL)
+  a_cmp <- safe_anosim(dist(rr_clr[s, , drop = FALSE]), g)
+  tibble(label = rr_jobs$label[i], n_samples = length(s),
+         R_gloscope = r$R, p_gloscope = r$p,
+         R_composition = unname(a_cmp$statistic), p_composition = a_cmp$signif)
+}) %>%
+  mutate(R_ratio = ifelse(abs(R_gloscope) > 1e-9, R_composition / R_gloscope, NA_real_),
+         verdict = case_when(R_gloscope < 0.05 ~ "no GloScope signal to explain",
+                             R_ratio >= 0.80   ~ "composition-driven",
+                             R_ratio <= 0.40   ~ "state-driven beyond composition",
+                             TRUE              ~ "mixed")) %>%
+  arrange(R_ratio)
+stopifnot("choroid-only comparison missing from the scECODA table" =
+            "Secondary mutation (choroidal pUM)" %in% rr_comp_res$label)
+write_csv(rr_comp_res, file.path(output_dir, "scecoda_composition_vs_gloscope.csv"))
+
+rr_clr_var <- sort(apply(rr_clr, 2, stats::var), decreasing = TRUE)
+rr_n_state <- sum(rr_comp_res$verdict == "state-driven beyond composition")
+rr_n_comp  <- sum(rr_comp_res$verdict == "composition-driven")
+```
+
+```{r c_patient_level, include=FALSE}
+# Pseudo-replication check for every comparison: ANOSIM with (a) all samples, (b) one
+# sample per patient per group (drops same-group re-preps), (c) one sample per patient
+# overall. The sample kept is the one with the most cells.
+pl_ladder <- function(r) {
+  m <- sample_metadata %>% dplyr::filter(Sample %in% rownames(r$div)) %>%
+    mutate(n_cells = as.numeric(n_cells), g = .data[[r$group_col]])
+  keep_b <- m %>% group_by(Patient_nr, g) %>% slice_max(n_cells, n = 1, with_ties = FALSE) %>%
+    ungroup() %>% pull(Sample)
+  keep_c <- m %>% group_by(Patient_nr) %>% slice_max(n_cells, n = 1, with_ties = FALSE) %>%
+    ungroup() %>% pull(Sample)
+  one <- function(keep, label) {
+    a <- tryCatch(safe_anosim(as.dist(r$div[keep, keep, drop = FALSE]),
+                              grouping = m$g[match(keep, m$Sample)]),
+                  error = function(e) list(statistic = NA_real_, signif = NA_real_))
+    tibble(subset = label, n_samples = length(keep),
+           n_patients = n_distinct(m$Patient_nr[match(keep, m$Sample)]),
+           R = unname(a$statistic), p = a$signif)
+  }
+  bind_rows(one(rownames(r$div), "(a) all samples (as reported)"),
+            one(keep_b, "(b) one sample per patient per group"),
+            one(keep_c, "(c) one sample per patient overall"))
+}
+pl_all <- purrr::map_dfr(gs, function(r) {
+  if (is.null(r$div) || is.na(r$R)) return(NULL)
+  pl_ladder(r) %>% mutate(key = r$key, row = r$row, col = r$col, .before = 1)
+})
+write_csv(pl_all, file.path(output_dir, "anosim_patient_level_sensitivity_all.csv"))
+rr_ladder <- pl_all %>% dplyr::filter(key == "origin_all") %>%
+  dplyr::select(subset, n_samples, n_patients, R, p)
+write_csv(rr_ladder, file.path(output_dir, "anosim_patient_level_sensitivity.csv"))
+rr_n_dropped_b <- rr_ladder$n_samples[1] - rr_ladder$n_samples[2]
+rr_n_dropped_c <- rr_ladder$n_samples[1] - rr_ladder$n_samples[3]
+pl_max_drop <- pl_all %>%
+  group_by(key, row, col) %>%
+  summarise(drop_b = R[1] - R[2], .groups = "drop") %>%
+  arrange(desc(drop_b))
+```
+
+```{r c_paired, include=FALSE}
+# Same-patient pairs: a non-malignant uveal sample and a primary from the same eye.
+# Is the non-malignant tissue closer to its own tumour than to other patients' tumours?
+rr_pairs <- sample_metadata %>%
+  dplyr::filter(origin %in% c("non-malignant", "primary")) %>%
+  group_by(Patient_nr) %>%
+  dplyr::filter(n_distinct(origin) == 2) %>%
+  ungroup()
+rr_pair_patients <- sort(unique(rr_pairs$Patient_nr))
+rr_has_pairs <- length(rr_pair_patients) >= 4
+rr_restricted <- NULL
+
+rr_paired_stats <- function(dmat, mat_label) {
+  hs <- rr_pairs %>% dplyr::filter(origin == "non-malignant", Sample %in% rownames(dmat))
+  ps <- rr_pairs %>% dplyr::filter(origin == "primary", Sample %in% rownames(dmat))
+  pats <- intersect(hs$Patient_nr, ps$Patient_nr)
+  if (length(pats) < 4) return(NULL)
+  purrr::map_dfr(pats, function(pt) {
+    h <- hs$Sample[hs$Patient_nr == pt][1]
+    own <- ps$Sample[ps$Patient_nr == pt][1]
+    others <- ps$Sample[ps$Patient_nr != pt]
+    tibble(matrix = mat_label, Patient_nr = pt,
+           d_own = dmat[h, own], d_others = mean(dmat[h, others]))
+  })
+}
+if (rr_has_pairs) {
+  rr_paired <- bind_rows(rr_paired_stats(gs$origin_all$div, "all cells"),
+                         if (!is.null(gs$origin_mel$div)) rr_paired_stats(gs$origin_mel$div, "melanocytic only")) %>%
+    mutate(delta = d_own - d_others)
+  rr_paired_test <- rr_paired %>%
+    group_by(matrix) %>%
+    summarise(n_patients = n(), median_d_own = median(d_own), median_d_others = median(d_others),
+              median_delta = median(delta),
+              p_signed_rank = suppressWarnings(stats::wilcox.test(d_own, d_others, paired = TRUE)$p.value),
+              .groups = "drop")
+  write_csv(rr_paired, file.path(output_dir, "paired_within_patient_divergences.csv"))
+  write_csv(rr_paired_test, file.path(output_dir, "paired_within_patient_test.csv"))
+  # Tumour vs own normal: ANOSIM on the pairs with permutations restricted within patient
+  # (each patient's two labels swap or not: 2^n arrangements, all enumerated). The smallest
+  # attainable p is 2 / 2^n, so with 8 pairs p cannot go below 0.0078.
+  rr_restricted_one <- function(dmat, mat_label) {
+    pp <- rr_pairs %>% dplyr::filter(Sample %in% rownames(dmat)) %>%
+      group_by(Patient_nr, origin) %>% slice_max(as.numeric(n_cells), n = 1, with_ties = FALSE) %>%
+      group_by(Patient_nr) %>% dplyr::filter(n() == 2) %>% ungroup() %>% arrange(Patient_nr, origin)
+    n_pairs <- n_distinct(pp$Patient_nr)
+    if (n_pairs < 4) return(NULL)
+    dd <- dmat[pp$Sample, pp$Sample]; dd[dd < 0] <- 0
+    set.seed(1)
+    a <- vegan::anosim(as.dist(dd), pp$origin,
+                       permutations = permute::how(blocks = factor(pp$Patient_nr), nperm = 9999))
+    tibble(matrix = mat_label, n_pairs = n_pairs, R = unname(a$statistic), p = a$signif,
+           p_floor = 2 / 2^n_pairs)
+  }
+  rr_restricted <- bind_rows(rr_restricted_one(gs$origin_all$div, "all cells"),
+                             if (!is.null(gs$origin_mel$div)) rr_restricted_one(gs$origin_mel$div, "melanocytic only"))
+  write_csv(rr_restricted, file.path(output_dir, "paired_tumour_vs_normal_restricted_anosim.csv"))
+}
+```
+
+```{r c_display_helpers, include=FALSE}
+# One MDS panel per comparison: colour = tested grouping (n per level in the legend),
+# R and p in the subtitle, sample labels when n <= 20.
+mds_panel <- function(key) {
+  r <- gs[[key]]
+  if (is.null(r$div)) {
+    return(ggplot() + annotate("text", x = 0, y = 0, label = r$skipped, size = 4) +
+             theme_void() + labs(title = r$subset))
+  }
+  df <- r$mds
+  df$colour <- as.character(df[[r$colour_col]])
+  cnt <- table(df$colour)
+  p <- ggplot(df, aes(Coordinate1, Coordinate2, colour = colour)) +
+    geom_point(size = 3, alpha = 0.85) +
+    scale_colour_manual(values = r$palette, na.value = "grey60", name = NULL,
+                        labels = function(b) sprintf("%s (%d)", b, as.integer(cnt[b]))) +
+    labs(title = paste(strwrap(r$subset, 48), collapse = "\n"),
+         subtitle = sprintf("n = %d samples | ANOSIM R = %.2f, %s", r$n, r$R, fmt_p(r$p)),
+         x = "MDS1", y = "MDS2",
+         caption = if (!is.null(r$note) || !is.null(r$floored))
+           paste(strwrap(c(r$note, if (!is.null(r$floored))
+             paste0("Divergence <= 0 floored for the MDS only: ", r$floored)), 70),
+             collapse = "\n")) +
+    theme_bw(base_size = 11) +
+    theme(aspect.ratio = 1, legend.position = "bottom", plot.title = element_text(face = "bold", size = 11),
+          plot.caption = element_text(size = 7, hjust = 0)) +
+    guides(colour = guide_legend(ncol = 2, override.aes = list(size = 3)))
+  if (!is.null(r$shape_col)) {
+    # Fixed shapes, so a level absent from one panel does not shift the others.
+    p <- p + aes(shape = .data[[r$shape_col]]) + labs(shape = NULL) +
+      scale_shape_manual(values = c("non-malignant" = 16, "primary" = 17, "metastasis" = 15)) +
+      guides(shape = guide_legend(ncol = 1))
+  }
+  if (r$n <= 20) {
+    p <- p + ggrepel::geom_text_repel(aes(label = short_name(Sample)), size = 2.5,
+                                      show.legend = FALSE, max.overlaps = 30, seed = 1)
+  }
+  p
+}
+show_panels <- function(keys, file) {
+  p <- wrap_plots(lapply(keys, mds_panel), ncol = grid_ncol(length(keys)))
+  ggsave(file.path(output_dir, file), p, width = fig_w(keys), height = fig_h(keys),
+         dpi = 300, bg = "white")
+  print(p)
+}
+```
+
+GloScope sample-level analysis of the UM atlas: how similar are samples to each other, and does that similarity follow origin, mutation or location?
+
+<style>
+/* Cap figure size so plots do not blow up in a full-screen window (retina + dpi 300 gives ~150 px per inch). */
+.main-container img { max-width: min(100%, 1400px) !important; height: auto !important; display: block; margin: 0 auto; }
+.main-container .html-widget { max-width: 1400px; margin: 0 auto; }
+</style>
+
+# {.tabset}
+
+## Overview
+
+- Data: October 2026 reprocessed atlas, `r n_samples_total` samples from `r n_patients_total` patients, `r format(n_cells_total, big.mark = ",")` cells, all cells used (no downsampling).
+- GloScope describes each sample as the distribution of its cells in the 50-PC PCA space (uncorrected, so batch is not removed) and computes the KL divergence between every pair of samples. MDS of that matrix gives the plots.
+- ANOSIM asks whether samples of the same group are closer to each other than to other samples. R runs from about 0 (no separation) to 1 (groups fully apart).
+- The unit is the sample. p-values come from `r N_PERM` permutations, so 0.001 is the smallest possible value, and they are not adjusted for the `r n_tests` tests below (`r n_sig` have p < 0.05). Several patients contribute more than one sample; the Robustness tab checks what that does.
+
+```{r overview_heatmap, fig.width=13, fig.height=11}
+# Second line = one sample per patient per group (ladder level b), shown when it drops samples.
+pl_b <- pl_all %>% dplyr::filter(startsWith(subset, "(b)")) %>%
+  dplyr::transmute(key, R_b = R, p_b = p, n_b = n_samples)
+hm <- hm_grid %>%
+  left_join(pl_b, by = "key") %>%
+  mutate(Comparison_Clean = factor(Comparison_Clean, levels = rev(row_order)),
+         Analysis_Group = factor(Analysis_Group, levels = col_order),
+         label = ifelse(is.na(code),
+                        paste0(sprintf("R = %.2f\n%s %s\nn = %d", statistic, fmt_p(p_value), p_stars(p_value), n_samples),
+                               ifelse(!is.na(n_b) & n_b < n_samples,
+                                      sprintf("\n1/pt: R %.2f, p %.2g %s", R_b, p_b, p_stars(p_b)), "")),
+                        paste0("n/a (", code, ")")))
+used <- na_reasons[sort(unique(na_cells$code))]
+hm_caption <- paste(c(
+  "Stars: *** p <= 0.001 (the permutation floor), ** p < 0.01, * p < 0.05, ns otherwise; unadjusted.",
+  "Grey n/a = not applicable:",
+  sprintf("  %s  %s", names(used), used),
+  "'All samples' = every sample the row's grouping applies to. Tumour-only rows show their melanocytic result once, as malignant cells.",
+  "'1/pt' = same test with one sample per patient per group (repeat libraries of one tumour removed); shown where it changes n."),
+  collapse = "\n")
+p_heatmap <- ggplot(hm, aes(Analysis_Group, Comparison_Clean)) +
+  geom_tile(data = dplyr::filter(hm, is.na(code)), aes(fill = statistic),
+            colour = "white", linewidth = 0.6) +
+  geom_tile(data = dplyr::filter(hm, !is.na(code)), fill = "grey88",
+            colour = "white", linewidth = 0.6) +
+  geom_text(aes(label = label, colour = is.na(code)), size = 2.8, lineheight = 0.9,
+            show.legend = FALSE) +
+  scale_colour_manual(values = c(`TRUE` = "black", `FALSE` = "grey45")) +
+  scale_fill_gradient2(low = "#2166AC", mid = "#F7F7F7", high = "#B2182B", midpoint = 0,
+                       limits = c(-0.1, 0.6), oob = scales::squish, name = "ANOSIM R") +
+  scale_x_discrete(drop = FALSE, labels = function(x) sub(", ", "\n", x)) +
+  labs(title = "ANOSIM on GloScope divergence, every comparison",
+       subtitle = "Rows 1-7: the five requested groupings.",
+       caption = hm_caption, x = NULL, y = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid = element_blank(), axis.text = element_text(face = "bold"),
+        plot.title = element_text(face = "bold"),
+        plot.caption = element_text(hjust = 0, size = 8.5, colour = "grey25"),
+        plot.caption.position = "plot",
+        # bold row names are measured narrower than the render node draws them; keep them on the canvas
+        plot.margin = margin(5.5, 5.5, 5.5, 60))
+ggsave(file.path(output_dir, "anosim_summary_heatmap.png"), p_heatmap,
+       width = 13, height = 11, dpi = 300, bg = "white")
+print(p_heatmap)
+```
+
+The same heatmap, simplified: ANOSIM R and stars only. Where keeping one sample per patient changes the stars, the per-patient stars are shown in brackets.
+
+```{r overview_heatmap_simple, fig.width=11.5, fig.height=8}
+hs <- hm %>% mutate(
+  st = p_stars(p_value), st_b = ifelse(!is.na(n_b) & n_b < n_samples, p_stars(p_b), NA_character_),
+  label = ifelse(is.na(code), paste0(sprintf("%.2f ", statistic), st,
+                                     ifelse(!is.na(st_b) & st_b != st, sprintf("\n(1/pt: %s)", st_b), "")), ""))
+p_heatmap_simple <- ggplot(hs, aes(Analysis_Group, Comparison_Clean)) +
+  geom_tile(data = dplyr::filter(hs, is.na(code)), aes(fill = statistic), colour = "white", linewidth = 0.6) +
+  geom_tile(data = dplyr::filter(hs, !is.na(code)), fill = "grey92", colour = "white", linewidth = 0.6) +
+  geom_text(aes(label = label), size = 3.6, lineheight = 0.9) +
+  scale_fill_gradient2(low = "#2166AC", mid = "#F7F7F7", high = "#B2182B", midpoint = 0,
+                       limits = c(-0.1, 0.6), oob = scales::squish, name = "ANOSIM R") +
+  scale_x_discrete(drop = FALSE, labels = function(x) sub(", ", "\n", x)) +
+  labs(title = "ANOSIM on GloScope divergence",
+       caption = paste("Number = ANOSIM R. *** p <= 0.001, ** p < 0.01, * p < 0.05, ns otherwise (999 permutations, unadjusted).",
+                       "Grey = not applicable (reasons in the detailed heatmap above).", sep = "\n"),
+       x = NULL, y = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid = element_blank(), axis.text = element_text(face = "bold"),
+        plot.title = element_text(face = "bold"),
+        plot.caption = element_text(hjust = 0, size = 9, colour = "grey25"), plot.caption.position = "plot",
+        plot.margin = margin(5.5, 5.5, 5.5, 60))
+ggsave(file.path(output_dir, "anosim_summary_heatmap_simple.png"), p_heatmap_simple,
+       width = 11.5, height = 8, dpi = 300, bg = "white")
+print(p_heatmap_simple)
+```
+
+The exact values are in `GloScope_Full_Outputs_2026b/anosim_summary_full_cohort.csv`.
+
+## Requested groupings {.tabset}
+
+### Origin
+
+Non-malignant vs primary vs metastasis. The Composition tab shows how much of the all-cells separation is cell-type mix rather than cell state.
+
+```{r panel_origin, fig.width=fig_w(k_origin), fig.height=fig_h(k_origin)}
+show_panels(k_origin, "MDS_panel_origin.png")
+```
+
+```{r heatmap_origin, fig.width=11, fig.height=9.5}
+invisible(draw(ht_origin, padding = unit(c(5, 5, 5, 20), "mm")))  # legend was clipped on the right
+```
+
+### Secondary mutation, all pUM
+
+`none/unknown` pools primaries without a detected mutation and primaries never sequenced for it. BAP1 for pUM12 and pUM14 is inferred from chr3 loss, not sequenced. The bottom row adds the non-malignant and metastatic samples of patients with a called mutation, first all cells, then malignant cells only. Every metastasis with a called mutation is BAP1, so the bottom row also separates metastasis from primary.
+
+```{r panel_smut, fig.width=fig_w(k_smut), fig.height=fig_h(k_smut)}
+show_panels(k_smut, "MDS_panel_secondary_mutation_pUM.png")
+```
+
+### Secondary mutation, choroidal pUM
+
+Choroidal primaries with a called mutation only. This removes the location confound: iris primaries carry no SF3B1 or EIF1AX. Left: all cells. Right: malignant cells only (at least 100 per sample).
+
+```{r panel_chor, fig.width=fig_w(k_chor), fig.height=fig_h(k_chor)}
+show_panels(k_chor, "MDS_panel_secondary_mutation_choroid.png")
+```
+
+### Location, pUM
+
+Choroid vs iris vs ciliary body primaries (the one ciliochoroidal tumour is left out). Tumours hold no healthy melanocytes, so a melanocytic subset would be the malignant cells again and is not shown. `r loc_b <- pl_all %>% dplyr::filter(key == "loc_pUM"); if (nrow(loc_b) >= 2) sprintf("Some patients contribute two libraries of the same tumour, which inflates this comparison: R = %.2f (p = %.3g, %d samples) with all libraries, R = %.2f (p = %.3g, %d patients) with one library per patient. The per-patient result is the one to report.", loc_b$R[1], loc_b$p[1], loc_b$n_samples[1], loc_b$R[2], loc_b$p[2], loc_b$n_patients[2]) else ""`
+
+```{r panel_loc, fig.width=fig_w(k_loc), fig.height=fig_h(k_loc)}
+show_panels(k_loc, "MDS_panel_location_pUM.png")
+```
+
+### Location, non-malignant
+
+Left: non-malignant uvea, all cells, by site. Middle: the same samples, healthy melanocytes only (at least 100 per sample, so `r length(setdiff(s_hs, rownames(gs$hs_mel$div)))` samples drop out). Right: non-malignant samples and primaries in one space, coloured by site; its ANOSIM tests non-malignant vs primary.
+
+```{r panel_hs, fig.width=fig_w(k_hs), fig.height=fig_h(k_hs)}
+show_panels(k_hs, "MDS_panel_location_nonmalignant.png")
+```
+
+## Other covariates {.tabset}
+
+### Primary mutation
+
+GNAQ vs GNA11 vs PLCB4; samples with no or unknown primary mutation are left out.
+
+```{r panel_pmut, fig.width=fig_w(k_pmut), fig.height=fig_h(k_pmut)}
+show_panels(k_pmut, "MDS_panel_primary_mutation.png")
+```
+
+### Organ
+
+Organs with at least two samples. Shape = origin.
+
+```{r panel_organ, fig.width=fig_w(k_organ), fig.height=fig_h(k_organ)}
+show_panels(k_organ, "MDS_panel_organ.png")
+```
+
+### Gender
+
+```{r panel_gender, fig.width=fig_w(k_gender), fig.height=fig_h(k_gender)}
+show_panels(k_gender, "MDS_panel_gender.png")
+```
+
+### Age
+
+Age at diagnosis: Young < 40, Middle 40-59, Old >= 60. Samples without an age are left out, which leaves tumours only; tumours hold no healthy melanocytes, so there is no separate melanocytic panel.
+
+```{r panel_age, fig.width=fig_w(k_age), fig.height=fig_h(k_age)}
+show_panels(k_age, "MDS_panel_age.png")
+```
+
+## Composition vs state
+
+Reviewer 2 argued that the separation is just different cell-type content. For each comparison, the same ANOSIM is run on the same samples twice: on the GloScope divergence (cell state and composition) and on the scECODA centred-log-ratio of cell-type counts (composition only). `r rr_n_state` of `r nrow(rr_comp_res)` comparisons are state-driven beyond composition and `r rr_n_comp` are composition-driven. Compare the bars qualitatively: ANOSIM R on two different distances is not a variance decomposition.
+
+```{r scecoda_plot, fig.width=11, fig.height=7}
+rr_pl <- rr_comp_res %>%
+  dplyr::select(label, n_samples, verdict,
+                `GloScope (KL, cell state + composition)` = R_gloscope,
+                `scECODA (CLR, composition only)` = R_composition) %>%
+  tidyr::pivot_longer(c(-label, -n_samples, -verdict), names_to = "space", values_to = "R") %>%
+  mutate(label = factor(sprintf("%s (n = %d)\n%s", label, n_samples, verdict),
+                        levels = sprintf("%s (n = %d)\n%s", rr_comp_res$label,
+                                         rr_comp_res$n_samples, rr_comp_res$verdict)))
+p_rr_scecoda <- ggplot(rr_pl, aes(x = label, y = R, fill = space)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.75) +
+  geom_text(aes(label = sprintf("%.2f", R), hjust = ifelse(R >= 0, -0.15, 1.15)),
+            position = position_dodge(width = 0.8), size = 3) +
+  geom_hline(yintercept = 0, linewidth = 0.3) +
+  scale_fill_manual(values = c("GloScope (KL, cell state + composition)" = "#B00068",
+                               "scECODA (CLR, composition only)" = "#6CACE4FF")) +
+  scale_y_continuous(expand = expansion(mult = c(0.15, 0.15))) +
+  coord_flip() +
+  labs(title = "Is the separation cell state, or cell-type mix?",
+       subtitle = "Bars close together: composition explains it.\nGloScope bar far higher: state signal beyond composition.",
+       x = NULL, y = "ANOSIM R", fill = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"), legend.position = "top",
+        axis.text.y = element_text(size = 9))
+ggsave(file.path(output_dir, "scecoda_composition_vs_gloscope.png"), p_rr_scecoda,
+       width = 11, height = 7, dpi = 300, bg = "white")
+print(p_rr_scecoda + theme(plot.margin = margin(5.5, 5.5, 5.5, 40)))  # long labels were clipped on the left
+```
+
+Compositional variance is dominated by **`r names(rr_clr_var)[1]`** (CLR variance `r sprintf("%.1f", rr_clr_var[[1]])`, `r sprintf("%.1fx", rr_clr_var[[1]] / rr_clr_var[[2]])` the next cell type). On the origin MDS itself, cell-type fractions explain `r sprintf("%.0f%%", 100 * rr_r2_mds1)` of MDS1 and `r sprintf("%.0f%%", 100 * rr_r2_mds2)` of MDS2 (linear model on all `r length(rr_celltypes)` fractions); restricting to melanocytic cells does not remove this confound, because the melanocyte-to-melanoma ratio follows origin by construction.
+
+```{r composition_plots, fig.width=14, fig.height=6}
+rr_var_df <- tibble(cell_type = names(rr_clr_var), clr_variance = as.numeric(rr_clr_var)) %>%
+  mutate(cell_type = factor(cell_type, levels = rev(names(rr_clr_var))))
+p_rr_var <- ggplot(rr_var_df, aes(x = cell_type, y = clr_variance)) +
+  geom_col(fill = "#4E79A7") +
+  geom_text(aes(label = sprintf("%.1f", clr_variance)), hjust = -0.15, size = 3) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
+  coord_flip() +
+  labs(title = "Which cell types carry the compositional variance?",
+       subtitle = sprintf("CLR variance across the %d samples", nrow(rr_clr)),
+       x = NULL, y = "CLR variance") +
+  theme_minimal(base_size = 12) + theme(plot.title = element_text(face = "bold"))
+
+rr_plot_df <- rr_cor %>%
+  dplyr::select(cell_type, rho_MDS1, rho_MDS2) %>%
+  tidyr::pivot_longer(-cell_type, names_to = "axis", values_to = "rho") %>%
+  mutate(axis = sub("rho_", "", axis), cell_type = factor(cell_type, levels = rev(rr_cor$cell_type)))
+p_rr_comp <- ggplot(rr_plot_df, aes(x = cell_type, y = rho, fill = axis)) +
+  geom_col(position = "dodge") +
+  geom_hline(yintercept = 0, linewidth = 0.3) +
+  scale_fill_manual(values = c("MDS1" = "#E15759", "MDS2" = "#4E79A7")) +
+  coord_flip() +
+  labs(title = "Origin MDS axes vs cell-type fraction",
+       subtitle = sprintf("Composition explains %.0f%% of MDS1, %.0f%% of MDS2",
+                          100 * rr_r2_mds1, 100 * rr_r2_mds2),
+       x = NULL, y = "Spearman rho", fill = "Axis") +
+  theme_minimal(base_size = 12) + theme(plot.title = element_text(face = "bold"))
+p_comp2 <- p_rr_var | p_rr_comp
+ggsave(file.path(output_dir, "composition_variance_and_mds_axes.png"), p_comp2,
+       width = 14, height = 6, dpi = 300, bg = "white")
+print(p_comp2 & theme(plot.margin = margin(5.5, 5.5, 5.5, 40)))
+```
+
+## Robustness {.tabset}
+
+### Patient-level sensitivity
+
+ANOSIM assumes samples are independent, but `r n_samples_total` samples come from `r n_patients_total` patients. Each comparison is re-run with (b) one sample per patient per group, which removes same-group re-preps, and (c) one sample per patient overall, which also drops the non-malignant partner of patients with a matched tumour and is therefore a conservative floor. For origin (all cells), (b) drops `r rr_n_dropped_b` samples and R goes from `r sprintf("%.2f", rr_ladder$R[1])` to `r sprintf("%.2f", rr_ladder$R[2])`.
+
+```{r patient_dumbbell, fig.width=11, fig.height=2 + 0.32 * nrow(pl_all) / 3}
+pl_df <- pl_all %>%
+  mutate(comp = sprintf("%s | %s", row, col),
+         step = substr(subset, 2, 2)) %>%
+  group_by(comp) %>%
+  mutate(lab = sprintf("a %.2f (%d)   b %.2f (%d)   c %.2f (%d)",
+                       R[step == "a"], n_samples[step == "a"], R[step == "b"], n_samples[step == "b"],
+                       R[step == "c"], n_samples[step == "c"]),
+         R_a = R[step == "a"]) %>%
+  ungroup() %>%
+  mutate(comp = factor(comp, levels = rev(unique(comp[order(match(row, row_order), match(col, col_order))]))))
+x_max <- max(pl_df$R, na.rm = TRUE)
+p_pl <- ggplot(pl_df, aes(y = comp)) +
+  geom_line(aes(x = R, group = comp), colour = "grey70", linewidth = 0.8, na.rm = TRUE) +
+  geom_point(aes(x = R, colour = subset), size = 2.6, na.rm = TRUE) +
+  geom_text(data = dplyr::distinct(pl_df, comp, lab), aes(x = x_max + 0.04, label = lab),
+            hjust = 0, size = 2.8, family = "mono") +
+  geom_vline(xintercept = 0, linewidth = 0.3) +
+  scale_colour_manual(values = c("(a) all samples (as reported)" = "#B00068",
+                                 "(b) one sample per patient per group" = "#F28E2B",
+                                 "(c) one sample per patient overall" = "#4E79A7"), name = NULL) +
+  coord_cartesian(xlim = c(min(0, min(pl_df$R, na.rm = TRUE)) - 0.02, x_max + 0.55), clip = "off") +
+  labs(title = "ANOSIM R with and without repeat samples of the same patient",
+       subtitle = "Right: R (number of samples) for a / b / c", x = "ANOSIM R", y = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "top", plot.title = element_text(face = "bold"))
+ggsave(file.path(output_dir, "anosim_patient_level_sensitivity.png"), p_pl,
+       width = 11, height = 2 + 0.32 * nrow(pl_all) / 3, dpi = 300, bg = "white")
+print(p_pl + theme(plot.margin = margin(5.5, 40, 5.5, 40)))
+```
+
+All values with p are in `anosim_patient_level_sensitivity_all.csv`. The largest drop from (a) to (b) is `r sprintf("%.2f", pl_max_drop$drop_b[1])` (`r pl_max_drop$row[1]`, `r tolower(pl_max_drop$col[1])`).
+
+### Paired non-malignant to primary
+
+`r length(rr_pair_patients)` patients have both a non-malignant uveal sample and a primary from the same eye (`r paste(rr_pair_patients, collapse = ", ")`). Main test: is a tumour different from its own non-malignant tissue? ANOSIM on the pairs with permutations only within each patient: `r if (!is.null(rr_restricted)) paste(sprintf("%s, %d pairs: R = %.2f, p = %.3g (smallest possible p with %d pairs: %.3g)", rr_restricted$matrix, rr_restricted$n_pairs, rr_restricted$R, rr_restricted$p, rr_restricted$n_pairs, rr_restricted$p_floor), collapse = "; ") else "not computed"`. A p equal to its floor means every pair separates in the same direction; it cannot get smaller with this many pairs. The plot below asks a different question, whether a non-malignant sample is closer to its own tumour than to other patients' tumours (signed-rank test), which tests patient identity rather than tumour vs normal.
+
+```{r paired_plot, eval=rr_has_pairs, fig.width=9, fig.height=5.5}
+rr_paired_long <- rr_paired %>%
+  dplyr::select(matrix, Patient_nr, `own tumour` = d_own, `other tumours` = d_others) %>%
+  tidyr::pivot_longer(c(`own tumour`, `other tumours`), names_to = "comparison", values_to = "divergence")
+rr_sub <- paste(sprintf("%s: %d patients, median diff %+.3g, signed-rank p = %.3g",
+                        rr_paired_test$matrix, rr_paired_test$n_patients,
+                        rr_paired_test$median_delta, rr_paired_test$p_signed_rank),
+                collapse = "\n")
+p_rr_paired <- ggplot(rr_paired_long, aes(x = comparison, y = divergence, group = Patient_nr)) +
+  geom_line(colour = "grey60", linewidth = 0.4) +
+  geom_point(aes(colour = comparison), size = 3) +
+  scale_colour_manual(values = c("own tumour" = "#B00068", "other tumours" = "#6CACE4FF"), guide = "none") +
+  facet_wrap(~ matrix, scales = "free_y") +
+  labs(title = "Non-malignant uvea vs own and other patients' primaries",
+       subtitle = rr_sub, x = NULL, y = "KL divergence") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"), plot.subtitle = element_text(size = 10))
+ggsave(file.path(output_dir, "paired_within_patient_divergence.png"), p_rr_paired,
+       width = 9, height = 5.5, dpi = 300, bg = "white")
+print(p_rr_paired)
+```
+
+## Methods and session info
+
+**Input.** `final_Subtyping_iCNV_reclustered.qs2` (October 2026, Levesque lab), uncorrected PCA, first 50 PCs. Groupings come from the object's metadata: `origin`, `organ`, `primary_mutation`, `secondary_mutation` (BAP1 / SF3B1 / EIF1AX, everything else pooled as `none/unknown`), `primary_location` (choroid / iris / ciliary body), `healthy_location`, `Gender`, `Age_atDiagnosisY`.
+
+**GloScope** (`r packageVersion("GloScope")`): per-sample kNN density (k = 50), symmetrised KL divergence between all sample pairs, MDS with `MASS::isoMDS` for display. Matrices are cached in `GloScope_Full_Outputs_2026b/divergence_*.qs2` and reloaded by file name. Subsets: malignant = iCNV `Malignant`; melanocytic = iCNV malignant plus annotated melanocytes (organ, gender), `majority_celltype` melanocytes plus melanoma cells (origin), or `majority_celltype` melanocytes alone (non-malignant sites). All `r format(n_hmel_cells, big.mark = ",")` annotated melanocytes are in non-malignant samples, so for tumour-only groupings the melanocytic subset equals the malignant one and is not run twice. Samples with fewer than 50 or 100 subset cells (stated in each panel title) are dropped.
+
+**Statistics.** `vegan::anosim`, `r N_PERM` permutations, seeded per test, p-values unadjusted. Composition: scECODA CLR of `majority_celltype` counts, same ANOSIM. Paired test: Wilcoxon signed-rank over patients. GloScope divergence is an estimate and can be slightly negative for two near-identical samples; such pairs are floored at a tiny positive value for the MDS only and named under the panel.
+
+**Software.** `r R.version.string`; `r paste(sprintf("%s %s", c("Seurat", "GloScope", "vegan", "scECODA", "ComplexHeatmap", "ggplot2", "patchwork"), sapply(c("Seurat", "GloScope", "vegan", "scECODA", "ComplexHeatmap", "ggplot2", "patchwork"), function(x) as.character(packageVersion(x)))), collapse = ", ")`. Rendered `r format(Sys.time(), "%Y-%m-%d")`.
+
+**Analysis code** (folded):
+
+```{r code_appendix, ref.label=grep("^c_", knitr::all_labels(), value = TRUE), eval=FALSE, echo=TRUE}
+```

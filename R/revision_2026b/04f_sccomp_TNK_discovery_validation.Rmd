@@ -1,0 +1,141 @@
+---
+title: "UM Atlas - T/NK states: matched pairs first, other patients as validation"
+output:
+  html_document:
+    self_contained: true
+    includes:
+      in_header: !expr system.file("templates/fgcz_header.html", package = "ezRun", lib.loc = .libPaths())
+    css: !expr system.file("templates/fgcz.css", package = "ezRun", lib.loc = .libPaths())
+    code_folding: hide
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+# Publication figures: every chunk figure is also written as PDF + 300 dpi PNG to Figures_2026b/sccomp_TNK_validation/.
+knitr::opts_chunk$set(dev = c("png", "cairo_pdf"), dpi = 300,
+                      fig.path = "../Figures_2026b/sccomp_TNK_validation/",
+                      echo = TRUE, message = FALSE, warning = FALSE, comment = "", fig.width = 10, fig.height = 5)
+library(data.table)
+library(tidyverse)
+source("config_colors_2026b.R")
+# Fits come from 04d (discovery) and 04f_sccomp_TNK_discovery_validation.R (validation).
+OUT <- "../Outputs/sccomp_paired_TNK_2026b"
+cmp <- fread(file.path(OUT, "validation_vs_discovery.csv"))
+val <- fread(file.path(OUT, "validation_tests.csv"))
+vs <- fread(file.path(OUT, "validation_samples.csv"))
+disc_n <- fread(file.path(OUT, "tnk_cells_per_sample.csv"))[kept == TRUE]
+stopifnot(nrow(cmp) == 7, nrow(val) == 21, !any(vs$Patient_nr %in% disc_n$Patient_nr))
+orig_lv <- c("non-malignant", "primary", "metastasis")
+n_val <- vs[, .(samples = .N, patients = uniqueN(Patient_nr), cells = sum(cells)), by = origin][match(orig_lv, origin)]
+vs[, tissue := fcase(grepl("_hCh|-hCh", Sample), "choroid", grepl("hIr", Sample), "iris", grepl("hCB", Sample), "ciliary body", default = NA_character_)]
+nm_tissue <- vs[origin == "non-malignant", .N, by = tissue][order(-N)]
+
+stars <- function(p) as.character(cut(p, c(-Inf, 0.001, 0.01, 0.05, Inf), c("***", "**", "*", "ns")))
+fmt_p <- function(p) ifelse(p < 0.001, "< 0.001", sprintf("= %.3f", p))
+calls <- cmp[discovery_call == TRUE][order(d_pH0)]
+verdict <- function(x) ifelse(x$holds, "holds", ifelse(x$same_sign, "same direction, not significant", "opposite direction"))
+call_txt <- if (nrow(calls)) paste(sprintf("%s (%s in the tumour, discovery p %s; validation p %s, %s)", calls$cell_group,
+  ifelse(calls$d_effect > 0, "up", "down"), fmt_p(calls$d_pH0), fmt_p(calls$v_pH0), verdict(calls)), collapse = "; ") else "none"
+n_hold <- sum(cmp$holds); n_same <- sum(cmp$same_sign)
+```
+
+<style>
+.main-container img { max-width: min(100%, 1400px) !important; height: auto !important; display: block; margin: 0 auto; }
+.main-container .html-widget { max-width: 1400px; margin: 0 auto; }
+</style>
+
+Question: which T/NK states differ between the normal tissue and the primary tumour of the same patient, and do those differences also show up in patients who have no matched pair?
+
+# {.tabset}
+
+## Overview
+
+- **Discovery**: the 7 tumour-normal pairs (`r nrow(disc_n)` samples, one non-malignant and one primary per patient), sccomp `~ origin + (1 | Patient_nr)`. Calls at p < 0.05: `r call_txt`.
+- **Validation**: samples of patients who are *not* in those pairs, same model and groups: `r paste(sprintf("%s %d samples from %d patients", n_val$origin, n_val$samples, n_val$patients), collapse = "; ")`. No patient is in both sets, which the earlier whole-cohort report (04e) did not guarantee because its pairs were part of its data.
+- **Rule set before the fit**: a discovery call "holds" when the validation effect has the same sign and p < 0.05. Result: `r n_hold` of `r sum(cmp$discovery_call)` calls hold; `r n_same` of 7 groups go in the same direction as in the pairs.
+- **Limit of the validation**: only `r n_val[origin == "non-malignant", patients]` independent non-malignant patients (`r paste(sprintf("%d %s", nm_tissue$N, nm_tissue$tissue), collapse = ", ")` samples). The paired normals are tumour-adjacent tissue; these are mostly iris and ciliary body donors, so a difference could be tissue and not tumour. A validation that fails here is weak evidence against a call, and one that holds is not proof that it is tumour-driven.
+- **Also asked**: metastasis against the same unpaired normals and against primary is on the Metastasis tab. That comparison has no matched pairs at all.
+
+## Discovery vs validation
+
+Primary vs non-malignant, log-odds with 95% credible interval, for the 7 matched pairs and for the independent samples. A group that replicates has both points on the same side of zero.
+
+```{r forest, fig.width = 11, fig.height = 5.5}
+fd <- bind_rows(
+  cmp |> transmute(cell_group, set = "Discovery: 7 pairs", lo = d_lower, eff = d_effect, hi = d_upper, p = d_pH0),
+  cmp |> transmute(cell_group, set = "Validation: other patients", lo = v_lower, eff = v_effect, hi = v_upper, p = v_pH0)) |>
+  mutate(cell_group = factor(cell_group, levels = cmp[order(d_effect), cell_group]),
+         set = factor(set, levels = c("Discovery: 7 pairs", "Validation: other patients")),
+         lab = sprintf("%s  p %s", stars(p), fmt_p(p)))
+ggplot(fd, aes(eff, cell_group, colour = set)) +
+  geom_vline(xintercept = 0, colour = "grey50") +
+  geom_errorbarh(aes(xmin = lo, xmax = hi), height = 0.25, position = position_dodge(width = 0.6)) +
+  geom_point(size = 2.6, position = position_dodge(width = 0.6)) +
+  geom_text(aes(x = max(hi) + 0.2, label = lab), position = position_dodge(width = 0.6), hjust = 0, size = 3, show.legend = FALSE) +
+  scale_colour_manual(values = c("grey25", "#E6550D"), name = NULL) +
+  coord_cartesian(xlim = c(min(fd$lo), max(fd$hi) + 2.2), clip = "off") +
+  labs(x = "Primary vs non-malignant (log-odds, 95% credible interval)", y = NULL,
+       title = sprintf("T/NK states: %d of %d discovery calls hold in other patients", n_hold, sum(cmp$discovery_call))) +
+  theme_bw(base_size = 11) + theme(legend.position = "bottom", plot.margin = margin(5.5, 20, 5.5, 5.5))
+```
+
+```{r scatter, fig.width = 6.5, fig.height = 6}
+ggplot(cmp, aes(d_effect, v_effect, label = cell_group)) +
+  geom_hline(yintercept = 0, colour = "grey60") + geom_vline(xintercept = 0, colour = "grey60") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey60") +
+  geom_errorbar(aes(ymin = v_lower, ymax = v_upper), colour = "grey70", width = 0) +
+  geom_errorbarh(aes(xmin = d_lower, xmax = d_upper), colour = "grey70", height = 0) +
+  geom_point(aes(colour = holds), size = 3) +
+  ggrepel::geom_text_repel(size = 3, min.segment.length = 0.2) +
+  scale_colour_manual(values = c(`TRUE` = "#B2182B", `FALSE` = "grey35"), labels = c(`TRUE` = "holds", `FALSE` = "does not hold"), name = NULL) +
+  labs(x = "Discovery effect (7 pairs, log-odds)", y = "Validation effect (other patients, log-odds)",
+       title = "Effect sizes, primary vs non-malignant") +
+  theme_bw(base_size = 11) + theme(aspect.ratio = 1, legend.position = "bottom")
+```
+
+## Metastasis
+
+Unpaired only: the independent samples, metastasis against non-malignant and against primary. Primary vs non-malignant is shown for reference.
+
+```{r metastasis, fig.width = 12, fig.height = 5}
+ctr_lv <- c("primary vs non-malignant", "metastasis vs non-malignant", "metastasis vs primary")
+md <- val |> mutate(contrast = factor(contrast, levels = ctr_lv),
+                    cell_group = factor(cell_group, levels = cmp[order(d_effect), cell_group]),
+                    lab = sprintf("%s  p %s", stars(v_pH0), fmt_p(v_pH0)))
+ggplot(md, aes(v_effect, cell_group)) +
+  geom_vline(xintercept = 0, colour = "grey50") +
+  geom_errorbarh(aes(xmin = v_lower, xmax = v_upper), height = 0.2) +
+  geom_point(aes(colour = v_effect > 0), size = 2.8) +
+  geom_text(aes(x = max(v_upper) + 0.15, label = lab), hjust = 0, size = 3) +
+  facet_wrap(~ contrast, nrow = 1) +
+  scale_colour_manual(values = c(`TRUE` = "#B2182B", `FALSE` = "#2166AC"),
+                      labels = c(`TRUE` = "higher in the first group", `FALSE` = "higher in the second group"), name = NULL) +
+  coord_cartesian(xlim = c(min(md$v_lower), max(md$v_upper) + 3.3), clip = "off") +
+  labs(x = "log-odds (95% credible interval)", y = NULL) +
+  theme_bw(base_size = 10) + theme(legend.position = "bottom", plot.margin = margin(5.5, 20, 5.5, 5.5), strip.text = element_text(size = 9))
+```
+
+## Samples
+
+T/NK cells per sample in the validation set (samples of patients outside the 7 pairs, at least 30 T/NK cells).
+
+```{r samples, fig.width = 11, fig.height = 5}
+vs |> mutate(origin = factor(origin, levels = orig_lv), lab = paste0(Patient_nr)) |>
+  ggplot(aes(reorder(paste(origin, Sample), cells), cells, fill = origin)) +
+  geom_col() +
+  geom_text(aes(label = format(cells, big.mark = ",")), hjust = -0.1, size = 2.6) +
+  coord_flip(clip = "off") +
+  scale_y_log10(labels = scales::comma, expand = expansion(mult = c(0, 0.2))) +
+  scale_x_discrete(labels = function(x) sub("^[a-z-]+ [0-9]+_[0-9]+-", "", x)) +
+  scale_fill_manual(values = origin_colors, name = NULL) +
+  labs(x = NULL, y = "T/NK cells (log scale)") +
+  theme_bw(base_size = 9) + theme(legend.position = "bottom")
+```
+
+## Methods
+
+- **Discovery**: `tnk_groups_paired.csv`, state grouping, from 04d (7 patients with a non-malignant and a primary sample and at least 30 T/NK cells in each).
+- **Validation**: every sample with at least 30 T/NK cells from a patient outside those 7 (37 samples), counts summed into the same 7 state groups (naive = CD4_N + CD8_N; memory/effector = CD4_EM, CD8_EM, CD8_EMRA, CD8_RM; exhausted = CD4_EX + CD8_EX; Treg = CD4_REG; MAIT + gdT; NK = NK_REST + NK_CYTO; proliferating T). Model, seed and sccomp settings as in 04d, with contrasts primary and metastasis vs non-malignant and metastasis vs primary.
+- **Verdict rule**: set before the fit - same sign as discovery and validation p < 0.05 (sccomp `c_pH0`).
+- sccomp `r packageVersion("sccomp")`. Script `04f_sccomp_TNK_discovery_validation.R`; tables `validation_*.csv` in `Outputs/sccomp_paired_TNK_2026b/`.

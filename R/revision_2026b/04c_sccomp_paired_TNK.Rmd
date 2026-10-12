@@ -1,0 +1,154 @@
+---
+title: "UM Atlas - Paired sccomp: model check and T/NK subtypes"
+output:
+  html_document:
+    self_contained: true
+    includes:
+      in_header: !expr system.file("templates/fgcz_header.html", package = "ezRun", lib.loc = .libPaths())
+    css: !expr system.file("templates/fgcz.css", package = "ezRun", lib.loc = .libPaths())
+    code_folding: hide
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+# Publication figures: every chunk figure is also written as PDF + 300 dpi PNG to Figures_2026b/sccomp_paired_TNK/.
+knitr::opts_chunk$set(dev = c("png", "cairo_pdf"), dpi = 300,
+                      fig.path = "../Figures_2026b/sccomp_paired_TNK/",
+                      echo = TRUE, message = FALSE, warning = FALSE, comment = "", fig.width = 10, fig.height = 7)
+library(data.table)
+library(tidyverse)
+source("config_colors_2026b.R")
+# Fits come from 04c_sccomp_paired_TNK.R (counts from the TME metadata of the October 2026 object).
+OUT <- "../Outputs/sccomp_paired_TNK_2026b"
+ct <- fread(file.path(OUT, "celltype_paired_models.csv"))
+tnk <- fread(file.path(OUT, "tnk_subtypes_paired.csv"))
+shares <- fread(file.path(OUT, "tnk_subtype_shares.csv"))
+n_tnk <- fread(file.path(OUT, "tnk_cells_per_sample.csv"))
+n_pairs <- uniqueN(n_tnk$Patient_nr)
+kept <- unique(n_tnk[kept == TRUE, Patient_nr])
+dropped <- setdiff(unique(n_tnk$Patient_nr), kept)
+floor_p <- 2 / 2^length(kept)
+
+stars <- function(p) cut(p, c(-Inf, 0.001, 0.01, 0.05, Inf), c("***", "**", "*", "ns"))
+fmt_p <- function(p) ifelse(p < 0.001, formatC(p, format = "e", digits = 1), sprintf("%.3f", p))
+
+# Calls per model on the cell-type level (c_pH0 < 0.05)
+calls <- ct[c_pH0 < 0.05, .(n = .N, types = paste(sprintf("%s (%s)", cell_group, ifelse(c_effect > 0, "up", "down")), collapse = ", ")), by = model]
+n_call <- function(m) if (m %in% calls$model) calls[model == m, n] else 0L
+same_hmc <- setequal(ct[model == "hmc, paired" & c_pH0 < 0.05, cell_group], ct[model == "pathfinder, paired (report)" & c_pH0 < 0.05, cell_group])
+tp <- tnk[model == "hmc, paired"][order(c_pH0)]
+sig_tnk <- tp[c_pH0 < 0.05]
+pooled <- shares[, .(n = sum(count)), by = .(SubTyping, origin)] |> dcast(SubTyping ~ origin, value.var = "n", fill = 0)
+sig_tnk <- merge(sig_tnk, pooled, by.x = "cell_group", by.y = "SubTyping")
+sig_txt <- if (nrow(sig_tnk)) paste(sprintf("%s (%s, sccomp p %s, Wilcoxon p %s, higher in the tumour in %d of %d pairs; %d cells in normal and %d in tumour samples overall)", sig_tnk$cell_group,
+  ifelse(sig_tnk$c_effect > 0, "up in tumour", "down in tumour"), fmt_p(sig_tnk$c_pH0), fmt_p(sig_tnk$wilcox_p), sig_tnk$n_up, sig_tnk$n_pairs,
+  sig_tnk$`non-malignant`, sig_tnk$primary),
+  collapse = "; ") else "none"
+same_way <- tp[wilcox_p <= floor_p * 1.001]  # exact Wilcoxon at its floor = every pair moved the same way, no ties
+same_way_txt <- if (nrow(same_way)) paste(sprintf("%s %s in all %d pairs (Wilcoxon p %s, sccomp p %s)", same_way$cell_group,
+  ifelse(same_way$median_diff < 0, "lower in the tumour", "higher in the tumour"), same_way$n_pairs, fmt_p(same_way$wilcox_p), fmt_p(same_way$c_pH0)),
+  collapse = "; ") else "none"
+```
+
+<style>
+.main-container img { max-width: min(100%, 1400px) !important; height: auto !important; display: block; margin: 0 auto; }
+.main-container .html-widget { max-width: 1400px; margin: 0 auto; }
+</style>
+
+Follow-up to the sccomp report: is the tumour vs adjacent-normal comparison really paired, and which T/NK subtypes change between the normal eye tissue and the primary tumour of the same patient?
+
+# {.tabset}
+
+## Overview
+
+- **sccomp does use the pairing.** A patient random intercept, `~ origin + (1 | Patient_nr)`, gives each patient its own baseline composition, so the origin effect is estimated within patients. The atlas has `r n_pairs` such patients (`r paste(sort(unique(n_tnk$Patient_nr)), collapse = ", ")`), each with one non-malignant and one primary sample; no patient has a primary and a metastasis.
+- **Model check.** The report fit used sccomp's default fast approximation (pathfinder). Refitted with full MCMC (hmc), the paired model calls `r n_call("hmc, paired")` cell types at p < 0.05 against `r n_call("pathfinder, paired (report)")` with pathfinder (`r if (same_hmc) "the same cell types" else "not the same set, see the Model check tab"`). Without the patient term, `r n_call("hmc, unpaired")` cell types are called.
+- **T/NK subtypes, tumour vs its own normal tissue** (`r length(kept)` pairs; `r if (length(dropped)) paste(dropped, collapse = ", ") else "none"` left out with fewer than 30 T/NK cells in a sample): `r sig_txt`.
+- Same direction in every pair: `r same_way_txt`.
+- With `r length(kept)` pairs the paired Wilcoxon cannot go below p = `r sprintf("%.3f", floor_p)`, so a Wilcoxon p at that value means every pair moved the same way, not a large effect.
+
+## Model check
+
+Origin effect (primary vs non-malignant, log-odds scale with 95% credible interval) per cell type, for the report's pathfinder fit and two full-MCMC refits, with and without the patient term. Filled points: p < 0.05.
+
+```{r model_check, fig.width = 10, fig.height = 7}
+ct |>
+  mutate(model = factor(model, levels = c("pathfinder, paired (report)", "hmc, paired", "hmc, unpaired")),
+         cell_group = fct_reorder(cell_group, c_effect, .fun = mean), sig = c_pH0 < 0.05) |>
+  ggplot(aes(c_effect, cell_group, colour = model)) +
+  geom_vline(xintercept = 0, colour = "grey50") +
+  geom_errorbarh(aes(xmin = c_lower, xmax = c_upper), height = 0, position = position_dodge(width = 0.6)) +
+  geom_point(aes(shape = sig), size = 2.5, position = position_dodge(width = 0.6)) +
+  scale_shape_manual(values = c(`TRUE` = 16, `FALSE` = 1), labels = c(`TRUE` = "p < 0.05", `FALSE` = "ns"), name = NULL) +
+  scale_colour_manual(values = c("grey40", "royalblue3", "darkorange2"), name = NULL) +
+  labs(x = "Primary vs non-malignant (log-odds)", y = NULL,
+       title = sprintf("%d tumour + adjacent-normal pairs, all TME cell types", n_pairs)) +
+  theme_bw(base_size = 11) + theme(legend.position = "bottom", plot.margin = margin(5.5, 15, 5.5, 5.5))
+```
+
+## T/NK subtypes {.tabset}
+
+Share of each T/NK subtype among the T/NK cells of a sample, normal tissue vs primary tumour of the same patient. sccomp: `~ origin + (1 | Patient_nr)`, full MCMC. Cross-check: exact paired Wilcoxon on the shares (floor p = `r sprintf("%.3f", floor_p)`).
+
+### Paired change
+
+```{r tnk_forest, fig.width = 10, fig.height = 1.5 + 0.4 * nrow(tp)}
+tp |>
+  mutate(cell_group = fct_reorder(cell_group, c_effect),
+         lab = sprintf("%s  p = %s", stars(c_pH0), fmt_p(c_pH0))) |>
+  ggplot(aes(c_effect, cell_group)) +
+  geom_vline(xintercept = 0, colour = "grey50") +
+  geom_errorbarh(aes(xmin = c_lower, xmax = c_upper), height = 0.2) +
+  geom_point(aes(colour = c_effect > 0), size = 3) +
+  geom_text(aes(x = max(c_upper) + 0.2, label = lab), hjust = 0, size = 3.3) +
+  scale_colour_manual(values = c(`TRUE` = unname(origin_colors["primary"]), `FALSE` = unname(origin_colors["non-malignant"])),
+                      labels = c(`TRUE` = "higher in tumour", `FALSE` = "higher in normal"), name = NULL) +
+  coord_cartesian(xlim = c(min(tp$c_lower), max(tp$c_upper) + 2), clip = "off") +
+  labs(x = "Primary vs non-malignant (log-odds, 95% credible interval)", y = NULL,
+       title = sprintf("T/NK subtypes, %d tumour-normal pairs (sccomp, paired)", length(kept))) +
+  theme_bw(base_size = 11) + theme(legend.position = "bottom", plot.margin = margin(5.5, 20, 5.5, 5.5))
+```
+
+### Per patient
+
+Lines join the two samples of a patient.
+
+```{r tnk_per_patient, fig.width = 13, fig.height = 3.2 * ceiling(uniqueN(shares$SubTyping) / 4)}
+facet_lab <- tp[, .(SubTyping = cell_group, lab = sprintf("%s\nsccomp p = %s, Wilcoxon p = %s", cell_group, fmt_p(c_pH0), fmt_p(wilcox_p)))]
+merge(shares, facet_lab, by = "SubTyping") |>
+  mutate(origin = factor(origin, levels = c("non-malignant", "primary")), lab = factor(lab, levels = facet_lab$lab)) |>
+  ggplot(aes(origin, share)) +
+  geom_line(aes(group = Patient_nr), colour = "grey65") +
+  geom_point(aes(colour = origin), size = 2) +
+  facet_wrap(~ lab, scales = "free_y", ncol = 4) +
+  scale_colour_manual(values = origin_colors, guide = "none") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = NULL, y = "Share of T/NK cells") +
+  theme_bw(base_size = 10) + theme(strip.text = element_text(size = 9))
+```
+
+### Cells per sample
+
+T/NK cells per sample; pairs with a sample below 30 T/NK cells are not tested.
+
+```{r tnk_cells, fig.width = 9, fig.height = 5}
+n_tnk |>
+  mutate(origin = factor(origin, levels = c("non-malignant", "primary"))) |>
+  ggplot(aes(Patient_nr, N, fill = origin, alpha = kept)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.75) +
+  geom_text(aes(label = N), position = position_dodge(width = 0.8), vjust = -0.3, size = 3) +
+  geom_hline(yintercept = 30, linetype = "dashed", colour = "grey40") +
+  scale_fill_manual(values = origin_colors, name = NULL) +
+  scale_alpha_manual(values = c(`TRUE` = 1, `FALSE` = 0.35), guide = "none") +
+  scale_y_log10() +
+  labs(x = NULL, y = "T/NK cells (log scale)", title = "T/NK cells per sample in the tumour-normal pairs") +
+  theme_bw(base_size = 11) + theme(legend.position = "bottom")
+```
+
+## Methods
+
+- **Data**: October 2026 TME object (149,062 cells, 63 samples), per-sample cell counts from its metadata. Pairs = patients with both a non-malignant and a primary sample (`r n_pairs`).
+- **Cell types**: `majority_celltype`, all TME cell types, the same samples as the report's paired tab. Models: the report's fit (`sccomp_estimate(~ origin + (1 | Patient_nr))`, pathfinder), the same model with `inference_method = "hmc"`, and `~ origin` with hmc. All with `bimodal_mean_variability_association = TRUE`, `sccomp_remove_outliers`, then `sccomp_test`; p = sccomp `c_pH0`.
+- **T/NK subtypes**: `SubTyping` levels of T and NK cells (CD4, CD8, MAIT, gdT, NK, proliferating T), composition within the T/NK cells only. Pairs kept when both samples have at least 30 T/NK cells; subtypes kept when seen in at least 3 kept samples. Same sccomp settings, hmc. Paired Wilcoxon: exact, two-sided, on the share of each subtype, unadjusted.
+- sccomp `r packageVersion("sccomp")`. Script `04c_sccomp_paired_TNK.R`; tables in `Outputs/sccomp_paired_TNK_2026b/`.

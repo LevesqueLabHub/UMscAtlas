@@ -1,0 +1,223 @@
+---
+title: "UM Atlas - CytoTRACE2 and Stemness Signature (October 2026 atlas)"
+output:
+  html_document:
+    self_contained: true
+    includes:
+      in_header: !expr system.file("templates/fgcz_header.html", package = "ezRun", lib.loc = .libPaths())
+    css: !expr system.file("templates/fgcz.css", package = "ezRun", lib.loc = .libPaths())
+    code_folding: hide
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+# Publication figures: every chunk figure is also written as a vector PDF (and a 300 dpi PNG)
+# to Figures_2026b/CytoTRACE2/, named after its chunk, for the figure bundle.
+knitr::opts_chunk$set(dev = c("png", "cairo_pdf"), dpi = 300, fig.path = "../Figures_2026b/CytoTRACE2/")
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, comment = "",
+                      fig.width = 12, fig.height = 6)
+library(tidyverse)
+library(data.table)
+library(patchwork)
+library(ggsignif)
+library(ggrepel)
+library(plotly)
+source("config_colors_2026b.R")
+
+# Scores and gene correlations come from run_cytotrace2_2026b.R (no Seurat object is loaded here).
+ct_dir <- "../Outputs/CytoTRACE2_2026b"
+meta <- fread("../new_data_2026b/full_meta_full.csv.gz",
+              select = c("cell", "Sample", "orig.ident", "Patient_nr", "origin", "Malignant", "majority_celltype",
+                         "secondary_mutation", "primary_location", "healthy_location"))
+ct <- qs2::qs_read(file.path(ct_dir, "cytotrace2_scores.qs2"), nthreads = 1)
+d <- merge(meta, ct[, .(cell, CytoTRACE2_Score, CytoTRACE2_Potency)], by = "cell")
+stopifnot("not every atlas cell is scored" = nrow(d) == 349696 && nrow(meta) == 349696, !anyNA(d$CytoTRACE2_Score))
+d[, origin := factor(origin, levels = c("non-malignant", "primary", "metastasis"))]
+stopifnot(!anyNA(d$origin))
+
+sets <- c(malignant = "Malignant cells", healthy_melanocyte = "Non-malignant melanocytes", all_cells = "All cells")
+set_n <- c(malignant = sum(d$Malignant == "Malignant"),
+           healthy_melanocyte = sum(d$majority_celltype == "Melanocytes" & d$origin == "non-malignant"),
+           all_cells = nrow(d))
+cors <- setNames(lapply(names(sets), function(s) fread(file.path(ct_dir, sprintf("gene_cor_%s.csv", s)))), names(sets))
+n_sig <- 50
+# Signatures in the gene,correlation,direction format of cytotrace2_signature_xenium.csv (used by report 14).
+sig <- lapply(names(sets), function(s) {
+  g <- cors[[s]]
+  out <- rbind(g[order(-correlation)][1:n_sig][, direction := "Top"],
+               g[order(correlation)][1:n_sig][, direction := "Bottom"])[, .(gene, correlation, direction)]
+  fwrite(out, file.path(ct_dir, sprintf("stemness_signature_%s_top%d.csv", s, n_sig)))
+  out
+}) |> setNames(names(sets))
+
+signif_label <- function(p) sprintf("%s  p = %s",
+  as.character(cut(p, c(-Inf, 0.001, 0.01, 0.05, Inf), c("***", "**", "*", "ns"))), formatC(p, digits = 2, format = "g"))
+box_by <- function(df, grp, levels, cols, title, ylab, cap) {
+  df <- df[df[[grp]] %in% levels, ]; df[[grp]] <- factor(df[[grp]], levels = levels)
+  n_by <- table(df[[grp]]); lv <- names(n_by)[n_by >= 3]
+  stopifnot(nrow(df) > 0)
+  ggplot(df, aes(.data[[grp]], score, fill = .data[[grp]])) +
+    geom_boxplot(outlier.shape = NA, alpha = 0.6) + geom_jitter(width = 0.12, size = 1.8) +
+    {if (length(lv) >= 2) geom_signif(comparisons = combn(lv, 2, simplify = FALSE), test = "wilcox.test",
+                                      map_signif_level = signif_label, step_increase = 0.1, textsize = 3, tip_length = 0.01)} +
+    scale_x_discrete(labels = setNames(sprintf("%s\n(n = %d)", names(n_by), as.integer(n_by)), names(n_by))) +
+    scale_y_continuous(expand = expansion(mult = c(0.05, 0.3))) + scale_fill_manual(values = cols) +
+    labs(title = title, x = NULL, y = ylab, caption = paste(strwrap(cap, 65), collapse = "\n")) +
+    theme_minimal(base_size = 12) + theme(legend.position = "none", plot.caption = element_text(hjust = 0))
+}
+
+# Per-sample means; per-patient means of malignant cells in primaries (one point per patient).
+# One point per patient and origin: 7 patients have several libraries of the same tumour.
+per_patient <- d[, .(score = mean(CytoTRACE2_Score), n = .N), by = .(Patient_nr, origin)]
+mal_patient <- d[Malignant == "Malignant" & origin == "primary",
+                 .(score = mean(CytoTRACE2_Score), n = .N, secondary_mutation = secondary_mutation[1],
+                   primary_location = primary_location[1], n_loc = uniqueN(primary_location)), by = Patient_nr]
+stopifnot("a patient has two primary locations" = all(mal_patient$n_loc == 1))
+mal_origin <- d[Malignant == "Malignant", .(score = mean(CytoTRACE2_Score), n = .N), by = .(Patient_nr, origin)]
+mel_sample <- d[majority_celltype == "Melanocytes" & origin == "non-malignant",
+                .(score = mean(CytoTRACE2_Score), n = .N, healthy_location = healthy_location[1]), by = Patient_nr][n >= 20]
+cap_pat <- "One point per patient (mean over its malignant cells). Unadjusted two-sided Wilcoxon; groups with fewer than 3 patients are drawn but not tested."
+```
+
+CytoTRACE2 (developmental potential, 0 = differentiated, 1 = totipotent) was scored on all `r format(nrow(d), big.mark = ",")` cells of the October 2026 atlas, one library at a time. The stemness signature is the set of genes whose expression correlates with the CytoTRACE2 score.
+
+<style>
+/* Cap figure size so plots do not blow up in a full-screen window (retina + dpi 300 gives ~150 px per inch). */
+.main-container img { max-width: min(100%, 1400px) !important; height: auto !important; display: block; margin: 0 auto; }
+.main-container .html-widget { max-width: 1400px; margin: 0 auto; }
+</style>
+
+# {.tabset}
+
+## Score overview
+
+```{r celltype, fig.height = 6}
+ord <- d[, .(m = median(CytoTRACE2_Score)), by = majority_celltype][order(m), majority_celltype]
+stopifnot("cell type without a colour" = all(ord %in% names(majority_celltype_col)))
+ggplot(d, aes(factor(majority_celltype, levels = ord), CytoTRACE2_Score, fill = majority_celltype)) +
+  geom_violin(scale = "width", colour = "grey30", linewidth = 0.3) +
+  geom_boxplot(width = 0.15, outlier.shape = NA, fill = "white") +
+  scale_fill_manual(values = majority_celltype_col, guide = "none") +
+  coord_flip() + labs(title = "CytoTRACE2 score by cell type (all cells)", x = NULL, y = "CytoTRACE2 score") +
+  theme_minimal(base_size = 12) +
+  theme(plot.margin = margin(5.5, 5.5, 5.5, 40))  # longest cell-type name was clipped
+```
+
+```{r origin_patient, fig.width = 7, fig.height = 6}
+box_by(per_patient[, .(origin, score)], "origin", levels(d$origin), origin_colors,
+       "Mean CytoTRACE2 score per patient, all cells", "Mean CytoTRACE2 score",
+       "One point per patient and origin (all cells); 8 patients have both a tumour and its adjacent normal, so the groups are not fully independent. Differences mix cell-type composition and cell state; the malignant-only tabs separate the two.")
+```
+
+## UMAP
+
+Atlas UMAP (as shipped with the October object) coloured by CytoTRACE2 score and by cell type, as a visual check.
+
+```{r umap, fig.width = 18, fig.height = 8.5}
+um <- merge(fread(file.path(ct_dir, "atlas_umap.csv.gz")), d[, .(cell, CytoTRACE2_Score, majority_celltype)], by = "cell")
+stopifnot("UMAP and score cells differ" = nrow(um) == nrow(d))
+um <- um[sample(.N)]  # random draw order: no cell type painted over the others
+p_sc <- ggplot(um, aes(UMAP_1, UMAP_2, colour = CytoTRACE2_Score)) +
+  scattermore::geom_scattermore(pointsize = 1.2) +
+  scale_colour_viridis_c(option = "magma", limits = c(0, 1), name = "CytoTRACE2\nscore") +
+  labs(title = "CytoTRACE2 score") + theme_void(base_size = 13) + theme(aspect.ratio = 1)
+lab <- um[, .(UMAP_1 = median(UMAP_1), UMAP_2 = median(UMAP_2)), by = majority_celltype]
+p_ct <- ggplot(um, aes(UMAP_1, UMAP_2, colour = majority_celltype)) +
+  scattermore::geom_scattermore(pointsize = 1.2) +
+  ggrepel::geom_text_repel(data = lab, aes(label = majority_celltype), colour = "black", size = 3.5) +
+  scale_colour_manual(values = majority_celltype_col, guide = "none") +
+  labs(title = "Cell type") + theme_void(base_size = 13) + theme(aspect.ratio = 1)
+p_sc | p_ct
+```
+
+## Malignant cells
+
+```{r malignant, fig.width = 16, fig.height = 6}
+p1 <- box_by(mal_origin[, .(origin, score)], "origin", c("primary", "metastasis"), origin_colors,
+             "Primary vs metastasis", "Mean CytoTRACE2 score, malignant cells",
+             "One point per patient and origin (a patient with both contributes to each).")
+p2 <- box_by(mal_patient[primary_location == "choroid"], "secondary_mutation", c("BAP1", "SF3B1", "EIF1AX"),
+             second_mutations_col, "Secondary mutation, choroidal pUM", "Mean CytoTRACE2 score, malignant cells", cap_pat)
+p3 <- box_by(mal_patient, "primary_location", c("choroid", "iris", "ciliary body"), primary_location_colors,
+             "Intra-ocular location, pUM", "Mean CytoTRACE2 score, malignant cells", cap_pat)
+p1 | p2 | p3
+```
+
+```{r melanocytes, fig.width = 7, fig.height = 6}
+box_by(mel_sample, "healthy_location", c("choroid", "iris", "ciliary body"), primary_location_colors,
+       "Non-malignant melanocytes by location", "Mean CytoTRACE2 score, melanocytes",
+       "One point per patient with at least 20 non-malignant melanocytes (one patient has two normal sites: the first is used). Unadjusted two-sided Wilcoxon.")
+```
+
+## Stemness signature {.tabset}
+
+Pearson correlation between the CytoTRACE2 score and each gene's log-normalised expression (log1p of counts per 10,000), computed within each cell set. Genes expressed in at least 1% of the set's cells. Top = most positively correlated (stemness), Bottom = most negatively correlated (differentiation).
+
+### Top genes
+
+```{r top_genes, fig.width = 16, fig.height = 9}
+bar <- function(s) {
+  x <- rbind(sig[[s]][direction == "Top"][1:25], sig[[s]][direction == "Bottom"][1:25])
+  ggplot(x, aes(correlation, reorder(gene, correlation), fill = direction)) + geom_col() +
+    scale_fill_manual(values = c(Top = "firebrick3", Bottom = "steelblue4")) +
+    labs(title = sprintf("%s (n = %s cells)", sets[[s]], format(set_n[[s]], big.mark = ",")),
+         x = "Pearson r with CytoTRACE2 score", y = NULL) +
+    theme_minimal(base_size = 10) + theme(legend.position = "none")
+}
+wrap_plots(lapply(names(sets), bar), nrow = 1) +
+  plot_annotation(title = "25 most positively and 25 most negatively correlated genes per cell set")
+```
+
+### Malignant vs melanocytes
+
+```{r concordance, fig.width = 9, fig.height = 8}
+cmp <- merge(cors$malignant[, .(gene, r_malignant = correlation)],
+             cors$healthy_melanocyte[, .(gene, r_melanocyte = correlation)], by = "gene")
+top_m <- sig$malignant$gene; top_h <- sig$healthy_melanocyte$gene
+cmp[, class := fcase(gene %in% top_m & gene %in% top_h, "top 50 in both",
+                     gene %in% top_m, "top 50 malignant only",
+                     gene %in% top_h, "top 50 melanocytes only", default = "other")]
+cmp[, class := factor(class, levels = c("other", "top 50 malignant only", "top 50 melanocytes only", "top 50 in both"))]
+setorder(cmp, class)
+r_all <- cor(cmp$r_malignant, cmp$r_melanocyte)
+p <- ggplot(cmp, aes(r_melanocyte, r_malignant, colour = class, text = gene)) +
+  geom_hline(yintercept = 0, colour = "grey70") + geom_vline(xintercept = 0, colour = "grey70") +
+  geom_point(size = 0.8, alpha = 0.7) +
+  scale_colour_manual(values = c(other = "grey80", `top 50 malignant only` = "firebrick3",
+                                 `top 50 melanocytes only` = "steelblue4", `top 50 in both` = "darkorange")) +
+  labs(title = sprintf("Per-gene correlation with CytoTRACE2: malignant cells vs non-malignant melanocytes (r = %.2f across %s genes)",
+                       r_all, format(nrow(cmp), big.mark = ",")),
+       x = "r in non-malignant melanocytes", y = "r in malignant cells", colour = NULL) +
+  theme_minimal(base_size = 11)
+ggplotly(p, tooltip = "text", width = 900, height = 720)
+```
+
+```{r overlap_counts, include = FALSE}
+ov <- sapply(c("Top", "Bottom"), function(dir) length(intersect(sig$malignant[direction == dir, gene],
+                                                                  sig$healthy_melanocyte[direction == dir, gene])))
+```
+
+Of the top `r n_sig` stemness genes, `r ov[["Top"]]` are shared between malignant cells and non-malignant melanocytes; of the top `r n_sig` differentiation genes, `r ov[["Bottom"]]` are shared. Hover a point for the gene name.
+
+### Downloads
+
+```{r downloads, results = "asis", echo = FALSE}
+for (s in names(sets)) {
+  cat(as.character(xfun::embed_file(file.path(ct_dir, sprintf("stemness_signature_%s_top%d.csv", s, n_sig)),
+                                    text = sprintf("Stemness signature, %s (top/bottom %d)", sets[[s]], n_sig))), "\n\n")
+  cat(as.character(xfun::embed_file(file.path(ct_dir, sprintf("gene_cor_%s.csv", s)),
+                                    text = sprintf("All gene correlations, %s", sets[[s]]))), "\n\n")
+}
+```
+
+## Methods and session info
+
+- **CytoTRACE2** 1.1.0, `cytotrace2(species = "human", batch_size = 10000, seed = 14)` on RNA counts, run per library so the KNN smoothing never mixes libraries (`run_cytotrace2_2026b.R`). Scores from the January 2025 object were not reused: counts changed in all 63 libraries.
+- **Cell sets**: malignant = iCNV `Malignant` label shipped in the October object; non-malignant melanocytes = `majority_celltype == "Melanocytes"` in non-malignant samples.
+- **Stemness signature**: Pearson r of CytoTRACE2 score with log1p(CP10k) expression, genes detected in at least 1% of the set; top and bottom `r n_sig` genes. Cell-level correlations, so they describe co-variation across cells, not a patient-level effect.
+- **Statistics**: per-patient or per-sample means, unadjusted two-sided Wilcoxon; groups below 3 not tested.
+
+```{r session}
+sessionInfo()
+```

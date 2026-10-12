@@ -1,0 +1,545 @@
+---
+title: "`r if (params$variant == 'original') 'UM Atlas - Cancer Gene Module Analysis with GeneNMF' else 'UM Atlas - GeneNMF without ribosomal and mitochondrial genes'`"
+params:
+  variant: "original"  # "ribo_mito" = program pool of 17e with ribosomal + mitochondrial genes blocked
+output:
+  html_document:
+    self_contained: true
+    includes:
+      in_header: !expr system.file("templates/fgcz_header.html", package = "ezRun", lib.loc = .libPaths())
+    css: !expr system.file("templates/fgcz.css", package = "ezRun", lib.loc = .libPaths())
+    code_folding: hide
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+# Publication figures: every chunk figure is also written as a vector PDF (and a 300 dpi PNG)
+# to Figures_2026b/GeneNMF/, named after its chunk, for the figure bundle.
+# variant "ribo_mito": the same report on the program pool of 17e_NMF_blocklist_goseq.R (ribosomal + mitochondrial
+# genes blocked from the HVGs); same cells, seed and downsampling, so the blocklist is the only change.
+variant <- params$variant
+stopifnot(variant %in% c("original", "ribo_mito"))
+knitr::opts_chunk$set(dev = c("png", "cairo_pdf"), dpi = 300, fig.path = paste0("../Figures_2026b/",
+                      if (variant == "original") "GeneNMF/" else "GeneNMF_blocklist/"))
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, comment = "",
+                      fig.width = 12, fig.height = 8)
+
+# Bioconductor first, tidyverse last: S4Vectors (via clusterProfiler / org.Hs.eg.db) otherwise masks
+# dplyr::first / filter / rename.
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(ComplexHeatmap)
+library(Seurat)
+library(qs2)
+library(GeneNMF)
+library(bbknnR)
+library(circlize)
+library(viridis)
+library(writexl)
+library(patchwork)
+library(ggsignif)
+library(tidyverse)
+
+# Relative on purpose (knitr runs in the Rmd directory); October 2026 palette.
+source("config_colors_2026b.R")
+
+# Directory for the October 2026 object: every cache below is keyed on the filename only, so the
+# old Outputs/GeneNMF/ would silently reload January results.
+base_dir <- "../Outputs/GeneNMF_2026b/"
+output_dir <- if (variant == "original") base_dir else file.path(base_dir, "blocklist_test_ribo_mito/")
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+sweep_dir <- file.path(output_dir, "nMP_sweep")
+mut_sweep_dir <- file.path(output_dir, "nMP_mutation_sweep")
+
+# The two cuts of the same program pool shown side by side. nMP = 3 is the sweep's choice (only cut
+# where every MP has a positive silhouette); nMP = 6 was asked for at the 2026-10-05 meeting.
+cuts <- c(3L, 6L)
+base_n <- 3L
+
+library(future)
+plan("multicore", workers = 16)
+options(future.globals.maxSize = 50000 * 1024^2)
+theme_set(theme_minimal(base_size = 14))
+```
+
+```{r load_data, include=FALSE}
+# October 2026 reprocessed object. nthreads = 1: multi-threaded qs2 reads of multi-GB objects can deadlock.
+# The report only needs metadata from the 30 GB atlas (malignant cells per sample, origin, location,
+# cell and gene counts), cached once; the atlas itself is read only to (re)build that cache or the
+# NMF program pool. Delete atlas_inputs_for_report.qs2 to rebuild it from the object.
+atlas_file <- "../new_data_2026b/Objects/full Dataset/final_Subtyping_iCNV_reclustered.qs2"
+atlas_inputs_file <- file.path(base_dir, "atlas_inputs_for_report.qs2")
+genenmf_cache_file <- file.path(output_dir, "geneNMF_metaprograms.qs2")
+if (!file.exists(atlas_inputs_file) || !file.exists(genenmf_cache_file)) {
+  um_atlas <- qs2::qs_read(atlas_file, nthreads = 1)
+  stopifnot("not the October 2026 object (expected 63 samples / 349,696 cells)" =
+              length(unique(um_atlas$Sample)) == 63 && ncol(um_atlas) == 349696)
+  stopifnot(!any(c("GANQ", "GNA1Q") %in% um_atlas$primary_mutation))
+  malignant <- subset(um_atlas, subset = majority_celltype == "Melanoma cells")
+  qs2::qs_save(list(n_atlas = ncol(um_atlas), universe = rownames(um_atlas), atlas_mtime = file.mtime(atlas_file),
+                    malignant_meta = malignant@meta.data[, c("orig.ident", "origin", "primary_location")]),
+               atlas_inputs_file, nthreads = 1)
+  rm(um_atlas); invisible(gc())
+}
+atlas_inputs <- qs2::qs_read(atlas_inputs_file, nthreads = 1)
+stopifnot("atlas changed since the report cache was built - delete atlas_inputs_for_report.qs2" =
+            atlas_inputs$atlas_mtime == file.mtime(atlas_file),
+          atlas_inputs$n_atlas == 349696)
+n_atlas <- atlas_inputs$n_atlas
+universe <- atlas_inputs$universe
+malignant_meta <- atlas_inputs$malignant_meta
+
+malig_counts <- table(malignant_meta$orig.ident)
+samples_for_nmf <- names(malig_counts[malig_counts >= 300])  # NMF input
+selected_samples <- names(malig_counts[malig_counts > 500])  # scoring / plotting set
+# Intra-ocular location per NMF sample (tumour location for primaries, "metastasis" otherwise),
+# for the location bar on the program-similarity heatmap.
+nmf_location <- malignant_meta %>% dplyr::filter(orig.ident %in% samples_for_nmf) %>%
+  dplyr::distinct(orig.ident, origin, primary_location) %>%
+  mutate(location = ifelse(origin == "metastasis", "metastasis", as.character(primary_location)))
+stopifnot("an NMF sample with more than one location" = !anyDuplicated(nmf_location$orig.ident),
+          "a primary without a location" = !anyNA(nmf_location$location))
+nmf_location <- setNames(nmf_location$location, nmf_location$orig.ident)
+
+# ---- GeneNMF program pool (multiNMF per sample, cached; written by the first run of this report) ----
+if (file.exists(genenmf_cache_file)) {
+  geneNMP_list <- qs2::qs_read(genenmf_cache_file, nthreads = 1)
+} else {
+  set.seed(42)
+  sampleObj.list <- Seurat::SplitObject(subset(malignant, subset = orig.ident %in% samples_for_nmf), split.by = "orig.ident")
+  sampleObj.list <- lapply(sampleObj.list, function(obj) if (ncol(obj) > 500) subset(obj, cells = sample(colnames(obj), 500)) else obj)
+  programs <- GeneNMF::multiNMF(sampleObj.list, assay = "RNA", k = 4:9, min.exp = 0.05)
+  geneNMP_list <- list(metaprograms = GeneNMF::getMetaPrograms(programs, nMP = 5), programs = programs)
+  qs2::qs_save(geneNMP_list, genenmf_cache_file, nthreads = 1)
+}
+geneNMF_programs <- geneNMP_list$programs
+n_programs_total <- length(geneNMF_programs)
+
+# ---- Malignant subset with the bbknn UMAP (cached by an earlier run) ----
+malignant_sub <- qs2::qs_read(file.path(base_dir, "malignant_sub_with_mp_scores_nMP3.qs2"), nthreads = 1)
+stopifnot("scored object is not the >500-cell sample set" = setequal(unique(malignant_sub$orig.ident), selected_samples),
+          "non-malignant cells in the scored object" = all(malignant_sub$majority_celltype == "Melanoma cells"))
+bbknn_reduction <- "umap"  # RunBBKNN stores its UMAP as "umap"
+
+# ---- MP scores (PLAID) of both cuts, malignant cells + non-malignant melanocytes (17c_MP_followup.R) ----
+scores <- qs2::qs_read(file.path(output_dir, "followup/mp_scores_malignant_and_melanocytes.qs2"), nthreads = 1)
+# healthy melanocytes scored on their own (z over healthy cells only), for the location comparison
+mel_only <- qs2::qs_read(file.path(output_dir, "followup/mp_scores_melanocytes_only.qs2"), nthreads = 1)
+stopifnot("healthy_location missing from the healthy-only scores" = !anyNA(mel_only$healthy_location))
+mal_scores <- scores %>% dplyr::filter(origin != "non-malignant")
+stopifnot("score table and malignant subset hold different cells" = setequal(mal_scores$cell, colnames(malignant_sub)))
+score_cols <- grep("^nMP[0-9]+_MP[0-9]+$", names(scores), value = TRUE)
+idx <- match(colnames(malignant_sub), mal_scores$cell)
+for (cn in score_cols) malignant_sub@meta.data[[cn]] <- mal_scores[[cn]][idx]
+```
+
+```{r derive, include=FALSE}
+# ---- shared helpers ----
+gene_families <- list(
+  ribosomal = function(g) grepl("^RP[SL][0-9]|^RPLP", g),
+  # heat shock + immediate-early genes counted together: they co-occur in the same MPs here
+  `stress / immediate early` = function(g) grepl("^HSP|^DNAJ", g) |
+    g %in% c("BAG3", "CRYAB", "FOS", "FOSB", "FOSL1", "FOSL2", "JUN", "JUNB", "JUND", "EGR1", "EGR2", "EGR3",
+             "IER2", "IER3", "IER5", "ATF3", "ZFP36", "DUSP1", "NR4A1", "NR4A2", "KLF2", "KLF4", "KLF6", "PPP1R15A", "GADD45B"),
+  mitochondrial = function(g) grepl("^MT-", g))
+signif_label <- function(p) sprintf("%s  p %s",
+  as.character(cut(p, c(-Inf, 0.001, 0.01, 0.05, Inf), c("***", "**", "*", "ns"))),
+  ifelse(p < 2.2e-16, "< 2.2e-16", paste("=", formatC(p, digits = 2, format = "g"))))
+jac <- function(a, b) outer(names(a), names(b), Vectorize(function(x, y)
+  length(intersect(a[[x]], b[[y]])) / length(union(a[[x]], b[[y]])))) |> `dimnames<-`(list(names(a), names(b)))
+
+w3 <- readxl::read_excel("../reference/Weizman_3CA_meta_programs_2025-01-29.xlsx", sheet = "Malignant")
+w3 <- lapply(as.list(w3), function(g) unique(na.omit(g)))
+hall <- msigdbr::msigdbr(species = "Homo sapiens", collection = "H") %>% dplyr::select(gs_name, gene_symbol)
+# KEGG from msigdbr (KEGG Legacy, 186 classic pathways): offline, unlike enrichKEGG, which calls the KEGG web API.
+kegg <- msigdbr::msigdbr(species = "Homo sapiens", collection = "C2", subcollection = "CP:KEGG_LEGACY") %>% dplyr::select(gs_name, gene_symbol)
+gw <- GenomicFeatures::genes(EnsDb.Hsapiens.v86::EnsDb.Hsapiens.v86)
+gene_len <- tapply(BiocGenerics::width(gw), gw$gene_name, max) / 1000
+len_all_median <- median(gene_len[intersect(universe, names(gene_len))])
+
+smeta <- data.table::fread("../new_data_2026b/full_meta_full.csv.gz",
+  select = c("orig.ident", "origin", "secondary_mutation", "primary_location")) %>% distinct() %>% as_tibble()
+stopifnot(!anyDuplicated(smeta$orig.ident))
+meta_cols <- c("orig.ident", "origin", "Patient_nr", "primary_mutation", "secondary_mutation", "organ", "Gender", "primary_location")
+
+# ---- everything one cut needs, in one list (the report section is a template over this list) ----
+prep_cut <- function(n) {
+  mp_file <- file.path(output_dir, sprintf("geneNMF_metaprograms_nMP%d.qs2", n))
+  if (!file.exists(mp_file)) qs2::qs_save(GeneNMF::getMetaPrograms(geneNMF_programs, nMP = n), mp_file, nthreads = 1)
+  mp <- qs2::qs_read(mp_file, nthreads = 1)
+  stopifnot(length(mp$metaprograms.genes) == n)
+  short <- names(mp$metaprograms.genes)
+  cols <- paste0("nMP", n, "_", short)
+  genes <- setNames(mp$metaprograms.genes, cols)
+  weights <- setNames(mp$metaprograms.genes.weights[short], cols)
+  short <- setNames(short, cols)
+  metrics <- mp$metaprograms.metrics[unname(short), ]
+  metrics[] <- lapply(metrics, function(x) as.numeric(as.character(x)))
+  rownames(metrics) <- cols
+  stopifnot(!anyNA(metrics), all(cols %in% names(malignant_sub@meta.data)))
+  fam <- sapply(cols, function(mp) { top <- head(genes[[mp]], 20)
+    f <- sapply(gene_families, function(g) mean(g(top))); paste(names(sort(f[f >= 0.25], decreasing = TRUE)), collapse = " + ") })
+  label <- setNames(sprintf("%s (%s%s)", short, ifelse(fam == "", "", paste0(fam, ": ")),
+                            sapply(genes, function(g) paste(head(g, 3), collapse = ", "))), cols)
+
+  # gene-set overlap and score correlation between the MPs of this cut
+  jaccard <- jac(genes, genes)
+  shared <- outer(cols, cols, Vectorize(function(a, b) length(intersect(genes[[a]], genes[[b]])))) |> `dimnames<-`(list(cols, cols))
+  pairs <- which(upper.tri(shared) & shared > 0, arr.ind = TRUE)
+  overlap_txt <- if (!nrow(pairs)) "No two MPs share a gene" else paste("Shared genes:",
+    paste(sprintf("%s-%s %d", short[pairs[, 1]], short[pairs[, 2]], shared[pairs]), collapse = ", "))
+  correlation <- cor(malignant_sub@meta.data[, cols])
+
+  # samples contributing programs (= coverage)
+  comp <- as.data.frame(as.table(as.matrix(mp$metaprograms.composition))) |> setNames(c("MP", "orig.ident", "n_programs"))
+  if (!all(comp$orig.ident %in% smeta$orig.ident)) comp <- setNames(comp, c("orig.ident", "MP", "n_programs"))
+  stopifnot(all(comp$orig.ident %in% smeta$orig.ident))
+  comp <- left_join(comp, smeta, by = "orig.ident") %>%
+    mutate(MP = factor(MP, levels = unname(short)),
+           group = case_when(origin == "metastasis" ~ "metastasis", TRUE ~ paste(primary_location, secondary_mutation, sep = " / ")))
+
+  # Weizmann 3CA: share of each 3CA program's genes found in our MP (Jaccard would cap a 200-gene MP at 0.25)
+  w3_shared <- t(sapply(genes, function(m) sapply(w3, function(g) length(intersect(m, g)))))
+  w3_frac <- sweep(w3_shared, 2, lengths(w3), "/")
+  w3_best <- apply(w3_frac, 2, max)
+  w3_top <- names(sort(w3_best, decreasing = TRUE))[seq_len(min(12, length(w3)))]
+  w3_top <- w3_top[order(apply(w3_frac[, w3_top, drop = FALSE], 2, which.max), -w3_best[w3_top])]
+  w3_txt <- paste(sapply(cols, function(mp) { j <- which.max(w3_frac[mp, ])
+    sprintf("%s: %s (%d of %d genes)", short[[mp]], colnames(w3_frac)[j], w3_shared[mp, j], lengths(w3)[j]) }), collapse = "; ")
+  write_csv(tibble(MP = rep(cols, ncol(w3_frac)), program_3CA = rep(colnames(w3_frac), each = length(cols)),
+                   shared_genes = as.vector(w3_shared), n_3CA = rep(lengths(w3), each = length(cols)),
+                   share_of_3CA = as.vector(w3_frac)), file.path(output_dir, sprintf("genenmf_overlap_weizmann_3CA_nMP%d.csv", n)))
+
+  # GO BP + Hallmark enrichment (cached per cut)
+  enr_file <- file.path(output_dir, sprintf("genenmf_enrichment_nMP%d.qs2", n))
+  if (!file.exists(enr_file)) {
+    enr <- bind_rows(lapply(cols, function(mp) {
+      go <- enrichGO(genes[[mp]], OrgDb = org.Hs.eg.db, keyType = "SYMBOL", ont = "BP", universe = universe, pvalueCutoff = 0.05)
+      hm <- enricher(genes[[mp]], TERM2GENE = hall, universe = universe, pvalueCutoff = 0.05)
+      bind_rows(if (!is.null(go)) mutate(as_tibble(go@result), source = "GO BP"),
+                if (!is.null(hm)) mutate(as_tibble(hm@result), source = "Hallmark")) %>% mutate(MP = mp)
+    }))
+    qs2::qs_save(enr, enr_file, nthreads = 1)
+  }
+  enr <- qs2::qs_read(enr_file, nthreads = 1)
+  kegg_file <- file.path(output_dir, sprintf("genenmf_enrichment_kegg_nMP%d.qs2", n))
+  if (!file.exists(kegg_file)) qs2::qs_save(bind_rows(lapply(cols, function(mp) {
+    kg <- enricher(genes[[mp]], TERM2GENE = kegg, universe = universe, pvalueCutoff = 0.05)
+    if (!is.null(kg)) mutate(as_tibble(kg@result), source = "KEGG", MP = mp)
+  })), kegg_file, nthreads = 1)
+  enr <- bind_rows(enr, qs2::qs_read(kegg_file, nthreads = 1)) %>%
+    mutate(Description = sub("^KEGG_", "", Description))
+  write_csv(enr, file.path(output_dir, sprintf("genenmf_enrichment_nMP%d.csv", n)))
+  n_enr <- enr %>% dplyr::filter(p.adjust < 0.05) %>% dplyr::count(MP)
+  enr_txt <- paste(sapply(cols, function(mp) sprintf("%s %d", short[[mp]], sum(n_enr$n[n_enr$MP == mp]))), collapse = ", ")
+  top_enr <- enr %>% dplyr::filter(p.adjust < 0.05) %>% group_by(MP, source) %>% slice_min(p.adjust, n = 10, with_ties = FALSE) %>% ungroup() %>%
+    mutate(term = str_trunc(Description, 55), ratio = sapply(strsplit(GeneRatio, "/"), function(x) as.numeric(x[1]) / as.numeric(x[2])))
+
+  # genomic span of MP genes vs all genes
+  len_df <- bind_rows(tibble(set = "all genes", gene = universe), imap_dfr(genes, ~ tibble(set = short[[.y]], gene = .x))) %>%
+    mutate(length_kb = gene_len[gene]) %>% dplyr::filter(!is.na(length_kb)) %>%
+    mutate(set = factor(set, levels = c("all genes", unname(short))))
+  len_med <- len_df %>% group_by(set) %>% summarise(m = median(length_kb), .groups = "drop")
+  long_mp <- len_med %>% dplyr::filter(set != "all genes", m > 4 * len_all_median)
+  len_txt <- if (nrow(long_mp)) sprintf("%s %s much longer genes than average (median %s kb against %.0f kb)",
+    paste(long_mp$set, collapse = ", "), if (nrow(long_mp) > 1) "have" else "has",
+    paste(sprintf("%.0f", long_mp$m), collapse = ", "), len_all_median) else
+    sprintf("no MP has unusually long genes (median %.0f kb for all genes)", len_all_median)
+
+  # per-cell, per-sample and per-patient tables (malignant cells)
+  module_data <- malignant_sub@meta.data[, c(meta_cols, cols)]
+  module_means <- module_data %>% group_by(orig.ident) %>%
+    summarise(across(all_of(cols), mean),
+              across(c(origin, primary_mutation, secondary_mutation, organ, Gender, primary_location), ~ as.character(dplyr::first(.x))),
+              n_cells = n(), .groups = "drop")
+  patient_mp <- module_data %>% dplyr::filter(origin == "primary") %>% group_by(Patient_nr) %>%
+    summarise(across(all_of(cols), mean), secondary_mutation = dplyr::first(secondary_mutation),
+              primary_location = dplyr::first(primary_location), n_loc = n_distinct(primary_location), .groups = "drop")
+  stopifnot("a patient has more than one primary location" = all(patient_mp$n_loc == 1))
+  patient_origin <- module_data %>% group_by(Patient_nr, origin) %>% summarise(across(all_of(cols), mean), .groups = "drop") %>%
+    mutate(origin = as.character(origin))
+  stopifnot("a patient has both a primary and a metastasis" = !anyDuplicated(patient_origin$Patient_nr))
+
+  # healthy melanocytes vs malignant cells, one point per sample
+  per_sample <- scores %>% group_by(orig.ident, origin) %>% summarise(across(all_of(cols), mean), n_cells = n(), .groups = "drop") %>%
+    dplyr::filter(n_cells >= 50) %>% mutate(origin = factor(origin, levels = c("non-malignant", "primary", "metastasis")))
+  mel_long <- pivot_longer(per_sample, all_of(cols), names_to = "MP", values_to = "score") %>% mutate(MP = factor(MP, levels = cols))
+  n_by <- table(per_sample$origin)
+  mel_plot <- ggplot(mel_long, aes(origin, score, fill = origin)) +
+    geom_boxplot(outlier.shape = NA, alpha = 0.6) + geom_jitter(width = 0.12, size = 1.4) +
+    geom_signif(comparisons = combn(levels(per_sample$origin), 2, simplify = FALSE), test = "wilcox.test",
+                map_signif_level = signif_label, step_increase = 0.12, textsize = 2.6, tip_length = 0.01) +
+    facet_wrap(~ MP, scales = "free_y", ncol = min(n, 3), labeller = as_labeller(setNames(stringr::str_wrap(label, 30), cols))) +
+    scale_x_discrete(labels = setNames(sprintf("%s\n(n = %d)", names(n_by), as.integer(n_by)), names(n_by))) +
+    scale_y_continuous(expand = expansion(mult = c(0.05, 0.35))) + scale_fill_manual(values = origin_colors) +
+    labs(x = NULL, y = "Mean MP score per sample (z)") + theme_minimal(base_size = 11) + theme(legend.position = "none")
+
+  # healthy melanocytes only, by intra-ocular location, one point per sample (>= 50 cells)
+  loc_lv <- c("choroid", "iris", "ciliary body")
+  mel_loc <- mel_only %>% group_by(orig.ident, Patient_nr, healthy_location) %>%
+    summarise(across(all_of(cols), mean), n_cells = n(), .groups = "drop") %>%
+    dplyr::filter(n_cells >= 50) %>% mutate(healthy_location = factor(healthy_location, levels = loc_lv))
+  mel_loc_dropped <- mel_only %>% dplyr::count(orig.ident) %>% dplyr::filter(n < 50)
+  n_loc <- table(mel_loc$healthy_location)
+  loc_cols <- setNames(healthy_location_colors[paste("non-malignant", loc_lv)], loc_lv)
+  mel_loc_plot <- pivot_longer(mel_loc, all_of(cols), names_to = "MP", values_to = "score") %>% mutate(MP = factor(MP, levels = cols)) %>%
+    ggplot(aes(healthy_location, score, fill = healthy_location)) +
+    geom_boxplot(outlier.shape = NA, alpha = 0.6) + geom_jitter(width = 0.12, size = 1.4) +
+    geom_signif(comparisons = combn(loc_lv, 2, simplify = FALSE), test = "wilcox.test",
+                map_signif_level = signif_label, step_increase = 0.12, textsize = 2.6, tip_length = 0.01) +
+    facet_wrap(~ MP, scales = "free_y", ncol = min(n, 3), labeller = as_labeller(setNames(stringr::str_wrap(label, 30), cols))) +
+    scale_x_discrete(labels = setNames(sprintf("%s\n(n = %d)", names(n_loc), as.integer(n_loc)), names(n_loc))) +
+    scale_y_continuous(expand = expansion(mult = c(0.05, 0.35))) + scale_fill_manual(values = loc_cols) +
+    labs(x = NULL, y = "Mean MP score per sample (z, healthy cells only)") + theme_minimal(base_size = 11) + theme(legend.position = "none")
+  mel_loc_kw <- sapply(cols, function(mp) kruskal.test(mel_loc[[mp]], mel_loc$healthy_location)$p.value)
+  mel_loc_txt <- paste(sprintf("%s p = %s", short[cols], formatC(mel_loc_kw, digits = 2, format = "g")), collapse = ", ")
+
+  # UMAP built on the MP scores of this cut (cached per cut)
+  um_file <- file.path(output_dir, sprintf("umap_on_mp_scores_nMP%d.qs2", n))
+  if (!file.exists(um_file)) {
+    set.seed(42)
+    xy <- uwot::umap(as.matrix(module_data[, cols]), n_neighbors = 30, min_dist = 0.3, n_threads = 16)
+    qs2::qs_save(data.frame(cell = rownames(module_data), UMAP1 = xy[, 1], UMAP2 = xy[, 2]), um_file, nthreads = 1)
+  }
+  um <- qs2::qs_read(um_file, nthreads = 1)
+  stopifnot(all(um$cell == rownames(module_data)))
+  um <- cbind(um, module_data)
+  dp <- function(col, colours, title) {
+    p <- ggplot(um[sample(nrow(um)), ], aes(UMAP1, UMAP2, colour = .data[[col]])) +
+      scattermore::geom_scattermore(pointsize = 1.2) + labs(title = title, colour = NULL) +
+      theme_void(base_size = 11) + theme(aspect.ratio = 1) + guides(colour = guide_legend(override.aes = list(size = 3)))
+    if (!is.null(colours)) p + scale_colour_manual(values = colours) else p
+  }
+  feat <- pivot_longer(um, all_of(cols), names_to = "MP", values_to = "score") %>% mutate(MP = short[MP])
+  p_feat <- ggplot(feat, aes(UMAP1, UMAP2, colour = score)) + scattermore::geom_scattermore(pointsize = 1) +
+    facet_wrap(~ MP, nrow = 2) + scale_colour_viridis_c() + theme_void(base_size = 10) + theme(aspect.ratio = 1)
+  umap_plot <- (dp("origin", origin_colors, "Origin") | dp("secondary_mutation", second_mutations_col, "Secondary mutation") |
+                  dp("primary_location", primary_location_colors, "Intra-ocular location (pUM)")) /
+    (dp("orig.ident", NULL, "Sample") + theme(legend.position = "none") | p_feat)
+
+  excel <- file.path(output_dir, sprintf("GeneNMF_MetaProgram_GeneLists_nMP%d.xlsx", n))
+  writexl::write_xlsx(lapply(setNames(cols, short), function(mp)
+    data.frame(Gene = genes[[mp]], Rank = seq_along(genes[[mp]]), Weight = unname(weights[[mp]][genes[[mp]]]))), excel)
+
+  list(n = n, mp = mp, cols = cols, short = short, genes = genes, weights = weights, metrics = metrics,
+       label = label, facet = setNames(stringr::str_wrap(label, 24), cols), neg = cols[metrics$silhouette < 0],
+       n_nmf_samples = ncol(as.matrix(mp$metaprograms.composition)), comp = comp,
+       jaccard = jaccard, shared = shared, overlap_txt = overlap_txt, correlation = correlation,
+       w3_frac = w3_frac, w3_shared = w3_shared, w3_top = w3_top, w3_txt = w3_txt,
+       top_enr = top_enr, enr_txt = enr_txt, len_df = len_df, len_txt = len_txt,
+       module_data = module_data, module_means = module_means, patient_mp = patient_mp, patient_origin = patient_origin,
+       mel_plot = mel_plot, mel_loc_plot = mel_loc_plot, mel_loc = mel_loc, mel_loc_dropped = mel_loc_dropped,
+       mel_loc_txt = mel_loc_txt, umap_plot = umap_plot, excel = excel)
+}
+S <- setNames(lapply(cuts, prep_cut), as.character(cuts))
+# One expanded copy of the section template per cut, knitted with the chunk option child = (a nested
+# knit_child() inside an asis chunk let the parent chunk capture a duplicate of the pheatmap figure).
+nmp_child <- setNames(lapply(cuts, function(n) {
+  f <- file.path(tempdir(), sprintf("17_nmp_section_nMP%d.Rmd", n))
+  writeLines(knitr::knit_expand("17_nmp_section.Rmd", n = n), f); f
+}), as.character(cuts))
+for (k in names(S)) if (S[[k]]$n != base_n)
+  S[[k]]$vs_base <- jac(S[[k]]$genes, S[[as.character(base_n)]]$genes)
+
+# GeneNMF::plotMetaPrograms with a second column bar: the intra-ocular location of the sample each
+# program comes from. Same similarity matrix, tree, MP gaps and downsampling (1,000 programs) as GeneNMF.
+plot_mp_similarity <- function(mp, cutoff = c(0.1, 1), downsample = 1000) {
+  J <- mp$programs.similarity; tree <- mp$programs.tree; cl <- mp$programs.clusters
+  ord <- labels(as.dendrogram(tree)); show_tree <- TRUE
+  if (length(cl) > downsample) {
+    keep <- GeneNMF:::downsampleMin(cl, size = downsample)
+    ord <- ord[ord %in% keep]; cl <- cl[ord]; J <- J[ord, ord]; show_tree <- FALSE
+  }
+  cl <- setNames(paste0("MP", cl), names(cl))
+  gaps <- which(diff(as.integer(as.factor(cl))) != 0)
+  smp <- sub("\\.k[0-9]+\\.[0-9]+$", "", names(cl))
+  stopifnot("program from a sample without a location" = all(smp %in% names(nmf_location)))
+  loc_lv <- intersect(c("choroid", "iris", "ciliary body", "ciliochoroidal", "metastasis"), unique(nmf_location[smp]))
+  anno_col <- data.frame(Metaprogram = factor(cl, levels = unique(cl[ord])),
+                         Location = factor(nmf_location[smp], levels = loc_lv), row.names = names(cl))
+  anno_row <- anno_col["Metaprogram"]
+  J[J < cutoff[1]] <- cutoff[1]; J[J > cutoff[2]] <- cutoff[2]
+  pheatmap::pheatmap(J, color = viridis(100, option = "H"), cluster_rows = if (show_tree) tree else FALSE,
+    cluster_cols = if (show_tree) tree else FALSE, gaps_row = gaps, gaps_col = gaps,
+    annotation_col = anno_col, annotation_row = anno_row,
+    annotation_colors = list(Location = c(primary_location_colors, metastasis = "grey85")[loc_lv]),
+    annotation_names_row = FALSE, show_rownames = FALSE, show_colnames = FALSE, main = "", silent = TRUE)
+}
+
+# clusterProfiler-style bubble plot of one MP's top terms (GO BP and Hallmark facets).
+enr_plot <- function(s, mp) {
+  d <- s$top_enr %>% dplyr::filter(MP == mp)
+  if (!nrow(d)) return(invisible(NULL))
+  ggplot(d, aes(ratio, reorder(term, ratio), size = Count, colour = p.adjust)) + geom_point() +
+    facet_grid(source ~ ., scales = "free_y", space = "free_y") +
+    scale_colour_viridis_c(trans = "log10", direction = -1) +
+    labs(title = s$label[[mp]], subtitle = "Top 10 terms per source, adjusted p < 0.05", x = "Gene ratio", y = NULL) +
+    theme_bw(base_size = 11) + theme(strip.text.y = element_text(angle = 0), plot.margin = margin(5.5, 20, 5.5, 5.5))
+}
+
+# One boxplot + points per MP, one point per patient; writes the Kruskal-Wallis p-values next to the figures.
+patient_mp_plot <- function(s, df, group, levels, colors, title, stub, note = NULL) {
+  df <- df[df[[group]] %in% levels, , drop = FALSE]
+  df[[group]] <- factor(df[[group]], levels = levels)
+  n_by <- table(df[[group]])
+  testable <- names(n_by)[n_by >= 3]; small <- names(n_by)[n_by < 3]
+  stopifnot("every group has <3 patients" = length(testable) >= 1, "a group has no patients" = all(n_by >= 1))
+  long <- pivot_longer(df, all_of(s$cols), names_to = "MetaProgram", values_to = "Score") %>%
+    mutate(MetaProgram = factor(MetaProgram, levels = s$cols))
+  kw <- if (length(testable) >= 2) long %>% dplyr::filter(.data[[group]] %in% testable) %>% group_by(MetaProgram) %>%
+    summarise(kruskal_p = kruskal.test(Score ~ droplevels(.data[[group]]))$p.value, .groups = "drop") else
+    tibble(MetaProgram = s$cols, kruskal_p = NA_real_)
+  write_tsv(kw, file.path(output_dir, sprintf("genenmf_patient_%s_nMP%d_kruskal.tsv", stub, s$n)))
+  cap <- paste(c(if (length(small)) paste0("Descriptive only, not tested (<3 patients): ", paste(small, collapse = ", "), "."),
+                 note, "Patients are limited to samples with >500 malignant cells."), collapse = " ")
+  ggplot(long, aes(x = .data[[group]], y = Score, fill = .data[[group]])) +
+    geom_boxplot(outlier.shape = NA, alpha = 0.6) + geom_jitter(width = 0.12, size = 1.8, alpha = 0.9) +
+    {if (length(testable) >= 2) geom_signif(comparisons = combn(testable, 2, simplify = FALSE), test = "wilcox.test",
+                                            map_signif_level = signif_label, step_increase = 0.12, tip_length = 0.01, textsize = 2.6)} +
+    facet_wrap(~ MetaProgram, ncol = min(s$n, 3), scales = "free_y", labeller = as_labeller(s$facet)) +
+    scale_x_discrete(labels = setNames(sprintf("%s\n(n = %d)", names(n_by), as.integer(n_by)), names(n_by))) +
+    scale_y_continuous(expand = expansion(mult = c(0.05, 0.35))) + scale_fill_manual(values = colors) +
+    labs(title = title, x = NULL, y = "Mean MP score per patient (z)", caption = paste(strwrap(cap, width = 110), collapse = "\n")) +
+    theme_minimal() + theme(legend.position = "none", axis.text.x = element_text(size = 8), plot.caption = element_text(hjust = 0))
+}
+
+# Cell-level boxplots, one row of MP facets per grouping (descriptive).
+cell_level_plot <- function(s, group, levels, colors, title) {
+  long <- s$module_data %>% dplyr::filter(.data[[group]] %in% levels) %>%
+    mutate(grp = factor(as.character(.data[[group]]), levels = levels)) %>%
+    pivot_longer(all_of(s$cols), names_to = "MetaProgram", values_to = "Score") %>%
+    mutate(MetaProgram = factor(MetaProgram, levels = s$cols))
+  ggplot(long, aes(x = grp, y = Score, fill = grp)) +
+    geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+    geom_signif(comparisons = combn(levels, 2, simplify = FALSE), test = "wilcox.test",
+                map_signif_level = signif_label, step_increase = 0.1, tip_length = 0.01, textsize = 2.4) +
+    facet_wrap(~ MetaProgram, nrow = 1, scales = "free_y", labeller = as_labeller(s$facet)) +
+    scale_fill_manual(values = colors) + scale_y_continuous(expand = expansion(mult = c(0.05, 0.25))) +
+    labs(title = title, x = NULL, y = "MP score per cell (z)") +
+    theme_minimal() + theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+}
+
+sweep_sum <- read_csv(file.path(sweep_dir, "nMP_sweep_summary.csv"), show_col_types = FALSE)
+mut_tests <- read_csv(file.path(mut_sweep_dir, "mutation_tests_all_cuts.csv"), show_col_types = FALSE)
+# PLAID vs UCell was measured on the original MPs (the scorer check); the blocklist variant reuses it.
+agree <- read_csv(file.path(base_dir, "followup/mp_scores_plaid_vs_ucell.csv"), show_col_types = FALSE)
+blocklist <- if (variant == "original") character(0) else readLines(file.path(output_dir, "blocklist.txt"))
+extras_child <- if (variant == "original") character(0) else "17_extras_blocklist.Rmd"
+bt <- "`"  # backticks cannot appear inside inline R, so the Methods strings are built here
+methods_blocklist <- if (variant == "original") "" else sprintf(paste0(
+  "- **Blocklist**: %d genes matching %s^RP[SL][0-9]%s, %s^RPLP%s, %s^MRP[SL][0-9]%s and %s^MT-%s are passed to %smultiNMF(hvg.blocklist = )%s, ",
+  "which removes them before the variable-gene selection (%s17e_NMF_blocklist_goseq.R%s, %sblocklist.txt%s). Sweeps and scores were rerun on this pool ",
+  "(%s17b%s, %s17c%s, %s17d%s with %sGN_DIR%s)."), length(blocklist), bt, bt, bt, bt, bt, bt, bt, bt, bt, bt, bt, bt, bt, bt, bt, bt, bt, bt, bt, bt, bt, bt)
+methods_paths <- paste0(bt, sub(".*/Victoria_UM_Atlas/", "", output_dir), bt, " and ", bt,
+                        sub(".*/Victoria_UM_Atlas/", "", knitr::opts_chunk$get("fig.path")), bt)
+mut_min <- mut_tests %>% group_by(cells) %>% summarise(p = min(kruskal_p), padj = min(padj_BH), n_mp = n(), .groups = "drop")
+```
+
+<style>
+/* Cap figure size so plots do not blow up in a full-screen window (retina + dpi 300 gives ~150 px per inch). */
+.main-container img { max-width: min(100%, 1400px) !important; height: auto !important; display: block; margin: 0 auto; }
+.main-container .html-widget { max-width: 1400px; margin: 0 auto; }
+</style>
+
+GeneNMF runs NMF on the malignant melanoma cells of each sample and groups programs that recur across samples into meta-programs (MPs). The same program pool is shown cut into 3 and into 6 MPs, with the same analyses in each tab.`r if (variant != "original") sprintf(" **This version removes the %d ribosomal and mitochondrial genes before the NMF**; everything else is as in the main GeneNMF report. Extra analyses (uveal melanoma markers, monosomy 3, gene-length-corrected enrichment, and a run that also removes stress genes) are in the last tab, Additional analyses.", length(blocklist)) else ""`
+
+# {.tabset}
+
+## Overview {.tabset}
+
+### Summary
+
+- Input: `r format(sum(malig_counts), big.mark = ",")` malignant cells (of `r format(n_atlas, big.mark = ",")` in the October 2026 atlas). NMF ran on each of the `r length(samples_for_nmf)` samples with at least 300 malignant cells (500 cells per sample, k = 4 to 9), giving `r format(n_programs_total, big.mark = ",")` programs.
+- **How the programs become MPs, and what coverage means.** All programs are clustered by the similarity of their gene weights and the tree is cut into nMP groups; every program lands in exactly one MP. An MP's **coverage** is the share of samples with at least one program in it. There is no expression threshold and no similarity cut-off at any step.
+- MPs are scored per cell with PLAID (mean z-score of the MP genes, spatial-scribe's fast scorer; it agrees with UCell at Spearman r `r sprintf('%.2f-%.2f', min(agree$spearman_patient_means), max(agree$spearman_patient_means))` on patient means and `r sprintf('%.2f-%.2f', min(agree$spearman_cells), max(agree$spearman_cells))` per cell) on the `r length(selected_samples)` samples with more than 500 malignant cells (`r format(ncol(malignant_sub), big.mark = ",")` cells, `r n_distinct(malignant_sub$Patient_nr)` patients). MP names are built in code from the top genes; they are not curated annotations.
+- **nMP = 3** is the only cut where every MP is well separated (positive silhouette). **nMP = 6** has `r length(S[["6"]]$neg)` MPs that are not well separated (negative silhouette: `r paste(S[["6"]]$short[S[["6"]]$neg], collapse = ", ")`); its lowest sample coverage is `r sprintf("%.2f", min(S[["6"]]$metrics$sampleCoverage))`.
+
+### Number of MPs
+
+Choice of the number of MPs: the same pool re-cut at nMP = 3 to 10 (`17b_nMP_sweep.R`).
+
+```{r nmp_sweep_plot, out.width = "100%"}
+knitr::include_graphics(file.path(sweep_dir, "nMP_sweep_elbow.png"), rel_path = FALSE)
+```
+
+### Mutation sweep
+
+Does any number of MPs give a program that differs by secondary mutation? Every MP of every cut (3 to 10), per patient, Kruskal-Wallis: smallest p = `r sprintf("%.2f", mut_min$p[mut_min$cells == "choroidal primaries"])` in choroidal primaries and `r sprintf("%.2f", mut_min$p[mut_min$cells == "all primaries"])` in all primaries (`r mut_min$n_mp[1]` MPs; smallest BH-adjusted p `r sprintf("%.2f", min(mut_min$padj))`).
+
+```{r mutation_sweep_plot, out.width = "100%"}
+knitr::include_graphics(file.path(mut_sweep_dir, "mutation_vs_nMP.png"), rel_path = FALSE)
+```
+
+## nMP = 3 {.tabset}
+
+```{r set_nMP3, include = FALSE}
+s <- S[["3"]]
+```
+
+```{r section_nMP3, child = nmp_child[["3"]]}
+```
+
+## nMP = 6 {.tabset}
+
+```{r set_nMP6, include = FALSE}
+s <- S[["6"]]
+```
+
+```{r section_nMP6, child = nmp_child[["6"]]}
+```
+
+## Data {.tabset}
+
+### Cells and mutations
+
+Malignant cells per sample in the scoring set, and mutation calls per sample.
+
+```{r input_samples, fig.width = 14, fig.height = 14}
+mm <- S[["3"]]$module_means
+p_samples <- ggplot(mm, aes(x = reorder(orig.ident, n_cells), y = n_cells, fill = origin)) +
+  geom_col() + scale_fill_manual(values = origin_colors) + coord_flip() +
+  labs(title = sprintf("Malignant cells per sample (%d samples, %s cells)", nrow(mm), format(sum(mm$n_cells), big.mark = ",")),
+       x = NULL, y = "Malignant cells", fill = "Origin") +
+  theme_minimal() + theme(legend.position = "top", axis.text.y = element_text(size = 8))
+mut_bar <- function(col, title) ggplot(mm, aes(x = .data[[col]], fill = origin)) +
+  geom_bar(position = position_dodge(preserve = "single")) + scale_fill_manual(values = origin_colors) +
+  labs(title = title, x = NULL, y = "Samples", fill = "Origin") +
+  theme_minimal() + theme(legend.position = "top", axis.text.x = element_text(angle = 45, hjust = 1))
+p_samples | (mut_bar("primary_mutation", "Primary mutation") / mut_bar("secondary_mutation", "Secondary mutation"))
+```
+
+### bbknn UMAP
+
+bbknn (batch-corrected) UMAP of the malignant cells by sample and clinical metadata.
+
+```{r bbknn_metadata, fig.width = 16, fig.height = 20}
+# Points rasterised by Seurat (scattermore): small, fast PDF, text stays vector. ggrastr crashed R here
+# (munmap_chunk: invalid pointer, 2026-10-08).
+dp <- function(group, cols, title) DimPlot(malignant_sub, reduction = bbknn_reduction, group.by = group, cols = cols,
+                                           pt.size = 1.5, raster = TRUE, raster.dpi = c(1500, 1500)) + labs(title = title) + theme(aspect.ratio = 1)
+(dp("orig.ident", NULL, "Sample") | dp("origin", origin_colors, "Origin")) /
+  (dp("primary_mutation", primary_mutations_col, "Primary mutation") | dp("secondary_mutation", second_mutations_col, "Secondary mutation")) /
+  (dp("organ", organ_colors, "Organ") | dp("Gender", gender_col, "Gender"))
+```
+
+```{r extras, child = extras_child}
+```
+
+## Methods and session info
+
+- **Object**: October 2026 reprocessed atlas (`final_Subtyping_iCNV_reclustered.qs2`), cells with `majority_celltype == "Melanoma cells"`.
+`r methods_blocklist`
+- **GeneNMF**: `multiNMF(assay = "RNA", k = 4:9, min.exp = 0.05)` on each sample with at least 300 malignant cells, 500 random cells per sample (seed 42); `getMetaPrograms(nMP = 3)` and `getMetaPrograms(nMP = 6)` with package defaults otherwise (cosine similarity on specificity-weighted gene loadings, `ward.D2`), re-cut from the same cached program pool. Sweeps: `17b_nMP_sweep.R` (metrics, nMP = 3 to 10) and `17d_nMP_mutation_sweep.R` (mutation tests, nMP = 3 to 10).
+- **Scores**: PLAID, as in spatial-scribe (`plaid_score.R`): log1p(CP10k) expression, each gene z-scored across the pooled malignant cells (samples with more than 500 malignant cells) and non-malignant melanocytes, score = mean z of the full MP gene set (`17c_MP_followup.R`). Agreement with UCell on the same cells: `followup/mp_scores_plaid_vs_ucell.csv`. For the comparison between healthy locations, the healthy melanocytes are scored again on their own (`followup/mp_scores_melanocytes_only.qs2`).
+- **MP labels**: a gene family (ribosomal `RPS/RPL`; stress / immediate early = `HSP/DNAJ` plus a fixed list such as FOS, JUN, EGR1, IER2, ZFP36, DUSP1; mitochondrial `MT-`) is named when it makes up at least 25% of the MP's top 20 genes; then the top 3 genes.
+- **Weizmann 3CA**: malignant meta-programs from `Weizman_3CA_meta_programs_2025-01-29.xlsx`; overlap = shared genes / 3CA program size.
+- **Enrichment**: `clusterProfiler::enrichGO` (BP), and `enricher` on Hallmark and KEGG Legacy pathways (msigdbr `C2` / `CP:KEGG_LEGACY`, used offline instead of `enrichKEGG`, which queries the KEGG web service), with all genes of the object as universe. **Gene span**: Ensembl v86. **MP-score UMAP**: `uwot::umap` on the MP scores (n_neighbors 30, min_dist 0.3, seed 42). **bbknn**: `bbknnR::RunBBKNN(batch_key = "orig.ident")`.
+- **Statistics**: patient level = mean MP score per patient, two-sided Wilcoxon, unadjusted, groups with fewer than 3 patients not tested; Kruskal-Wallis p-values in `genenmf_patient_*_kruskal.tsv`. Healthy melanocytes: one point per sample. Cell-level tests are descriptive.
+- **Caches, tables and figures**: `r methods_paths` under the analysis directory.
+
+```{r session, results='asis'}
+cat("<details><summary>R session info</summary>\n\n<pre>",
+    paste(htmltools::htmlEscape(capture.output(sessionInfo())), collapse = "\n"),
+    "</pre>\n\n</details>\n")
+```

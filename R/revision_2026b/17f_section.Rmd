@@ -1,0 +1,119 @@
+
+### nMP = {{n}} {.tabset}
+
+#### Programs
+
+```{r topgenes_{{key}}, fig.width = 6 * min(s$n, 3), fig.height = 5 * ceiling(s$n / 3)}
+wrap_plots(lapply(s$ids, function(k) {
+  top_w <- head(sort(s$weights[[k]], decreasing = TRUE), 15)
+  df <- data.frame(Gene = factor(names(top_w), levels = rev(names(top_w))), Weight = as.numeric(top_w))
+  ggplot(df, aes(x = Gene, y = Weight, fill = Weight)) + geom_col() + scale_fill_viridis() + coord_flip() +
+    labs(title = s$label[[k]], subtitle = sprintf("%d genes in MP", length(s$weights[[k]])), x = NULL, y = "Gene weight") +
+    theme_minimal(base_size = 12) + theme(legend.position = "none")
+}), ncol = min(s$n, 3))
+```
+
+The 15 genes with the highest GeneNMF weight in each MP.
+
+```{r download_{{key}}, echo = FALSE, results = "asis"}
+xfun::embed_file(file.path(gn, run_dirs[[s$run]], "GeneNMF_blocklist_GeneLists.xlsx"),
+                 name = sprintf("GeneNMF_%s_GeneLists.xlsx", s$run), text = "Download the full MP gene lists (Excel, nMP = 3 and 6)")
+```
+
+```{r genemap_{{key}}, fig.width = 2 + 2.3 * s$n, fig.height = 11}
+gene_map(s)
+```
+
+Top 30 genes of each MP, coloured by what is known about them. Genes that fit no category are coloured grey when they span more than `r long_kb` kb, white otherwise. Sample coverage: `r paste(sprintf("%s %.2f", s$m$MP, s$m$sampleCoverage), collapse = ", ")`. Silhouette: `r paste(sprintf("%s %.2f", s$m$MP, s$m$silhouette), collapse = ", ")` (negative = the MP is not a clean cluster of per-sample programs). Share of MP genes on chromosome 3: `r paste(sprintf("%s %.0f%%", s$chr3_share$MP, 100 * s$chr3_share$chr3), collapse = ", ")`. This matters for the chr3 tests, because the iCNV chr3 call is itself made from expression.
+
+```{r catshare_{{key}}, fig.width = 10, fig.height = 1.2 + 0.45 * s$n}
+ggplot(s$cat_share %>% mutate(category = factor(category, levels = names(cat_cols)), MP = factor(MP, levels = rev(unname(s$short)))),
+       aes(share, MP, fill = category)) + geom_col(colour = "white") + scale_fill_manual(values = cat_cols, name = NULL) +
+  scale_x_continuous(labels = scales::percent, expand = c(0, 0)) + labs(x = "share of the top 50 genes", y = NULL) +
+  theme(legend.position = "right") + left_room
+```
+
+#### Uveal melanoma markers
+
+```{r refcor_{{key}}, fig.width = 9, fig.height = 1.6 + 0.55 * s$n}
+ggplot(s$cors %>% mutate(MP = factor(s$label[id], levels = rev(s$label))), aes(ref, MP, fill = rho)) + geom_tile(colour = "white") +
+  geom_text(aes(label = sprintf("%.2f%s", rho, ifelse(p < 0.05, "*", ""))), size = 3.3) +
+  scale_fill_gradient2(low = "#2166AC", high = "#B2182B", limits = c(-1, 1), name = "Spearman") +
+  scale_y_discrete(labels = function(x) str_wrap(x, 40)) +
+  labs(x = NULL, y = NULL) + theme(axis.text.x = element_text(angle = 30, hjust = 1), panel.grid = element_blank()) + left_room
+```
+
+Spearman correlation, across the `r nrow(patients)` patient-tumours, between each MP score and the reference scores: HLA class I/II, PRAME, MIF and the melanocytic genes (scored the same way), plus the iCNV chr3-loss and chr8-gain shares. * = unadjusted p < 0.05. Several reference genes can also be MP genes, so a high correlation partly reflects that overlap.
+
+#### Monosomy 3 and BAP1
+
+```{r chr3_{{key}}, fig.width = 4 + 3.5 * min(s$n, 3), fig.height = 5.5 * ceiling(s$n / 3)}
+patient_box(s, pum, "chr3", levels(pum$chr3), chr3_cols, list(c("disomy 3", "monosomy 3")), "Primary tumours, by chr3 status (iCNV)")
+```
+
+```{r mutation_{{key}}, fig.width = 4 + 3.5 * min(s$n, 3), fig.height = 5.5 * ceiling(s$n / 3)}
+patient_box(s, pum, "secondary_mutation", mut_levels, second_mutations_col,
+            list(c("BAP1", "SF3B1"), c("BAP1", "EIF1AX"), c("SF3B1", "EIF1AX")), "Primary tumours, by secondary mutation")
+```
+
+#### Location and origin
+
+```{r location_{{key}}, fig.width = 4 + 3.5 * min(s$n, 3), fig.height = 5.5 * ceiling(s$n / 3)}
+patient_box(s, pum, "primary_location", loc_levels, primary_location_colors,
+            list(c("choroid", "iris"), c("choroid", "ciliary body")), "Primary tumours, by intra-ocular location")
+```
+
+```{r origin_{{key}}, fig.width = 4 + 3.5 * min(s$n, 3), fig.height = 5.5 * ceiling(s$n / 3)}
+patient_box(s, patients, "origin", c("primary", "metastasis"), origin_colors, list(c("primary", "metastasis")), "Primary vs metastasis")
+```
+
+#### Test summary
+
+```{r tests_{{key}}, fig.width = 10, fig.height = 1.8 + 0.55 * s$n}
+ggplot(s$tests %>% mutate(MP = factor(s$label[id], levels = rev(s$label))), aes(test, MP, fill = -log10(p_adj))) + geom_tile(colour = "white") +
+  geom_text(aes(label = fmt_p(p_adj)), size = 3.3) + scale_fill_gradient(low = "white", high = "#B2182B", limits = c(0, 3), oob = scales::squish,
+                                                                         name = "-log10 adj. p") +
+  scale_y_discrete(labels = function(x) str_wrap(x, 40)) + scale_x_discrete(labels = function(x) str_wrap(x, 13)) +
+  labs(x = NULL, y = NULL) + theme(panel.grid = element_blank()) + left_room
+```
+
+BH-adjusted p-values (across the MPs of this cut, within each test), one value per patient.
+
+#### Enrichment
+
+```{r enrichment_{{key}}, fig.width = 11, fig.height = 1.5 + 0.32 * max(4, nrow(s$top_enr)) + 0.55 * length(unique(s$top_enr$MP))}
+# goseq can return adj. p = 0 (score Inf): cap the axis at 1e-30 and say so on the figure
+p_cap <- 30
+if (nrow(s$top_enr)) {
+  d <- s$top_enr %>% transmute(MP, term, `plain ORA` = -log10(padj_ora), `goseq (gene length)` = -log10(padj_goseq)) %>%
+    pivot_longer(-c(MP, term), names_to = "test", values_to = "score") %>%
+    mutate(capped = score > p_cap, score = pmin(score, p_cap),
+           MP = factor(s$label[match(MP, s$short)], levels = s$label), term = reorder(paste(MP, term, sep = "___"), score, max))
+  ggplot(d, aes(score, term)) + geom_line(aes(group = term), colour = "grey70") +
+    geom_point(aes(colour = test, shape = capped), size = 2.5) +
+    geom_vline(xintercept = -log10(0.05), linetype = 2) + scale_y_discrete(labels = function(x) sub(".*___", "", x)) +
+    facet_grid(MP ~ ., scales = "free_y", space = "free_y", switch = "y", labeller = label_wrap_gen(18)) +
+    scale_colour_manual(values = c(`plain ORA` = "grey40", `goseq (gene length)` = "#D55E00"), name = NULL) +
+    scale_shape_manual(values = c(`FALSE` = 16, `TRUE` = 17), breaks = "TRUE", labels = sprintf("adj. p < 1e-%d (capped)", p_cap),
+                       name = NULL) +
+    scale_x_continuous(limits = c(0, p_cap), expand = expansion(mult = c(0.01, 0.03))) +
+    labs(x = "-log10 adj. p", y = NULL) +
+    guides(colour = guide_legend(order = 1), shape = guide_legend(order = 2)) +
+    theme(legend.position = "bottom", legend.box = "vertical", strip.placement = "outside", strip.text.y.left = element_text(angle = 0, hjust = 1, face = "bold"),
+          panel.border = element_rect(fill = NA, colour = "grey85"), panel.spacing = unit(4, "pt"), strip.switch.pad.grid = unit(14, "pt"))
+} else ggplot() + annotate("text", 0, 0, label = "No term reaches adj. p < 0.05 with either test") + theme_void()
+```
+
+Top terms per MP among GO BP, Hallmark and Reactome, shown for both tests. A term that is significant by plain ORA but not by goseq is explained by gene length. Full table: `mp_enrichment_ora_vs_goseq.csv` in the run folder.
+
+#### vs original MPs
+
+```{r jaccard_{{key}}, fig.width = 3 + 1.1 * s$n, fig.height = 1.6 + 0.5 * s$n}
+as.data.frame(as.table(s$jac)) %>% setNames(c("new", "original", "jaccard")) %>%
+  mutate(new = factor(new, levels = rev(rownames(s$jac)))) %>%
+  ggplot(aes(original, new, fill = jaccard)) + geom_tile(colour = "white") + geom_text(aes(label = sprintf("%.2f", jaccard)), size = 3.3) +
+  scale_fill_gradient(low = "white", high = "#2166AC", limits = c(0, 1)) +
+  labs(x = "original MP (report 17, same nMP)", y = "MP after the blocklist") + theme(panel.grid = element_blank())
+```
+
+Jaccard overlap of the gene lists with the MPs of report 17 at the same nMP.

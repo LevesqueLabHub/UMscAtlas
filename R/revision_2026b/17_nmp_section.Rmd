@@ -1,0 +1,243 @@
+### Meta-programs {.tabset}
+
+#### Top genes
+
+```{r top_genes_nMP{{n}}, fig.width = 6 * min(s$n, 3), fig.height = 5 * ceiling(s$n / 3)}
+s <- S[["{{n}}"]]
+plot_list <- lapply(s$cols, function(mp) {
+  top_w <- head(sort(s$weights[[mp]], decreasing = TRUE), 15)
+  df <- data.frame(Gene = factor(names(top_w), levels = rev(names(top_w))), Weight = as.numeric(top_w))
+  ggplot(df, aes(x = Gene, y = Weight, fill = Weight)) +
+    geom_col() + scale_fill_viridis() + coord_flip() +
+    labs(title = s$facet[[mp]], subtitle = sprintf("%d genes in MP", length(s$genes[[mp]])), x = NULL, y = "Gene weight") +
+    theme_minimal(base_size = 12) + theme(legend.position = "none")
+})
+wrap_plots(plot_list, ncol = min(s$n, 3))
+```
+
+The 15 genes with the highest GeneNMF weight in each MP.
+
+```{r download_nMP{{n}}, echo = FALSE}
+xfun::embed_file(s$excel, name = basename(s$excel), text = "Download the MP gene lists with rank and weight (Excel)")
+```
+
+#### Metrics
+
+**sampleCoverage** = share of the `r s$n_nmf_samples` NMF samples with at least one of their own NMF programs in the MP (no expression threshold). **silhouette** = how well the MP's programs separate from the other MPs (negative = not separated). `r if (length(s$neg)) paste0("Silhouette is negative for ", paste(s$short[s$neg], collapse = ", "), ".") else "Every MP has a positive silhouette."`
+
+```{r metrics_nMP{{n}}, fig.width = 16, fig.height = 4.5}
+s$metrics %>%
+  rownames_to_column("MetaProgram") %>%
+  mutate(MetaProgram = factor(s$short[MetaProgram], levels = s$short)) %>%
+  pivot_longer(c(sampleCoverage, silhouette, meanSimilarity, numberGenes, numberPrograms), names_to = "Metric", values_to = "Value") %>%
+  mutate(Metric = factor(Metric, levels = c("sampleCoverage", "silhouette", "meanSimilarity", "numberGenes", "numberPrograms"))) %>%
+  ggplot(aes(x = MetaProgram, y = Value, fill = MetaProgram)) +
+  geom_col() +
+  geom_text(aes(label = ifelse(Value %% 1 == 0, as.character(Value), sprintf("%.2f", Value)),
+                vjust = ifelse(Value < 0, 1.3, -0.3)), size = 3.2) +
+  geom_hline(yintercept = 0, colour = "grey40") +
+  facet_wrap(~ Metric, scales = "free_y", ncol = 5) +
+  scale_fill_viridis(discrete = TRUE) +
+  scale_y_continuous(expand = expansion(mult = c(0.12, 0.15))) +
+  labs(x = NULL, y = NULL) + theme_minimal() + theme(legend.position = "none")
+```
+
+#### Contributing samples
+
+Samples contributing at least one NMF program to each MP (this is what coverage counts).
+
+```{r contributing_nMP{{n}}, fig.width = 3 + 0.6 * s$n, fig.height = 11}
+ggplot(s$comp, aes(MP, orig.ident, fill = n_programs > 0)) + geom_tile(colour = "white") +
+  facet_grid(group ~ ., scales = "free_y", space = "free_y", switch = "y") +
+  scale_fill_manual(values = c(`TRUE` = "darkred", `FALSE` = "grey92"), labels = c(`FALSE` = "no", `TRUE` = "yes"), name = "contributes") +
+  labs(x = NULL, y = NULL) +
+  theme_minimal(base_size = 9) +
+  theme(strip.text.y.left = element_text(angle = 0), strip.placement = "outside", plot.margin = margin(5.5, 5.5, 5.5, 20))
+```
+
+#### Program similarity
+
+Bars on top: MP and the intra-ocular location of the sample each program comes from (grey = metastasis). Pairwise similarity of the `r format(nrow(s$mp$programs.similarity), big.mark = ",")` per-sample NMF programs, with their MP assignment (GeneNMF `plotMetaPrograms`).
+
+```{r similarity_nMP{{n}}, fig.width = 12, fig.height = 10}
+print(plot_mp_similarity(s$mp))
+```
+
+### Overlaps {.tabset}
+
+#### Between MPs
+
+Gene-set overlap between the MPs (Jaccard, shared genes in brackets) next to the correlation of their scores across cells. `r s$overlap_txt`.
+
+```{r mp_overlap_nMP{{n}}, fig.width = 8 + 1.2 * s$n, fig.height = 2.5 + 0.8 * s$n}
+h_jac <- Heatmap(s$jaccard, name = "Jaccard", col = colorRamp2(c(0, 0.5, 1), c("white", "#F4A582", "#B2182B")),
+                 cluster_rows = FALSE, cluster_columns = FALSE,
+                 row_labels = s$label[rownames(s$jaccard)], row_names_side = "left",
+                 row_names_max_width = max_text_width(s$label, gp = gpar(fontsize = 9)),
+                 row_names_gp = gpar(fontsize = 9), column_labels = s$short[colnames(s$jaccard)],
+                 column_names_gp = gpar(fontsize = 10), column_names_rot = 0, column_names_centered = TRUE,
+                 cell_fun = function(j, i, x, y, w, h, fill)
+                   grid.text(sprintf("%.2f\n(%d)", s$jaccard[i, j], s$shared[i, j]), x, y, gp = gpar(fontsize = 8)),
+                 column_title = "Gene-set overlap: Jaccard (shared genes)")
+h_cor <- Heatmap(s$correlation, name = "Pearson r", col = colorRamp2(c(-1, 0, 1), c("blue", "white", "red")),
+                 cluster_rows = FALSE, cluster_columns = FALSE, show_row_names = FALSE,
+                 column_labels = s$short[colnames(s$correlation)],
+                 column_names_gp = gpar(fontsize = 10), column_names_rot = 0, column_names_centered = TRUE,
+                 cell_fun = function(j, i, x, y, w, h, fill)
+                   grid.text(sprintf("%.2f", s$correlation[i, j]), x, y, gp = gpar(fontsize = 8)),
+                 column_title = "MP score correlation across cells")
+draw(h_jac + h_cor, ht_gap = unit(2, "cm"), padding = unit(c(5, 5, 5, 15), "mm"))
+```
+
+{{if (n != base_n) "#### vs nMP = 3\n\nWhere each MP of this cut comes from in the nMP = 3 cut (Jaccard of the gene sets)." else ""}}
+
+```{r vs_base_nMP{{n}}, fig.width = 9, fig.height = 2.5 + 0.5 * s$n, eval = s$n != base_n}
+Heatmap(s$vs_base, name = "Jaccard", col = colorRamp2(c(0, 1), c("white", "darkred")),
+        cluster_rows = FALSE, cluster_columns = FALSE,
+        row_labels = s$label[rownames(s$vs_base)], row_names_side = "left",
+        row_names_max_width = max_text_width(s$label, gp = gpar(fontsize = 9)), row_names_gp = gpar(fontsize = 9),
+        column_labels = paste("nMP = 3", S[[as.character(base_n)]]$short[colnames(s$vs_base)]), column_names_rot = 0,
+        column_names_centered = TRUE,
+        cell_fun = function(j, i, x, y, w, h, fill) grid.text(sprintf("%.2f", s$vs_base[i, j]), x, y, gp = gpar(fontsize = 9))) |>
+  draw(padding = unit(c(5, 5, 5, 10), "mm"))
+```
+
+#### Weizmann 3CA
+
+Overlap with the Weizmann 3CA malignant meta-programs (`r length(w3)` programs of about 50 genes): colour = share of the 3CA program's genes found in our MP, number = shared genes; the `r length(s$w3_top)` 3CA programs with the largest overlap, ordered by the MP they match best. Best match per MP: `r s$w3_txt`.
+
+```{r weizmann_3ca_nMP{{n}}, fig.width = 12, fig.height = 2.5 + 0.6 * s$n}
+Heatmap(s$w3_frac[, s$w3_top, drop = FALSE], name = "share of\n3CA genes",
+        col = colorRamp2(c(0, max(s$w3_frac[, s$w3_top])), c("white", "#B2182B")),
+        cluster_rows = FALSE, cluster_columns = FALSE,
+        row_labels = s$label[s$cols], row_names_side = "left", row_names_gp = gpar(fontsize = 10),
+        row_names_max_width = max_text_width(s$label[s$cols], gp = gpar(fontsize = 10)),
+        column_names_gp = gpar(fontsize = 9), column_names_rot = 45,
+        cell_fun = function(j, i, x, y, w, h, fill)
+          grid.text(s$w3_shared[s$cols[i], s$w3_top[j]], x, y, gp = gpar(fontsize = 9))) |>
+  draw(padding = unit(c(5, 5, 5, 10), "mm"))
+```
+
+### Enrichment {.tabset}
+
+clusterProfiler over-representation of each MP's genes (GO BP with `enrichGO`; Hallmark and KEGG with `enricher`; universe = all genes in the object). Significant terms (adjusted p < 0.05): `r s$enr_txt`.
+
+{{paste(sprintf("#### MP%1$d\n\n```{r enrichment_nMP%2$d_MP%1$d, fig.width = 9, fig.height = 2.6 + 0.3 * max(1, sum(s$top_enr$MP == s$cols[%1$d]))}\nif (!sum(s$top_enr$MP == s$cols[%1$d])) cat('No term with adjusted p < 0.05.') else enr_plot(s, s$cols[%1$d])\n```\n", seq_len(n), n), collapse = "\n")}}
+
+### Gene length
+
+Very long genes collect many intronic reads, so a long-gene MP can reflect nuclear or pre-mRNA content rather than a biological state; `r s$len_txt`.
+
+```{r gene_length_nMP{{n}}, fig.width = 4 + 0.8 * s$n, fig.height = 5}
+ggplot(s$len_df, aes(set, length_kb)) + geom_boxplot(outlier.size = 0.3, fill = "grey85") +
+  geom_hline(yintercept = len_all_median, linetype = "dashed", colour = "darkred") + scale_y_log10() +
+  stat_summary(fun = median, geom = "text", aes(label = sprintf("%.0f", after_stat(y))), vjust = -0.6, size = 3) +
+  labs(title = "Genomic span of MP genes (Ensembl v86)", subtitle = "Dashed line = median of all genes; numbers = median kb",
+       x = NULL, y = "Gene span (kb, log scale)") +
+  theme_minimal(base_size = 11) + theme(axis.text.x = element_text(angle = 45, hjust = 1), plot.margin = margin(5.5, 20, 5.5, 20))
+```
+
+### Requested groupings {.tabset}
+
+One point per patient (mean MP score over that patient's malignant cells), so n on the axis is patients. Brackets: unadjusted two-sided Wilcoxon, descriptive with this few patients; groups with fewer than 3 patients are drawn but not tested. The non-malignant groupings do not apply because NMF uses malignant cells only.
+
+#### Mutation, all pUM
+
+```{r patient_secondary_all_nMP{{n}}, fig.width = 4 + 3.5 * min(s$n, 3), fig.height = 6 * ceiling(s$n / 3)}
+patient_mp_plot(s, s$patient_mp, "secondary_mutation", c("BAP1", "SF3B1", "EIF1AX"), second_mutations_col,
+                "Secondary mutation, all primary tumours", "secondary_all_pUM")
+```
+
+#### Mutation, choroidal pUM
+
+```{r patient_secondary_choroid_nMP{{n}}, fig.width = 4 + 3.5 * min(s$n, 3), fig.height = 6 * ceiling(s$n / 3)}
+patient_mp_plot(s, s$patient_mp %>% filter(primary_location == "choroid"), "secondary_mutation",
+                c("BAP1", "SF3B1", "EIF1AX"), second_mutations_col,
+                "Secondary mutation, choroidal primary tumours", "secondary_choroid_pUM")
+```
+
+#### Location
+
+```{r patient_location_nMP{{n}}, fig.width = 4 + 3.5 * min(s$n, 3), fig.height = 6 * ceiling(s$n / 3)}
+patient_mp_plot(s, s$patient_mp, "primary_location", c("choroid", "iris", "ciliary body"), primary_location_colors,
+                "Intra-ocular location, primary tumours", "location_pUM")
+```
+
+#### Origin
+
+```{r patient_origin_nMP{{n}}, fig.width = 4 + 3.5 * min(s$n, 3), fig.height = 6 * ceiling(s$n / 3)}
+patient_mp_plot(s, s$patient_origin, "origin", c("primary", "metastasis"), origin_colors,
+                "Origin: primary vs metastasis", "origin",
+                note = "No patient has both a primary and a metastasis, so the two groups are independent.")
+```
+
+#### Per sample
+
+Mean score per sample, scaled across MPs, with the sample annotations.
+
+```{r sample_heatmap_nMP{{n}}, fig.width = 8 + 0.8 * s$n, fig.height = 12}
+mat <- s$module_means %>% select(orig.ident, all_of(s$cols)) %>% column_to_rownames("orig.ident") %>% as.matrix()
+loc <- ifelse(s$module_means$origin == "metastasis", "metastasis", s$module_means$primary_location)
+row_anno <- rowAnnotation(
+  Origin = s$module_means$origin, `Intra-ocular location` = loc, `Primary mutation` = s$module_means$primary_mutation,
+  `Secondary mutation` = s$module_means$secondary_mutation, Organ = s$module_means$organ, Gender = s$module_means$Gender,
+  col = list(Origin = origin_colors, `Intra-ocular location` = c(primary_location_colors, metastasis = "grey80"),
+             `Primary mutation` = primary_mutations_col,
+             `Secondary mutation` = second_mutations_col, Organ = organ_colors, Gender = gender_col))
+Heatmap(t(scale(t(mat))), name = "Z-score", col = viridis(100), column_labels = s$short[colnames(mat)],
+        column_names_rot = 0, column_names_centered = TRUE, row_names_gp = gpar(fontsize = 7),
+        left_annotation = row_anno, column_title = "Mean MP score per sample, scaled across MPs", row_title = "Sample") |>
+  draw(padding = unit(c(10, 5, 5, 25), "mm"))
+```
+
+### Healthy melanocytes {.tabset}
+
+#### vs tumours
+
+Melanocytes of non-malignant eye samples scored on the same MP gene sets, next to the malignant cells of primaries and metastases. One point per sample with at least 50 cells; unadjusted two-sided Wilcoxon. A tumour and its adjacent normal share a patient (8 pairs), so the groups are not fully independent.
+
+```{r melanocytes_nMP{{n}}, fig.width = 4 + 3.5 * min(s$n, 3), fig.height = 6 * ceiling(s$n / 3)}
+s$mel_plot
+```
+
+#### Healthy, by location
+
+Healthy melanocytes only, scored on their own (z-scores over the healthy cells, so the tumours do not set the scale), one point per non-malignant sample with at least 50 melanocytes (`r nrow(s$mel_loc)` samples; `r if (nrow(s$mel_loc_dropped)) paste(sprintf("%s with %d", s$mel_loc_dropped$orig.ident, s$mel_loc_dropped$n), collapse = ", ") else "none"` left out). Brackets: unadjusted two-sided Wilcoxon; Kruskal-Wallis across the three locations: `r s$mel_loc_txt`. Location and batch overlap: 3 of the 4 iris and all 3 ciliary-body samples are Batch05, against 2 of the 8 choroid samples, so a location difference here can also be a batch difference.
+
+```{r melanocytes_location_nMP{{n}}, fig.width = 4 + 3.5 * min(s$n, 3), fig.height = 6 * ceiling(s$n / 3)}
+s$mel_loc_plot
+```
+
+### UMAPs {.tabset}
+
+#### bbknn UMAP
+
+MP scores on the bbknn (batch-corrected) UMAP of the malignant cells.
+
+```{r umap_bbknn_nMP{{n}}, fig.width = 6 * min(s$n, 3), fig.height = 5.5 * ceiling(s$n / 3)}
+wrap_plots(lapply(s$cols, function(mp)
+  FeaturePlot(malignant_sub, features = mp, reduction = bbknn_reduction, pt.size = 1.5, order = TRUE, raster = TRUE, raster.dpi = c(1500, 1500)) +
+    scale_color_viridis_c(option = "D") + labs(title = stringr::str_wrap(s$label[[mp]], 32)) +
+    theme(aspect.ratio = 1, plot.title = element_text(size = 11))), ncol = min(s$n, 3))
+```
+
+#### UMAP on MP scores
+
+UMAP built on the `r s$n` MP scores themselves (`uwot`, n_neighbors 30), coloured by sample annotation and by each MP.
+
+```{r umap_scores_nMP{{n}}, fig.width = 20, fig.height = 12}
+s$umap_plot
+```
+
+### Cell level
+
+One box per group over all malignant cells. **Cells are not independent replicates**, so these Wilcoxon p-values overstate the evidence and are for orientation only; use Requested groupings for comparisons.
+
+```{r cell_level_nMP{{n}}, fig.width = 4 + 3.5 * s$n, fig.height = 22}
+prim_lv <- intersect(c("GNAQ", "GNA11", "PLCB4", "CYSLTR2"), unique(s$module_data$primary_mutation))
+organ_lv <- intersect(names(organ_colors), unique(s$module_data$organ))
+(cell_level_plot(s, "origin", c("primary", "metastasis"), origin_colors, "Origin") /
+  cell_level_plot(s, "primary_mutation", prim_lv, primary_mutations_col, "Primary mutation (unknown / none excluded)") /
+  cell_level_plot(s, "organ", organ_lv, organ_colors, "Organ") /
+  cell_level_plot(s, "Gender", c("M", "F"), gender_col, "Gender"))
+```

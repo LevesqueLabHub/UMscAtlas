@@ -1,0 +1,122 @@
+---
+title: "UM Atlas - Paired sccomp: combined T/NK subtypes (lineage and state)"
+output:
+  html_document:
+    self_contained: true
+    includes:
+      in_header: !expr system.file("templates/fgcz_header.html", package = "ezRun", lib.loc = .libPaths())
+    css: !expr system.file("templates/fgcz.css", package = "ezRun", lib.loc = .libPaths())
+    code_folding: hide
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+# Publication figures: every chunk figure is also written as PDF + 300 dpi PNG to Figures_2026b/sccomp_paired_TNK_groups/.
+knitr::opts_chunk$set(dev = c("png", "cairo_pdf"), dpi = 300,
+                      fig.path = "../Figures_2026b/sccomp_paired_TNK_groups/",
+                      echo = TRUE, message = FALSE, warning = FALSE, comment = "", fig.width = 10, fig.height = 5)
+library(data.table)
+library(tidyverse)
+source("config_colors_2026b.R")
+# Fits come from 04d_sccomp_paired_TNK_groups.R (counts from 04c's tnk_subtype_shares.csv).
+OUT <- "../Outputs/sccomp_paired_TNK_2026b"
+res <- fread(file.path(OUT, "tnk_groups_paired.csv"))
+shares <- fread(file.path(OUT, "tnk_groups_shares.csv"))
+sub14 <- fread(file.path(OUT, "tnk_subtypes_paired.csv"))[model == "hmc, paired"]
+n_pairs <- uniqueN(shares$Patient_nr)
+floor_p <- 2 / 2^n_pairs
+stopifnot(n_pairs == 7, nrow(res) == 12, all(c("lineage", "state") %in% res$grouping))
+
+stars <- function(p) cut(p, c(-Inf, 0.001, 0.01, 0.05, Inf), c("***", "**", "*", "ns"))
+fmt_p <- function(p) ifelse(p < 0.001, formatC(p, format = "e", digits = 1), sprintf("%.3f", p))
+line_txt <- function(d) paste(sprintf("%s (%s in the tumour, sccomp p %s, Wilcoxon p %s, up in %d of %d pairs)", d$cell_group,
+  ifelse(d$c_effect > 0, "up", "down"), fmt_p(d$c_pH0), fmt_p(d$wilcox_p), d$n_up, d$n_pairs), collapse = "; ")
+hit <- function(g) { d <- res[grouping == g & c_pH0 < 0.05][order(c_pH0)]; if (nrow(d)) line_txt(d) else "none" }
+best14 <- sub14[order(c_pH0)][1]
+
+forest <- function(g, title) {
+  d <- res[grouping == g] |> mutate(cell_group = fct_reorder(cell_group, c_effect), lab = sprintf("%s  p = %s", stars(c_pH0), fmt_p(c_pH0)))
+  ggplot(d, aes(c_effect, cell_group)) +
+    geom_vline(xintercept = 0, colour = "grey50") +
+    geom_errorbarh(aes(xmin = c_lower, xmax = c_upper), height = 0.2) +
+    geom_point(aes(colour = c_effect > 0), size = 3) +
+    geom_text(aes(x = max(c_upper) + 0.2, label = lab), hjust = 0, size = 3.3) +
+    scale_colour_manual(values = c(`TRUE` = unname(origin_colors["primary"]), `FALSE` = unname(origin_colors["non-malignant"])),
+                        labels = c(`TRUE` = "higher in tumour", `FALSE` = "higher in normal"), name = NULL) +
+    coord_cartesian(xlim = c(min(d$c_lower), max(d$c_upper) + 2), clip = "off") +
+    labs(x = "Primary vs non-malignant (log-odds, 95% credible interval)", y = NULL, title = title) +
+    theme_bw(base_size = 11) + theme(legend.position = "bottom", plot.margin = margin(5.5, 20, 5.5, 5.5))
+}
+per_patient <- function(g) {
+  labs_dt <- res[grouping == g][order(c_pH0), .(grp = cell_group, lab = sprintf("%s\nsccomp p = %s, Wilcoxon p = %s", cell_group, fmt_p(c_pH0), fmt_p(wilcox_p)))]
+  merge(shares[grouping == g], labs_dt, by = "grp") |>
+    mutate(origin = factor(origin, levels = c("non-malignant", "primary")), lab = factor(lab, levels = labs_dt$lab)) |>
+    ggplot(aes(origin, share)) +
+    geom_line(aes(group = Patient_nr), colour = "grey65") +
+    geom_point(aes(colour = origin), size = 2) +
+    facet_wrap(~ lab, scales = "free_y", ncol = 4) +
+    scale_colour_manual(values = origin_colors, guide = "none") +
+    scale_y_continuous(labels = scales::percent) +
+    labs(x = NULL, y = "Share of T/NK cells") +
+    theme_bw(base_size = 10) + theme(strip.text = element_text(size = 9))
+}
+```
+
+<style>
+.main-container img { max-width: min(100%, 1400px) !important; height: auto !important; display: block; margin: 0 auto; }
+.main-container .html-widget { max-width: 1400px; margin: 0 auto; }
+</style>
+
+Follow-up to the paired T/NK subtype report (04c): do the changes between normal eye tissue and the primary tumour of the same patient become clearer when the 14 subtypes are combined into lineage or state groups?
+
+# {.tabset}
+
+## Overview
+
+- **Same fit as 04c, fewer groups.** The 14 T/NK subtypes are summed per sample into 5 lineage groups and 7 state groups, then refitted with sccomp `~ origin + (1 | Patient_nr)`, full MCMC, on the same `r n_pairs` tumour-normal pairs.
+- **Lineage** (CD4, CD8, NK, MAIT + gdT, proliferating T), p < 0.05: `r hit("lineage")`.
+- **State** (naive, memory/effector, exhausted, Treg, MAIT + gdT, NK, proliferating T), p < 0.05: `r hit("state")`.
+- **For comparison**, the best of the 14 subtypes in 04c was `r best14$cell_group` (sccomp p `r fmt_p(best14$c_pH0)`, FDR `r fmt_p(best14$c_FDR)`).
+- **Limits.** The groupings were defined on biology but chosen after the 14-subtype result was known, so the p-values below are not a clean confirmation. Two groupings were tried (12 groups in total); sccomp's FDR is within a grouping only. Exhausted T cells are near zero in every normal sample, and one tumour (about 35% of its T/NK cells) carries much of the effect. With `r n_pairs` pairs the paired Wilcoxon cannot go below p = `r sprintf("%.4f", floor_p)`, and a Wilcoxon p at that value means every pair moved the same way, not a large effect.
+
+## Lineage {.tabset}
+
+CD4 = CD4_N, CD4_EM, CD4_REG, CD4_EX. CD8 = CD8_N, CD8_EM, CD8_EMRA, CD8_RM, CD8_EX. NK = NK_REST, NK_CYTO. Shares are of all T/NK cells, so the groups sum to 100% and a gain in one is partly a loss in another.
+
+### Paired change
+
+```{r lineage_forest, fig.width = 10, fig.height = 1.5 + 0.5 * 5}
+forest("lineage", sprintf("T/NK lineage groups, %d tumour-normal pairs (sccomp, paired)", n_pairs))
+```
+
+### Per patient
+
+Lines join the two samples of a patient.
+
+```{r lineage_per_patient, fig.width = 13, fig.height = 3.2 * 2}
+per_patient("lineage")
+```
+
+## State {.tabset}
+
+Naive = CD4_N, CD8_N. Memory/effector = CD4_EM, CD8_EM, CD8_EMRA, CD8_RM. Exhausted = CD4_EX, CD8_EX. Treg = CD4_REG. MAIT + gdT, NK and proliferating T as in the lineage grouping.
+
+### Paired change
+
+```{r state_forest, fig.width = 10, fig.height = 1.5 + 0.5 * 7}
+forest("state", sprintf("T/NK state groups, %d tumour-normal pairs (sccomp, paired)", n_pairs))
+```
+
+### Per patient
+
+```{r state_per_patient, fig.width = 13, fig.height = 3.2 * 2}
+per_patient("state")
+```
+
+## Methods
+
+- **Data**: per-sample T/NK cell counts of the 14 `SubTyping` levels from 04c (`tnk_subtype_shares.csv`): the October 2026 TME object, `r n_pairs` patients with a non-malignant and a primary sample and at least 30 T/NK cells in each. Summing must keep every cell; the script stops otherwise.
+- **Model**: `sccomp_estimate(~ origin + (1 | Patient_nr))`, `inference_method = "hmc"`, `bimodal_mean_variability_association = TRUE`, then `sccomp_remove_outliers` and `sccomp_test`, seed 20261005, as in 04c. p = sccomp `c_pH0`; FDR = `c_FDR` within one grouping.
+- **Cross-check**: exact two-sided paired Wilcoxon on each group's share of T/NK cells, unadjusted.
+- sccomp `r packageVersion("sccomp")`. Script `04d_sccomp_paired_TNK_groups.R`; tables `tnk_groups_paired.csv` and `tnk_groups_shares.csv` in `Outputs/sccomp_paired_TNK_2026b/`.
