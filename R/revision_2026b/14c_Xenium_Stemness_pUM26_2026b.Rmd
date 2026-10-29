@@ -1,0 +1,267 @@
+---
+title: "UM Atlas - pUM26 Xenium: spatial stemness with the October 2026 signature"
+output:
+  html_document:
+    self_contained: true
+    includes:
+      in_header: !expr system.file("templates/fgcz_header.html", package = "ezRun", lib.loc = .libPaths())
+    css: !expr system.file("templates/fgcz.css", package = "ezRun", lib.loc = .libPaths())
+    code_folding: hide
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+fig_dir <- "../Figures_2026b/Xenium_Stemness_pUM26"
+dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, comment = "", dpi = 300,
+                      dev = c("png", "cairo_pdf"), fig.path = paste0(fig_dir, "/"))
+suppressPackageStartupMessages({ library(data.table); library(qs2); library(ggplot2); library(patchwork) })
+src_dir <- dirname(knitr::current_input(dir = TRUE))
+source(file.path(src_dir, "config_colors_2026b.R"))
+source(file.path(src_dir, "14b_stemness_common.R"))   # rho(), spatial_3panel(), hex_by_sample(), lolli()
+
+# Per-cell scores, refined RCTD labels, iCNV and coordinates, from 14c_score_xenium_pum26_2026b.R
+L <- qs_read("../Outputs/Xenium_Stemness_pUM26_2026b/pum26_scores_2026b.qs2", nthreads = 1)
+d <- L$cells
+sets <- L$sets; n_top <- lengths(sets)
+lab_top <- "Stemness: October panel-matched Top (50 genes)"   # PRIMARY score, see 14b_stemness_common.R
+
+# Coarse classes: coarsen() of Xenium_pUM26/SPLIT_Reannotation/21_immune_icnv_report.Rmd, applied to the
+# canonical refined_immune_type label, onto the atlas majority_celltype names.
+coarsen <- function(x) {
+  x <- as.character(x); x[is.na(x)] <- "Unknown"
+  dplyr::case_when(
+    grepl("Malignant|Melanoma|Cancer", x, ignore.case = TRUE)                 ~ "Melanoma cells",
+    grepl("Melanocyt|pigmented epithelial", x, ignore.case = TRUE)            ~ "Melanocytes",
+    grepl("CD4|CD8|T_NK|T cell|Treg|MAIT|gdT|T_cytotoxic|T_naive|T_exhausted|T_helper|natural killer|NK_CYTO|NK_REST|NK cell|\\bNK\\b", x, ignore.case = TRUE) ~ "T/NK cells",
+    grepl("B cell|B_cell|Plasma", x, ignore.case = TRUE)                      ~ "B/Plasma cells",
+    grepl("Macrophage|TAM|Myeloid|Monocyte|Mono-derived|\\bDC\\b|cDC|pDC|dendritic|microglia|Basophil|Neutrophil|Mast|Kupffer|ISG expressing immune", x, ignore.case = TRUE) ~ "Myeloid cells",
+    grepl("Endothel|\\bLEC\\b|\\bVEC\\b", x, ignore.case = TRUE)              ~ "Endothelial cells",
+    grepl("Fibroblast", x, ignore.case = TRUE)                               ~ "Fibroblasts",
+    grepl("Pericyte", x, ignore.case = TRUE)                                 ~ "Pericytes",
+    grepl("Epithelial|Hepatocyte|Cholangiocyte", x, ignore.case = TRUE)      ~ "Epithelial cells",
+    TRUE ~ "Other/Unknown"
+  )
+}
+# Per-cell CNV RMS (14d_cnv_rms_per_cell.py), joined on section + barcode; must equal the iCNV run's own cnv_rms_score
+d[fread(rms_csv), on = .(sample, cell = barcode), cnv_rms_cell := i.cnv_rms]
+stopifnot(!anyNA(d$cnv_rms_cell), all(abs(d$cnv_rms_cell - d$cnv_rms) < 1e-9))
+# Unsmoothed iCNV (14e_pum26_icnv_unsmoothed.py, 2026-10-20): the January-style run for Suppl. Fig. 5b, as Fig. 2h uses
+# the January (unsmoothed) Boston run. The rest of this report keeps the smoothed run.
+uns <- rbindlist(lapply(c("pUM26_eye", "pUM26_liver"), function(p)
+  fread(file.path(dirname(rms_csv), "../Xenium_Stemness_pUM26_2026b", paste0(p, "_icnv_unsmoothed.csv")))[, sample := p]))
+d[uns, on = .(sample, cell = barcode), cnv_rms_uns := i.cnv_rms_unsmoothed]
+stopifnot(!anyNA(d$cnv_rms_uns))
+d[, celltype := coarsen(refined_immune_type)]
+ct_levels <- c(setdiff(d[, .N, by = celltype][order(-N), celltype], "Other/Unknown"), "Other/Unknown")
+d[, celltype := factor(celltype, levels = ct_levels)]
+ct_cols <- c(majority_celltype_col, "Other/Unknown" = "#D9D9D9")
+stopifnot(all(ct_levels %in% names(ct_cols)))
+d[, sample := factor(sample, levels = c("pUM26_eye", "pUM26_liver"))]
+d[, is_mel := celltype == "Melanoma cells"]
+for (s in c("panel_malignant", "new_malignant", "new_healthy_melanocyte", "new_all_cells", "jan_malignant"))
+  d[, paste0(s, "_TmB") := get(paste0(s, "_Top")) - get(paste0(s, "_Bottom"))]
+mel <- d[is_mel == TRUE]
+sec_lab <- c(pUM26_eye = "pUM26 primary eye tumour (Region5_0038498)", pUM26_liver = "pUM26 liver metastasis (Region1_0038471)")
+
+# iCNV summaries vs the malignant label: AUROC per section
+auroc <- function(s, y) { r <- rank(s); n1 <- as.numeric(sum(y)); n0 <- as.numeric(sum(!y)); (sum(r[y]) - n1 * (n1 + 1) / 2) / (n1 * n0) }
+cnv_auc <- d[, .(`Directed (chr8q - chr3)` = auroc(cnv_directed, is_mel), `Global RMS burden` = auroc(cnv_rms, is_mel),
+                 `chr3 loss (-chr3)` = auroc(-chr3_cnv, is_mel), `chr8q gain` = auroc(chr8q_cnv, is_mel)), by = sample]
+cnv_auc <- melt(cnv_auc, id.vars = "sample", variable.name = "score", value.name = "auroc")
+auc_of <- function(s, sc) cnv_auc[sample == s & score == sc, sprintf("%.2f", auroc)]
+
+# Per-section cell-level rho in melanoma cells
+score_cols <- c("panel_malignant_Top", "panel_malignant_Bottom", "panel_malignant_TmB", "panel_malignant_Top_noHS")
+cmp_cols <- c("new_malignant_Top", "new_malignant_TmB", "jan_malignant_Top", "jan_malignant_TmB")
+cmp_lab <- c(sprintf("October genome-wide Top (%d genes)", n_top["new_malignant_Top"]), "October genome-wide Top - Bottom",
+             "January Top (50 genes)", "January Top - Bottom")
+cov_cols <- c(cnv_directed = "CNV directed (chr8q - chr3)", chr3_cnv = "chr3 CNV", chr8q_cnv = "chr8q CNV", cnv_rms = "CNV RMS burden",
+              Cycling = "Cycling (PLAID)", HeatShock_IEG = "Heat shock / IEG (PLAID)", nFeature = "Genes detected (nFeature)")
+ps <- rbindlist(lapply(c(score_cols, cmp_cols, "cnv_directed"), function(s) rbindlist(lapply(names(cov_cols), function(cv)
+  mel[, .(rho = rho(get(s), get(cv)), n = .N), by = sample][, `:=`(score = s, covariate = cv)]))))
+r_of <- function(s, sc, cv) ps[sample == s & score == sc & covariate == cv, sprintf("%.2f", rho)]
+pr_of <- function(s) mel[sample == s, sprintf("%.2f", cor(panel_malignant_Top, cnv_rms_cell))]   # Pearson, as in the figure
+# Melanoma-labelled cells without the UM CNV pattern (directed score near 0) vs the CNV-positive ones
+cnv_cut <- 0.1
+cnvneg <- mel[, .(n = .N, frac_neg = mean(cnv_directed < cnv_cut),
+                  rho_pos = rho(panel_malignant_Top[cnv_directed >= cnv_cut], cnv_directed[cnv_directed >= cnv_cut]),
+                  med_neg = median(panel_malignant_Top[cnv_directed < cnv_cut]), med_pos = median(panel_malignant_Top[cnv_directed >= cnv_cut])), by = sample]
+cn_of <- function(s, col, fmt = "%.2f") sprintf(fmt, cnvneg[sample == s][[col]])
+
+ct_med <- d[, .(med = median(panel_malignant_Top), n = .N), by = .(sample, celltype)]
+med_of <- function(s, mal) d[sample == s & is_mel == mal, sprintf("%.2f", median(panel_malignant_Top))]
+
+# Spatial maps: shared colour caps across the two sections
+Q <- c(0.01, 0.99)
+stem_lim <- quantile(d$panel_malignant_Top, Q)
+cnv_lim <- quantile(abs(d$cnv_directed), Q[2])
+# dpi 700 so the PNG carries the >= 4000 px per panel scattermore raster (spatial_raster() in 14b_stemness_common.R)
+# Each map is also saved as manuscript panel SFig5a_spatial_<section> (PDF + 300 dpi PNG).
+tmpl <- c("### {{s}}", "", "```{r spatial_{{s}}, fig.width={{w}}, fig.height={{h}}, dpi=700, fig.retina=1}",
+          "save_panel(spatial_panel(\"{{s}}\"), \"SFig5a_spatial_{{s}}\", {{w}}, {{h}})", "```", "")
+spatial_child <- file.path(tempdir(), "spatial_child_pum26.Rmd")
+writeLines(unlist(lapply(levels(d$sample), function(s)
+  knitr::knit_expand(text = tmpl, s = s, w = spatial_width, h = d[sample == s, spatial_height(x, y)]))), spatial_child)
+spatial_panel <- function(s) {
+  f <- d[sample == s, .(x, y, celltype, stem = panel_malignant_Top, cnv = cnv_directed)]
+  spatial_3panel(f, ct_cols, stem_lim,
+                 stem_title = "Stemness\nOctober panel-matched\nmalignant Top (50 genes)",
+                 cnv_scale = scale_colour_gradient2(low = "#2166AC", mid = "grey70", high = "#B2182B", midpoint = 0,
+                                                    limits = c(-cnv_lim, cnv_lim), oob = scales::squish,
+                                                    name = sprintf("chr8q - chr3\nCNV, capped at\n%gth pct of |value|", 100 * Q[2])),
+                 cnv_title = "Directed iCNV score\n(chr8q gain minus chr3 loss)",
+                 title = sprintf("%s, %s cells", sec_lab[s], format(nrow(f), big.mark = ",")), Q = Q)
+}
+```
+
+Victoria asked for the Boston spatial stemness analysis (report 14b) also on patient pUM26 from the pUM26 Xenium run: the primary eye tumour and its liver metastasis. Same October 2026 signatures and PLAID scoring as 14b; cell types and iCNV are the July results of `Xenium_pUM26/SPLIT_Reannotation`, not redone.
+
+<style>
+.main-container img { max-width: min(100%, 1400px) !important; height: auto !important; display: block; margin: 0 auto; }
+.main-container .html-widget { max-width: 1400px; margin: 0 auto; }
+</style>
+
+# {.tabset}
+
+## Overview
+
+**Data.** One patient, two sections: `r sec_lab["pUM26_eye"]` with `r format(d[sample == "pUM26_eye", .N], big.mark = ",")` cells (`r format(mel[sample == "pUM26_eye", .N], big.mark = ",")` melanoma) and `r sec_lab["pUM26_liver"]` with `r format(d[sample == "pUM26_liver", .N], big.mark = ",")` cells (`r format(mel[sample == "pUM26_liver", .N], big.mark = ",")` melanoma). Same 5,001-gene panel as Boston, so the same stemness signature: the October malignant gene correlations (report 01b) restricted to the panel, top 50 = Top, bottom 50 = Bottom (`Outputs/CytoTRACE2_2026b/stemness_signature_malignant_xenium_panel_top50.csv`; gene list and overlaps in report 14b).
+
+**Stemness is high in the melanoma cells of both sections**: median Top score `r med_of("pUM26_eye", TRUE)` in eye melanoma cells vs `r med_of("pUM26_eye", FALSE)` in the other eye cells, and `r med_of("pUM26_liver", TRUE)` vs `r med_of("pUM26_liver", FALSE)` in the liver. Liver melanoma cells score a little higher than eye melanoma cells; with one section per site this is a description, not a test.
+
+**CNV.** The maps use the **directed iCNV score, chr8q gain minus chr3 loss**, not the global RMS burden. Against the malignant label it gives AUROC `r auc_of("pUM26_eye", "Directed (chr8q - chr3)")` (eye) and `r auc_of("pUM26_liver", "Directed (chr8q - chr3)")` (liver), against `r auc_of("pUM26_eye", "Global RMS burden")` and `r auc_of("pUM26_liver", "Global RMS burden")` for the RMS burden.
+
+**Stemness vs CNV within melanoma cells differs between the two sites** (cell-level Spearman rho): `r r_of("pUM26_eye", "panel_malignant_Top", "cnv_directed")` in the eye and `r r_of("pUM26_liver", "panel_malignant_Top", "cnv_directed")` in the liver metastasis. In the liver, the cells with more chr8q gain carry more stemness (rho with chr8q `r r_of("pUM26_liver", "panel_malignant_Top", "chr8q_cnv")`, with chr3 `r r_of("pUM26_liver", "panel_malignant_Top", "chr3_cnv")`); in the eye there is almost none. Part of the liver correlation comes from the `r sprintf("%.0f%%", 100 * cnvneg[sample == "pUM26_liver", frac_neg])` of melanoma-labelled liver cells with no UM CNV pattern (directed score below `r cnv_cut`), which have low stemness (median `r cn_of("pUM26_liver", "med_neg")` vs `r cn_of("pUM26_liver", "med_pos")`); among the CNV-positive liver melanoma cells alone rho is `r cn_of("pUM26_liver", "rho_pos")` (eye: `r cn_of("pUM26_eye", "rho_pos")`, with `r sprintf("%.1f%%", 100 * cnvneg[sample == "pUM26_eye", frac_neg])` CNV-negative). Those CNV-negative cells may be mislabelled non-malignant cells. Against the per-cell CNV RMS used in the manuscript figure (Pearson r): `r pr_of("pUM26_eye")` in the eye and `r pr_of("pUM26_liver")` in the liver.
+
+**Caveat, as in Boston.** The strongest correlate of the Top score is the number of genes detected per cell (rho `r r_of("pUM26_eye", "panel_malignant_Top", "nFeature")` eye, `r r_of("pUM26_liver", "panel_malignant_Top", "nFeature")` liver), stronger than cycling (`r r_of("pUM26_eye", "panel_malignant_Top", "Cycling")`, `r r_of("pUM26_liver", "panel_malignant_Top", "Cycling")`) or heat shock (`r r_of("pUM26_eye", "panel_malignant_Top", "HeatShock_IEG")`, `r r_of("pUM26_liver", "panel_malignant_Top", "HeatShock_IEG")`). The liver CNV relation could partly come through detection too: the directed CNV score itself correlates with nFeature at rho `r r_of("pUM26_eye", "cnv_directed", "nFeature")` (eye) and `r r_of("pUM26_liver", "cnv_directed", "nFeature")` (liver).
+
+## Cell types and iCNV {.tabset}
+
+### Cell types
+
+```{r composition, fig.width=10, fig.height=4}
+comp <- d[, .N, by = .(sample, celltype)][, frac := N / sum(N), by = sample]
+ggplot(comp, aes(frac, sample, fill = celltype)) + geom_col(width = 0.7) +
+  geom_text(data = comp[frac > 0.04], aes(label = sprintf("%.0f%%", 100 * frac)), position = position_stack(vjust = 0.5), size = 3.2, colour = "white") +
+  scale_fill_manual(values = ct_cols, name = NULL) + scale_x_continuous(labels = scales::percent) +
+  scale_y_discrete(labels = sec_lab) + theme_bw(base_size = 12) +
+  labs(x = "Share of cells", y = NULL, title = "Coarse cell classes (refined RCTD labels, SPLIT-purified)")
+```
+
+### Which CNV score
+
+```{r cnv-auroc, fig.width=10, fig.height=4}
+ggplot(cnv_auc, aes(auroc, score, fill = sample)) + geom_col(position = position_dodge(0.8), width = 0.75) +
+  geom_text(aes(label = sprintf("%.2f", auroc)), position = position_dodge(0.8), hjust = -0.15, size = 3.4) +
+  scale_fill_manual(values = c(pUM26_eye = "#5498BA", pUM26_liver = "#E2ADDD"), name = NULL) +
+  coord_cartesian(xlim = c(0.5, 1.05)) + scale_y_discrete(limits = rev) + theme_bw(base_size = 12) +
+  labs(x = "AUROC, melanoma cells vs all other cells", y = NULL, title = "How well each iCNV summary separates melanoma cells")
+```
+
+```{r cnv-density, fig.width=12, fig.height=4.5}
+ggplot(d, aes(cnv_directed, fill = is_mel)) + geom_density(alpha = 0.6, colour = NA) +
+  facet_wrap(~sample, scales = "free_y", labeller = as_labeller(sec_lab)) +
+  scale_fill_manual(values = c(`TRUE` = "#B00068", `FALSE` = "grey50"), labels = c(`TRUE` = "Melanoma cells", `FALSE` = "Other cells"), name = NULL) +
+  coord_cartesian(xlim = quantile(d$cnv_directed, c(0.001, 0.999))) + theme_bw(base_size = 12) + theme(legend.position = "bottom") +
+  labs(x = "Directed iCNV score (chr8q - chr3)", y = "Density")
+```
+
+The iCNV run (infercnvpy after neighbour smoothing, macrophages as the diploid reference) smooths each cell over its 100 expression neighbours, so separation from an expression-based label is partly built in; the point here is only which summary to map.
+
+## Spatial maps {.tabset}
+
+Cell types, the panel-matched Top stemness score and the directed iCNV score on the same coordinates. Both colour scales are shared by the two sections: stemness capped at the `r 100 * Q[1]`st and `r 100 * Q[2]`th percentile (`r sprintf("%.2f to %.2f", stem_lim[1], stem_lim[2])`), the CNV score at the `r 100 * Q[2]`th percentile of its absolute value (`r sprintf("%.2f", cnv_lim)`); values beyond take the end colour. Each cell is one dot with a radius of `r formals(spatial_raster)$frac` times the median distance between neighbouring cell centres, so the section reads as filled and the closest neighbours overlap slightly; the images are rasterised at 4,000 pixels or more per panel, so open one in a new browser tab to zoom in to single cells.
+
+```{r spatial-child, child=spatial_child}
+```
+
+## Score by cell type
+
+```{r by-celltype, fig.width=13, fig.height=6}
+ggplot(d, aes(celltype, panel_malignant_Top, fill = celltype)) +
+  geom_violin(scale = "width", linewidth = 0.2) + geom_boxplot(width = 0.12, fill = "white", outlier.shape = NA) +
+  facet_wrap(~sample, labeller = as_labeller(sec_lab)) + scale_fill_manual(values = ct_cols, guide = "none") +
+  theme_bw(base_size = 12) + theme(axis.text.x = element_text(angle = 40, hjust = 1)) +
+  labs(x = NULL, y = "PLAID score", title = lab_top, subtitle = "Cell-level distribution per section")
+```
+
+```{r by-celltype-heat, fig.width=7, fig.height=5}
+ggplot(ct_med, aes(sample, celltype, fill = med)) + geom_tile(colour = "white") +
+  geom_text(aes(label = sprintf("%.2f\n(n = %s)", med, format(n, big.mark = ","))), size = 3) +
+  scale_fill_gradient2(low = "#325A9B", mid = "white", high = "#B00068", midpoint = 0, name = "Median\nscore") +
+  scale_y_discrete(limits = rev) + theme_bw(base_size = 11) +
+  labs(x = NULL, y = NULL, title = "Median panel-matched Top score per cell class")
+```
+
+## Melanoma cells: eye vs liver
+
+```{r eye-vs-liver, fig.width=13, fig.height=4.5}
+ml <- melt(mel[, .(sample, panel_malignant_Top, panel_malignant_Bottom, panel_malignant_TmB)], id.vars = "sample", variable.name = "score")
+ml[, score := factor(score, labels = c(sprintf("Top (%d genes)", n_top["panel_malignant_Top"]),
+                                       sprintf("Bottom (%d genes)", n_top["panel_malignant_Bottom"]), "Top - Bottom"))]
+ggplot(ml, aes(sample, value, fill = sample)) + geom_violin(scale = "width", linewidth = 0.2) +
+  geom_boxplot(width = 0.12, fill = "white", outlier.shape = NA) + facet_wrap(~score, scales = "free_y") +
+  scale_fill_manual(values = c(pUM26_eye = "#5498BA", pUM26_liver = "#E2ADDD"), guide = "none") + theme_bw(base_size = 12) +
+  labs(x = NULL, y = "PLAID score", title = "Malignant signature in melanoma cells, primary eye tumour vs liver metastasis",
+       subtitle = "One section per site of one patient: descriptive, no test (cells are not independent replicates)")
+```
+
+## Stemness vs CNV
+
+```{r vs-cnv, fig.width=12, fig.height=5.5}
+save_panel(stem_cnv_scatter(mel[, .(sample, stem = panel_malignant_Top, cnv_rms = cnv_rms_uns)], lab_top, ncol = 2,
+                            labeller = as_labeller(sec_lab), ylab = "CNV score (per-cell RMS, iCNV without smoothing)"), "SFig5b_stemness_vs_cnv_pUM26", 12, 5.5)
+uns_r <- mel[, .(r_uns = cor(panel_malignant_Top, cnv_rms_uns), r_smooth = cor(panel_malignant_Top, cnv_rms_cell),
+                 uns_vs_genes = cor(cnv_rms_uns, nFeature, method = "spearman")), by = sample]
+uns_txt <- function(s, col) sprintf("%.2f", uns_r[sample == s, get(col)])
+```
+
+One point per melanoma cell (`r format(nrow(mel), big.mark = ",")`), black line = linear fit with 95% band, Pearson r per section. CNV score = per-cell RMS of the iCNV profile **without neighbour smoothing** (`14e_pum26_icnv_unsmoothed.py`, 2026-10-20, to match Fig. 2h, which uses the January unsmoothed Boston run); Pearson r `r uns_txt("pUM26_eye", "r_uns")` (eye) and `r uns_txt("pUM26_liver", "r_uns")` (liver), against `r uns_txt("pUM26_eye", "r_smooth")` and `r uns_txt("pUM26_liver", "r_smooth")` with the smoothed run used elsewhere in this report. The unsmoothed score follows genes detected per melanoma cell (rho `r uns_txt("pUM26_eye", "uns_vs_genes")` eye, `r uns_txt("pUM26_liver", "uns_vs_genes")` liver); unlike the directed score on the maps it has no sign, so chr3 loss and chr8q gain both raise it. The heatmap below has the directed and per-chromosome scores and the covariates.
+
+```{r rho-heatmap, fig.width=13, fig.height=5}
+hm <- ps[score %in% score_cols]
+hm[, score := factor(score, levels = rev(score_cols),
+                     labels = rev(c("Top (50 genes)", "Bottom (50 genes)", "Top - Bottom",
+                                    sprintf("Top without heat-shock / IEG genes (%d)", n_top["panel_malignant_Top_noHS"]))))]
+hm[, covariate := factor(cov_cols[covariate], levels = cov_cols)]
+ggplot(hm, aes(covariate, score, fill = rho)) + geom_tile(colour = "white") + geom_text(aes(label = sprintf("%.2f", rho)), size = 3.2) +
+  facet_wrap(~sample, labeller = as_labeller(sec_lab)) +
+  scale_fill_gradient2(low = "#325A9B", mid = "white", high = "#B00068", midpoint = 0, limits = c(-1, 1), name = "rho") +
+  theme_bw(base_size = 11) + theme(axis.text.x = element_text(angle = 35, hjust = 1)) +
+  labs(x = NULL, y = NULL, title = "Correlation of the panel-matched stemness scores with CNV and the covariates, melanoma cells",
+       subtitle = "Cell-level Spearman rho within each section")
+```
+
+## Other signatures
+
+The October signature as published by 01b (genome-wide top / bottom 50) keeps only `r n_top["new_malignant_Top"]` of 50 Top genes on this panel (`r paste(sets$new_malignant_Top, collapse = ", ")`, `r length(intersect(sets$new_malignant_Top, unique(c(L$heat_shock, L$ieg))))` of them heat-shock / IEG genes), all of them also in the panel-matched Top set. That score and the January signature of report 14 are shown here for comparison only; the first column is their agreement with the primary score.
+
+```{r other-signatures, fig.width=13, fig.height=4.5}
+oc <- c(panel_malignant_Top = "Primary Top (panel-matched)", cov_cols)
+om <- rbind(ps[score %in% cmp_cols],
+            rbindlist(lapply(cmp_cols, function(s) mel[, .(rho = rho(get(s), panel_malignant_Top), n = .N), by = sample][, `:=`(score = s, covariate = "panel_malignant_Top")])))
+om[, score := factor(score, levels = rev(cmp_cols), labels = rev(cmp_lab))]
+om[, covariate := factor(oc[covariate], levels = oc)]
+ggplot(om, aes(covariate, score, fill = rho)) + geom_tile(colour = "white") + geom_text(aes(label = sprintf("%.2f", rho)), size = 3.2) +
+  facet_wrap(~sample, labeller = as_labeller(sec_lab)) +
+  scale_fill_gradient2(low = "#325A9B", mid = "white", high = "#B00068", midpoint = 0, limits = c(-1, 1), name = "rho") +
+  theme_bw(base_size = 11) + theme(axis.text.x = element_text(angle = 35, hjust = 1)) +
+  labs(x = NULL, y = NULL, title = "Comparison scores, melanoma cells", subtitle = "Cell-level Spearman rho within each section")
+```
+
+## Methods
+
+- **Cells, counts and labels.** Per-region SPLIT-purified objects `Xenium_pUM26/SPLIT_Reannotation/regions/<region>/scData_SPLIT_immune.qs2` (Region5_0038498 = pUM26 eye, Region1_0038471 = pUM26 liver, `pairs.tsv`). Counts are the SPLIT-purified (shift-mode, non-integer) counts. Coarse classes = `coarsen()` of report 21 applied to `refined_immune_type` ("Malignant" and "Cancer cells" = Melanoma cells; Platelets, Unknown and filtered = Other/Unknown).
+- **iCNV.** `xenium_icnv/pUM26_{eye,liver}_cnv.h5ad` (infercnvpy, script 18): `chr3_cnv` = mean CNV over chr3 windows, `chr8q_cnv` = mean over the distal half of chr8 windows, `cnv_rms_score` = global RMS. Directed score = chr8q_cnv - chr3_cnv, computed here. Only obs was read (`14c_extract_pum26_icnv_obs.py`), with coordinates recovered by script 17 from the original region objects. The per-cell RMS of the stemness vs CNV figure is recomputed from `obsm/X_cnv` by `14d_cnv_rms_per_cell.py` (sqrt(mean(X_cnv^2)) over all windows; cache `Outputs/Xenium_Stemness_Boston_2026b/cnv_rms_per_cell.csv`, joined on section + barcode) and equals `cnv_rms_score` for every cell (checked in the report).
+- **Signature.** As report 14b: the October 2026 malignant gene-CytoTRACE2 correlations of report 01b (`gene_cor_malignant.csv`, genes detected in at least 1% of malignant cells) restricted to the 5,001 panel genes, top 50 = Top, bottom 50 = Bottom, the rule that reproduces report 14's January signature exactly. The pUM26 panel is identical to the Boston one, checked by rebuilding the signature from it (`stemness_sets()` stops if it differs from the saved file). Comparison scores: the October genome-wide signature (`r n_top["new_malignant_Top"]` / `r n_top["new_malignant_Bottom"]` of its 50 Top / Bottom genes on the panel) and the January signature.
+- **Scoring.** PLAID (`plaid_score.R`) with all sets in one call; z-scores relative to all `r format(nrow(d), big.mark = ",")` cells of the two sections pooled, so eye and liver share one scale. Gene sets and figure helpers: `UM_Atlas/14b_stemness_common.R`.
+- **Statistics.** Spearman correlations computed on cells within one section (cell-level, describing co-variation across cells, not a patient effect). One patient, one section per site: eye vs liver differences are descriptive.
+- Scripts: `UM_Atlas/14c_extract_pum26_icnv_obs.py`, `UM_Atlas/14c_score_xenium_pum26_2026b.R`, `UM_Atlas/14d_cnv_rms_per_cell.py`; cache `Outputs/Xenium_Stemness_pUM26_2026b/pum26_scores_2026b.qs2`; figures (PNG + PDF) in `Figures_2026b/Xenium_Stemness_pUM26/`, manuscript panels (SFig5a maps, SFig5b scatter; PDF + 300 dpi PNG) in `Figures_2026b/Manuscript_panels/`.
+
+## Session Info
+
+```{r session-info}
+sessionInfo()
+```

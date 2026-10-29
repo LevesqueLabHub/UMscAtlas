@@ -1,0 +1,138 @@
+---
+title: "UM Atlas - manuscript panels on the October 2026 object"
+output:
+  html_document:
+    self_contained: true
+    includes:
+      in_header: !expr system.file("templates/fgcz_header.html", package = "ezRun", lib.loc = .libPaths())
+    css: !expr system.file("templates/fgcz.css", package = "ezRun", lib.loc = .libPaths())
+    code_folding: hide
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE, comment = "")
+library(tidyverse)
+A <- ".."
+panel_dir <- file.path(A, "Figures_2026b/Manuscript_panels")
+pngs <- list.files(panel_dir, pattern = "\\.png$")
+ids <- sub("\\.png$", "", pngs)
+
+# One caption per panel prefix (exact id or prefix shared by several files, e.g. one map per section).
+# Test values: Outputs/Manuscript_panels_2026b/tests_cytotrace_mp.csv, Outputs/GloScope_manuscript_2026b/anosim_manuscript_panels.csv.
+captions <- tribble(
+  ~prefix, ~panel, ~caption,
+  "Fig1h_", "Fig. 1h", "ANOSIM R on GloScope divergence for each grouping and cell set, with the requested rows added: location over all samples, and primary mutation, secondary mutation and non-malignant vs primary on melanocytic cells (for tumours these are the malignant cells). Secondary mutation rows use BAP1 / SF3B1 / EIF1AX only, as submitted. New: melanocytic non-malignant vs primary R 0.09, p 0.09 (all cells R 0.49). Updated 2026-10-20 (Victoria's marked cells): Location in malignant, melanocytic and primary-tumour cells, age in melanocytic cells (non-malignant samples take their patient's age), and a Choroidal pUM column (all cells of the 18 choroidal primaries) for secondary mutation, primary mutation, gender and age; only secondary mutation separates choroidal pUM (R 0.49, p 0.001). Updated 2026-10-28 (Mauro): a Malignant Cells, pUM column (malignant cells of the primaries only) for every variable; beyond secondary mutation (R 0.54) only location separates them (R 0.25, p 0.01, not with one sample per patient), while primary mutation, gender and age do not.",
+  "Fig1i_mds_origin", "Fig. 1i", "MDS of all cells, all 63 samples, by disease stage.",
+  "Fig1i_mds_primary_mutation", "Fig. 1i (primary mutation)", "MDS of all cells, all samples, by primary mutation with none and unknown shown; ANOSIM on GNAQ / GNA11 / PLCB4 only. Labelled Fig. 1i in the request, like the panel above.",
+  "Fig1j_", "Fig. 1j", "MDS of all cells, primary tumours, by secondary mutation with none and unknown as separate groups; ANOSIM on BAP1 / SF3B1 / EIF1AX (R 0.42, 23 samples; submitted 0.48 on 16).",
+  "Fig1k_", "Fig. 1k", "MDS of all cells, primary tumours, by location including the ciliochoroidal tumour (plotted, not tested).",
+  "Fig2c_", "Fig. 2c", "CytoTRACE2 potency categories on the atlas UMAP.",
+  "Fig2d_", "Fig. 2d", "CytoTRACE2 score by cell type, all cells.",
+  "Fig2e_", "Fig. 2e", "CytoTRACE2 per tumour/tissue (melanoma cells of tumours, melanocytes of non-malignant tissue), coloured by location; p on patient means. Metastasis > primary > non-malignant.",
+  "Fig2g_", "Fig. 2g", "Boston Xenium sections: cell types (atlas cell types only; hepatocytes, cholangiocytes and mast cells drawn as Other/Unknown), stemness (October signature on panel genes) and CNV, with coordinates. Open an image in a new tab to zoom.",
+  "Fig2h_", "Fig. 2h", "Stemness vs CNV per melanoma cell, Boston sections, with the CNV of the submitted panel: the January InSituCNV run without neighbour smoothing (per-cell RMS), grey points, black line = linear fit, Pearson r per section. Stemness = October panel-matched signature. Caveat: this CNV score follows genes detected per cell (r 0.92-0.96), like the stemness score; adjusted for genes detected r is 0.03-0.17, and with the smoothed rerun -0.30 to 0.35 (Outputs/Manuscript_panels_2026b/fig2h_correlation_decomposition.csv).",
+  "Fig2i_", "Fig. 2i", "CytoTRACE2 in primary-tumour malignant cells by location (choroid, iris, ciliary body; the ciliochoroidal tumour is left out), per tumour; p on patient means (choroid vs iris p = 0.0013).",
+  "Fig3a_", "Fig. 3a", "Correlation of the 30 metaprograms with the highest mean UCell score, all melanocytic cells.",
+  "Fig3c_", "Fig. 3c", "MP45 Skin-pigmentation (UCell) on the atlas UMAP.",
+  "Fig3d_", "Fig. 3d", "MP45 per tumour/tissue by disease stage; p on patient means.",
+  "Fig3e_", "Fig. 3e", "MP17 EMT-III (UCell) on the atlas UMAP.",
+  "Fig3f_", "Fig. 3f", "MP17 per tumour/tissue by disease stage; p on patient means.",
+  "Fig3g_", "Fig. 3g", "MP9 Stress 2 (UCell) on the atlas UMAP.",
+  "Fig3h_", "Fig. 3h", "MP9 per tumour/tissue by disease stage; p on patient means.",
+  "Fig3i_", "Fig. 3i", "Interferon/MHC-II programs MP22-24 (UCell) by disease stage: patient-level boxplots (one point per tumour/tissue, p on patient means; all three higher in metastases than in primaries, p 0.0008-0.012) and the dot plot in the submitted design (colour = average UCell scaled across groups, size = % cells with UCell > 0, 92-100% everywhere).",
+  "Fig3j_", "Fig. 3j", "MP22-24 in metastases by treatment stage, boxplots and the dot plot in the submitted design; 1-8 patients per arm and P26 / P31 each in two arms, so descriptive only, no test.",
+  "SFig3b_", "Suppl. Fig. 3b", "GloScope KL divergence between all samples, with patient, origin, organ, location (including metastatic sites), gender, age group and primary and secondary mutation (none and unknown separate). Age is per patient, so non-malignant samples take their patient's age; unknown = the 8 patients without an age.",
+  "SFig3c_", "Suppl. Fig. 3c", "MDS of all cells, all 63 samples, labelled with sample names (colour organ, shape origin).",
+  "SFig4a_cytotrace_origin", "Suppl. Fig. 4a", "CytoTRACE2 per tumour/tissue by disease stage, coloured by age class (<40 / 40-60 / >=60; unknown for 8 patients).",
+  "SFig4a_cytotrace_age_by_stage", "Suppl. Fig. 4a (test)", "Added 2026-10-28 (reviewer, L172: the same per-patient test for every factor): CytoTRACE2 by age class within each disease stage, Wilcoxon on patient means. <40 has fewer than 3 patients in every stage, so only 40-60 vs >=60 is tested; no difference (p 0.52-0.63).",
+  "SFig4b_cytotrace_origin", "Suppl. Fig. 4b", "CytoTRACE2 per tumour/tissue by disease stage, coloured by gender.",
+  "SFig4b_cytotrace_gender_by_stage", "Suppl. Fig. 4b (test)", "Added 2026-10-28 (reviewer, L172): CytoTRACE2 by gender within each disease stage, Wilcoxon on patient means, points coloured by location. Men score higher in every stage, significant only in primaries (p 0.034), where 3 of 6 women but 1 of 18 men have an iris tumour (choroid / iris / ciliary body primaries); adjusted for location the gender difference disappears (see the caption on the figure).",
+  "SFig4c_", "Suppl. Fig. 4c", "CytoTRACE2 in malignant cells per tumour by secondary mutation, coloured by gender; no comparison is significant at patient level (p 0.36-0.76).",
+  "SFig5a_", "Suppl. Fig. 5a", "pUM26 primary (Region5_0038498) and liver metastasis (Region1_0038471): cell types, stemness and CNV, with coordinates.",
+  "SFig5b_", "Suppl. Fig. 5b", "Stemness vs CNV per melanoma cell, pUM26 eye and liver, with iCNV run without neighbour smoothing (as Fig. 2h; per-cell RMS, run 2026-10-20), grey points, black line = linear fit. Stemness = October panel-matched signature.",
+  "SFig6a_", "Suppl. Fig. 6a", "The 20 metaprograms with the highest mean UCell score, all melanocytic cells.",
+  "SFig6b_", "Suppl. Fig. 6b", "MP45 per primary tumour by location; p on patient means (p 0.36-0.86).",
+  "Rev_L169_", "Reviewer, L169", "Added 2026-10-28 (Mauro): in the January object the fibroblasts with high CytoTRACE2 came from iris. In the October object they come from every site: CytoTRACE2 of fibroblasts per tumour/tissue by site, eye sites pooling non-malignant tissue and primaries, p on patient means. The shares are in the figure caption.")
+figures <- list(
+  "Fig. 1" = "^Fig1", "Fig. 2" = "^Fig2", "Fig. 3" = "^Fig3",
+  "Suppl. Fig. 3" = "^SFig3", "Suppl. Fig. 4" = "^SFig4", "Suppl. Fig. 5" = "^SFig5", "Suppl. Fig. 6" = "^SFig6",
+  "Reviewer" = "^Rev")
+stopifnot("a requested panel has no PNG" = all(sapply(captions$prefix, function(p) any(startsWith(ids, p)))),
+          "a PNG has no caption" = all(sapply(ids, function(i) any(startsWith(i, captions$prefix)))))
+
+show_figure <- function(rx) {
+  cap <- dplyr::filter(captions, grepl(rx, prefix))
+  for (k in seq_len(nrow(cap))) {
+    files <- sort(pngs[startsWith(ids, cap$prefix[k])])
+    cat(sprintf("**%s**. %s\n\n", cap$panel[k], cap$caption[k]))
+    for (f in files) cat(sprintf("![](%s){width=100%%}\n\n", file.path(panel_dir, f)))
+  }
+}
+```
+
+Panels of the submitted manuscript, rebuilt on the October 2026 atlas (349,696 cells, 63 libraries, 56 tumours/tissues, 45 patients) with the changes requested on 2026-10-15. Each panel is also available as PDF and PNG in `Figures_2026b/Manuscript_panels/`, named by figure panel.
+
+<style>
+.main-container img { max-width: min(100%, 1400px) !important; height: auto !important; display: block; margin: 0 auto; }
+.main-container .html-widget { max-width: 1400px; margin: 0 auto; }
+</style>
+
+# {.tabset}
+
+## Fig. 1
+
+```{r fig1, results = "asis"}
+show_figure(figures[["Fig. 1"]])
+```
+
+## Fig. 2
+
+```{r fig2, results = "asis"}
+show_figure(figures[["Fig. 2"]])
+```
+
+## Fig. 3
+
+```{r fig3, results = "asis"}
+show_figure(figures[["Fig. 3"]])
+```
+
+## Suppl. Fig. 3
+
+```{r sfig3, results = "asis"}
+show_figure(figures[["Suppl. Fig. 3"]])
+```
+
+## Suppl. Fig. 4
+
+```{r sfig4, results = "asis"}
+show_figure(figures[["Suppl. Fig. 4"]])
+```
+
+## Suppl. Fig. 5
+
+```{r sfig5, results = "asis"}
+show_figure(figures[["Suppl. Fig. 5"]])
+```
+
+## Suppl. Fig. 6
+
+```{r sfig6, results = "asis"}
+show_figure(figures[["Suppl. Fig. 6"]])
+```
+
+## Reviewer
+
+```{r rev, results = "asis"}
+show_figure(figures[["Reviewer"]])
+```
+
+## Methods
+
+- **Object**: October 2026 reprocessed atlas (`final_Subtyping_iCNV_reclustered.qs2`). Boxplots show one point per tumour/tissue (`orig.ident`); p-values are two-sided Wilcoxon tests on patient means (`Patient_nr`), so a patient with two samples in one group counts once. Groups with fewer than 3 patients are shown but not tested.
+- **CytoTRACE2**: scores from `run_cytotrace2_2026b.R`, one library at a time (report 01b). Panels: `manuscript_panels_2026b_cytotrace_mp.R`.
+- **Weizmann metaprograms**: the 67 malignant meta-programs (3CA, 2025-01-29) scored with UCell on the 200,634 melanoma cells and melanocytes (`score_3CA_ucell_2026b.R`), as in the submitted figures.
+- **GloScope**: divergence matrices of report 03b (k = 50 KNN, symmetrised KL), MDS with `cmdscale`, ANOSIM with 999 permutations (`manuscript_panels_2026b_gloscope.R`). Each divergence value depends only on its two samples, so sub-matrices of the cached matrices were used for the added rows.
+- **Spatial**: Xenium 5k, Boston cohort (6 sections) and pUM26 (primary Region5_0038498, liver metastasis Region1_0038471). Stemness = October malignant stemness signature restricted to the panel genes (top/bottom 50); CNV = per-cell RMS of the infercnvpy matrix. Reports 14b/14c.

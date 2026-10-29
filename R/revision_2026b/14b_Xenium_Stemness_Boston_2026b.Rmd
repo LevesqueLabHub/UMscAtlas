@@ -1,0 +1,414 @@
+---
+title: "UM Atlas - Boston Xenium: spatial stemness with the October 2026 signature"
+output:
+  html_document:
+    self_contained: true
+    includes:
+      in_header: !expr system.file("templates/fgcz_header.html", package = "ezRun", lib.loc = .libPaths())
+    css: !expr system.file("templates/fgcz.css", package = "ezRun", lib.loc = .libPaths())
+    code_folding: hide
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+fig_dir <- "../Figures_2026b/Xenium_Stemness_Boston"
+dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, comment = "", dpi = 300,
+                      dev = c("png", "cairo_pdf"), fig.path = paste0(fig_dir, "/"))
+
+suppressPackageStartupMessages({
+  library(data.table); library(qs2); library(ggplot2); library(patchwork); library(ggsignif)
+})
+src_dir <- dirname(knitr::current_input(dir = TRUE))
+source(file.path(src_dir, "config_colors_2026b.R"))
+source(file.path(src_dir, "14b_stemness_common.R"))   # gene sets, rho(), spatial_3panel(), hex_by_sample(), lolli()
+
+# Per-cell scores, coordinates, cell types and CNV, from 14b_score_xenium_boston_2026b.R
+cache <- "../Outputs/Xenium_Stemness_Boston_2026b/boston_scores_2026b.qs2"
+L <- qs_read(cache, nthreads = 1)
+d <- L$cells
+sets <- L$sets; n_top <- lengths(sets)
+d[celltype == "Mast_cells", celltype := "Mast cells"]
+# Per-cell CNV RMS (14d_cnv_rms_per_cell.py); bare barcodes repeat across sections, so join on section + barcode
+stopifnot(all(startsWith(d$cell, paste0(d$sample, "_"))))
+d[, barcode := substring(cell, nchar(sample) + 2)]
+d[fread(rms_csv), on = .(sample, barcode), cnv_rms := i.cnv_rms]
+# January InSituCNV run (no neighbour smoothing; per-cell RMS from report 18): the CNV of the submitted Fig. 2h.
+# Victoria (2026-10-20) wants the manuscript panel in this version; the smoothed run stays in the rest of the report.
+jan_cnv <- fread(file.path(dirname(rms_csv), "inputs/cnv_january_unsmoothed_report18.csv"), select = c("Sample", "barcode_suffix", "cnv_score"))
+d[jan_cnv, on = .(sample = Sample, barcode = barcode_suffix), cnv_jan := i.cnv_score]
+# Positive control: per-cell RMS averaged per CNV cluster (cells sharing one 09 score) vs the 09 per-cluster score
+rms_ctrl <- d[cnv_score > 0, .(rms = mean(cnv_rms)), by = .(sample, cnv_score)]
+rms_ctrl_r <- rms_ctrl[, cor(rms, cnv_score)]
+stopifnot(rms_ctrl_r > 0.8)
+ct_levels <- c(setdiff(d[, .N, by = celltype][order(-N), celltype], "Unknown"), "Unknown")
+d[, celltype := factor(celltype, levels = ct_levels)]
+ct_cols <- c(majority_celltype_col[intersect(ct_levels, names(majority_celltype_col))],
+             "Hepatocytes" = "#8C564B", "Cholangiocytes" = "#00A878", "Mast cells" = "#E6AB02", "Unknown" = "#D9D9D9")
+stopifnot(all(ct_levels %in% names(ct_cols)))
+# Manuscript maps show only the atlas cell types (Victoria, 2026-10-16); Hepatocytes, Cholangiocytes, Mast cells and
+# Unknown are drawn as Other/Unknown. The report's own statistics keep the full Boston labels.
+d[, celltype_atlas := factor(fifelse(as.character(celltype) %in% names(majority_celltype_col), as.character(celltype), "Other/Unknown"),
+                             levels = c(intersect(ct_levels, names(majority_celltype_col)), "Other/Unknown"))]
+ct_cols_atlas <- c(majority_celltype_col, "Other/Unknown" = "#D9D9D9")
+
+samples <- d[, .N, by = .(sample, tissue, timepoint, response)][order(tissue != "Liver", sample)]
+d[, sample := factor(sample, levels = samples$sample)]
+d[, is_mel := celltype == "Melanoma cells"]
+for (s in c("panel_malignant", "new_malignant", "new_healthy_melanocyte", "new_all_cells", "jan_malignant"))
+  d[, paste0(s, "_TmB") := get(paste0(s, "_Top")) - get(paste0(s, "_Bottom"))]
+mel <- d[is_mel == TRUE]
+stopifnot(!anyNA(mel$cnv_rms))
+cnv_pr <- mel[, .(r = cor(panel_malignant_Top, cnv_rms)), by = sample]
+cnv_pr_txt <- cnv_pr[, paste(sprintf("%s %.2f", sample, r), collapse = ", ")]
+jan_pr_txt <- mel[, .(r = cor(jan_UCell_Top, cnv_rms)), by = sample][, sprintf("%.2f to %.2f", min(r), max(r))]
+
+# PRIMARY score = October panel-matched malignant signature (top / bottom 50 panel genes of the 01b correlations)
+sig_lab <- c(panel_malignant = "October panel-matched (primary)", new_malignant = "October genome-wide malignant",
+             new_healthy_melanocyte = "October healthy melanocyte", new_all_cells = "October all cells",
+             jan_malignant = "January malignant")
+score_lab <- function(sc) {
+  base <- sub("_(Top|Bottom|TmB)$", "", sc); part <- sub(".*_", "", sc)
+  n <- if (part == "TmB") sprintf("%d - %d genes", n_top[paste0(base, "_Top")], n_top[paste0(base, "_Bottom")])
+       else sprintf("%d genes", n_top[sc])
+  sprintf("%s %s (%s)", sig_lab[base], c(Top = "Top", Bottom = "Bottom", TmB = "Top - Bottom")[part], n)
+}
+lab_top <- "Stemness: October panel-matched Top (50 genes)"
+
+# Per-section cell-level Spearman rho in melanoma cells, every score x covariate
+prim_cols <- c("panel_malignant_Top", "panel_malignant_Bottom", "panel_malignant_TmB")
+cmp_cols <- c("new_malignant_Top", "new_malignant_TmB", "jan_malignant_Top", "jan_malignant_TmB",
+              "new_healthy_melanocyte_Top", "new_healthy_melanocyte_TmB", "new_all_cells_Top", "new_all_cells_TmB")
+cov_cols <- c(Cycling = "Cycling (PLAID)", HeatShock_IEG = "Heat shock / IEG (PLAID)", nFeature = "Genes detected (nFeature)",
+              cnv_rms = "CNV RMS (per cell)", panel_malignant_Top = "Primary Top (panel-matched)")
+ps <- rbindlist(lapply(c(prim_cols, "panel_malignant_Top_noHS", "panel_malignant_Top_noCC", cmp_cols),
+  function(s) rbindlist(lapply(names(cov_cols), function(cv)
+    mel[, .(rho = rho(get(s), get(cv)), n = .N), by = sample][, `:=`(score = s, covariate = cv)]))))
+ps <- ps[score != covariate]
+ps_med <- ps[, .(med = median(rho), lo = min(rho), hi = max(rho)), by = .(score, covariate)]
+fmt_r <- function(s, cv) with(ps_med[score == s & covariate == cv], sprintf("%.2f (range %.2f to %.2f)", med, lo, hi))
+jan_ucell_rho <- mel[, .(rho = rho(panel_malignant_Top, jan_UCell_Top)), by = sample]
+
+# Gene overlaps of the primary signature
+hs_ieg <- unique(c(L$heat_shock, L$ieg))
+psig <- L$panel_sig
+ovl <- function(dir) {
+  g <- psig[direction == dir, gene]; jan <- if (dir == "Top") L$jan_top else L$jan_bot
+  data.table(direction = dir, ref = c("Heat shock / IEG", "Cell cycle", sprintf("January %s", dir)),
+             n = c(sum(g %in% hs_ieg), sum(g %in% L$cycling), sum(g %in% jan)),
+             genes = c(paste(intersect(g, hs_ieg), collapse = ", "), paste(intersect(g, L$cycling), collapse = ", "),
+                       paste(setdiff(g, jan), collapse = ", ")))
+}
+ov <- rbind(ovl("Top"), ovl("Bottom"))
+ov_n <- function(dir, r) ov[direction == dir & ref == r, n]
+cc_genes <- ov[direction == "Top" & ref == "Cell cycle", genes]
+cc_delta <- max(abs(ps[score == "panel_malignant_Top" & covariate == "Cycling"][order(sample), rho] -
+                    ps[score == "panel_malignant_Top_noCC" & covariate == "Cycling"][order(sample), rho]))
+top7 <- sets$new_malignant_Top; top7_hs <- intersect(top7, hs_ieg)
+stopifnot(all(top7 %in% sets$panel_malignant_Top))
+
+# Where stemness is high: per-section median by cell type, melanoma vs other per section
+ct_med <- d[, .(med = median(panel_malignant_Top), n = .N), by = .(sample, celltype)]
+pair <- d[celltype != "Unknown", .(med = median(panel_malignant_Top)), by = .(sample, group = ifelse(is_mel, "Melanoma cells", "Other annotated cells"))]
+pair_w <- dcast(pair, sample ~ group, value.var = "med")
+pair_p <- wilcox.test(pair_w[["Melanoma cells"]], pair_w[["Other annotated cells"]], paired = TRUE, exact = TRUE)$p.value
+
+# Colour caps for the spatial maps (global over all Boston cells, so the six maps share one scale)
+Q <- c(0.01, 0.99)
+stem_lim <- quantile(d$panel_malignant_Top, Q)
+cnv_hi <- quantile(mel$cnv_score, Q[2], na.rm = TRUE)
+
+# Spatial tabs: one templated child section per sample (chunk label = sample, so the figure files carry it),
+# height from the tissue aspect ratio. dpi 700 so the PNG carries the >= 4000 px per panel scattermore raster
+# (spatial_raster() in 14b_stemness_common.R); the page shows it capped at 1400 px, open the image to zoom.
+# Each map is also saved as manuscript panel Fig2g_spatial_<section> (PDF + 300 dpi PNG).
+tmpl <- c("### {{s}}", "", "```{r spatial_{{s}}, fig.width={{w}}, fig.height={{h}}, dpi=700, fig.retina=1}",
+          "save_panel(spatial_panel(\"{{s}}\"), \"Fig2g_spatial_{{s}}\", {{w}}, {{h}})", "```", "")
+spatial_child <- file.path(tempdir(), "spatial_child.Rmd")
+writeLines(unlist(lapply(samples$sample, function(s)
+  knitr::knit_expand(text = tmpl, s = s, w = spatial_width, h = d[sample == s, spatial_height(x, y)]))), spatial_child)
+spatial_panel <- function(s) {
+  f <- d[sample == s, .(x, y, celltype = celltype_atlas, stem = panel_malignant_Top, cnv = cnv_score)]
+  info <- samples[sample == s]
+  spatial_3panel(f, ct_cols_atlas, stem_lim, stem_title = "Stemness\nOctober panel-matched\nmalignant Top (50 genes)",
+                 cnv_scale = scale_colour_viridis_c(limits = c(0, cnv_hi), oob = scales::squish, na.value = "grey80",
+                                                    name = sprintf("CNV score\ncapped at\n%gth pct\n(grey = no CNV)", 100 * Q[2])),
+                 cnv_title = "CNV score\n(0 = non-melanoma cell)",
+                 title = sprintf("%s | %s | %s | best response %s, %s cells", s, info$tissue, info$timepoint, info$response,
+                                 format(nrow(f), big.mark = ",")), Q = Q)
+}
+lolli_b <- function(pairs, title) lolli(ps, pairs, title, samples$sample)
+```
+
+Victoria asked to repeat the spatial stemness analysis on the Boston/Sullivan Xenium samples with the new stemness signature from the October 2026 atlas (report 01b). This report mirrors report 14, restricted to the Boston cohort, scores with PLAID instead of UCell, and uses the October signature restricted to the Xenium panel, built the way the January one was.
+
+<style>
+.main-container img { max-width: min(100%, 1400px) !important; height: auto !important; display: block; margin: 0 auto; }
+.main-container .html-widget { max-width: 1400px; margin: 0 auto; }
+</style>
+
+# {.tabset}
+
+## Overview
+
+**Data.** `r nrow(samples)` Boston/Sullivan Xenium sections (`r sum(samples$tissue == "Liver")` liver, `r sum(samples$tissue == "Breast")` breast metastasis), `r format(nrow(d), big.mark = ",")` cells, of which `r format(nrow(mel), big.mark = ",")` are melanoma cells.
+
+**Signature.** The October malignant gene correlations (report 01b) restricted to the `r length(L$panel)`-gene panel; the 50 most positively correlated genes are the stemness (Top) set and the 50 most negatively correlated the differentiation (Bottom) set. `r ov_n("Top", "January Top")` of the 50 Top and `r ov_n("Bottom", "January Bottom")` of the 50 Bottom genes are also in the January signature. `r ov_n("Top", "Heat shock / IEG")` Top genes are heat-shock or immediate-early genes and `r ov_n("Top", "Cell cycle")` is a cell-cycle gene (`r cc_genes`); no Bottom gene is in either set.
+
+**Where stemness is high.** In melanoma cells: median Top score `r sprintf("%.2f", median(mel$panel_malignant_Top))` against `r sprintf("%.2f", d[is_mel == FALSE & celltype != "Unknown", median(panel_malignant_Top)])` in the other annotated cells, higher in melanoma cells in all `r sum(pair_w[["Melanoma cells"]] > pair_w[["Other annotated cells"]])` of `r nrow(pair_w)` sections (paired Wilcoxon on per-section medians p = `r signif(pair_p, 2)`, the smallest p possible with 6 pairs). In space it follows the tumour regions.
+
+**Correlations in melanoma cells** (median of the 6 per-section cell-level Spearman rho, range in brackets):
+
+- Genes detected per cell (nFeature): `r fmt_r("panel_malignant_Top", "nFeature")`
+- Heat shock / IEG: `r fmt_r("panel_malignant_Top", "HeatShock_IEG")`; without the `r n_top["panel_malignant_Top"] - n_top["panel_malignant_Top_noHS"]` shared genes: `r fmt_r("panel_malignant_Top_noHS", "HeatShock_IEG")`
+- Cycling: `r fmt_r("panel_malignant_Top", "Cycling")`
+- CNV (per-cell RMS): `r fmt_r("panel_malignant_Top", "cnv_rms")`; Top - Bottom vs CNV: `r fmt_r("panel_malignant_TmB", "cnv_rms")`. Pearson r, as in the manuscript figure: `r cnv_pr_txt`
+
+**Caveat that changes interpretation.** The strongest correlate of the Top score is the number of genes detected per cell, not cycling or CNV. Top - Bottom depends less on detection (`r fmt_r("panel_malignant_TmB", "nFeature")`). A Top score made of broadly expressed genes rises with how much of each cell was captured, so cell-to-cell differences in it are partly cell size and segmentation. The October panel-matched and the January signature share most genes and their scores agree almost perfectly (rho `r fmt_r("jan_malignant_Top", "panel_malignant_Top")`), so on this panel the October signature largely restates the January one.
+
+## Signature {.tabset}
+
+### Genes
+
+```{r signature-genes, fig.width=14, fig.height=10}
+sg <- copy(psig)
+sg[, class := fifelse(gene %in% hs_ieg, "Heat shock / IEG", fifelse(gene %in% L$cycling, "Cell cycle", "Other"))]
+sg[, jan := gene %in% c(L$jan_top, L$jan_bot)]
+sg[, gene_lab := paste0(gene, ifelse(jan, "", " *"))]
+sg[, gene_lab := factor(gene_lab, levels = gene_lab[order(correlation)])]
+sg[, direction := factor(direction, levels = c("Top", "Bottom"))]
+ggplot(sg, aes(correlation, gene_lab, colour = class)) + geom_vline(xintercept = 0, colour = "grey60") +
+  geom_segment(aes(x = 0, xend = correlation, yend = gene_lab), colour = "grey75") + geom_point(size = 2.5) +
+  facet_wrap(~direction, scales = "free") +
+  scale_colour_manual(values = c("Heat shock / IEG" = "#DE4968", "Cell cycle" = "#325A9B", "Other" = "grey35"), name = NULL) +
+  theme_bw(base_size = 10) + theme(legend.position = "bottom") +
+  labs(x = "Pearson r with CytoTRACE2 score in malignant cells (October atlas, report 01b)", y = NULL,
+       title = "October panel-matched malignant signature: top and bottom 50 panel genes",
+       subtitle = "* = not in the January signature")
+```
+
+```{r signature-overlap-table, results='asis'}
+knitr::kable(ov[, .(Set = direction, `Compared with` = ref, `Genes shared` = n,
+                    Genes = fifelse(grepl("January", ref), paste("not in January:", genes), genes))],
+             format = "markdown") |> cat(sep = "\n")
+```
+
+The full list with correlations is `Outputs/CytoTRACE2_2026b/stemness_signature_malignant_xenium_panel_top50.csv`. The heat-shock / IEG reference set (`r length(hs_ieg)` genes) and the cell-cycle set (`r length(L$cycling)` genes) are listed in the Methods tab.
+
+## Score distributions
+
+```{r distributions, fig.width=14, fig.height=12}
+dl <- melt(d[, c("sample", "is_mel", prim_cols), with = FALSE], id.vars = c("sample", "is_mel"), variable.name = "score")
+dl[, score := factor(sapply(as.character(score), score_lab), levels = sapply(prim_cols, score_lab))]
+dl[, group := ifelse(is_mel, "Melanoma cells", "Other cells")]
+ggplot(dl, aes(value, fill = group)) + geom_histogram(bins = 60, alpha = 0.7, position = "identity") +
+  facet_grid(sample ~ score, scales = "free") + scale_fill_manual(values = c("Melanoma cells" = "#B00068", "Other cells" = "grey50"), name = NULL) +
+  theme_bw(base_size = 11) + theme(legend.position = "bottom", strip.text.y = element_text(size = 8)) +
+  labs(x = "PLAID score (mean z over the signature genes)", y = "Cells", title = "Primary signature scores per section")
+```
+
+## Spatial maps {.tabset}
+
+One tab per section: cell types, the primary stemness score and the CNV score on the same coordinates (the layout of report 19). Stemness colours are capped at the `r 100 * Q[1]`st and `r 100 * Q[2]`th percentile of all Boston cells (`r sprintf("%.2f to %.2f", stem_lim[1], stem_lim[2])`), and the CNV scale at the `r 100 * Q[2]`th percentile of melanoma cells (`r sprintf("%.4f", cnv_hi)`); values beyond the caps take the end colour. The CNV score is per CNV cluster of melanoma cells and 0 for every other cell; grey cells are absent from the CNV run. Each cell is one dot with a radius of `r formals(spatial_raster)$frac` times the median distance between neighbouring cell centres, so the section reads as filled and the closest neighbours overlap slightly; the images are rasterised at 4,000 pixels or more per panel, so open one in a new browser tab to zoom in to single cells.
+
+```{r spatial-child, child=spatial_child}
+```
+
+## Score by cell type {.tabset}
+
+### Primary signature
+
+```{r by-celltype, fig.width=13, fig.height=6}
+ggplot(d, aes(celltype, panel_malignant_Top, fill = celltype)) +
+  geom_violin(scale = "width", linewidth = 0.2) + geom_boxplot(width = 0.12, fill = "white", outlier.shape = NA) +
+  scale_fill_manual(values = ct_cols, guide = "none") + theme_bw(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 40, hjust = 1)) +
+  labs(x = NULL, y = "PLAID score", title = lab_top, subtitle = "All six sections pooled, cell-level distribution")
+```
+
+```{r by-celltype-sample, fig.width=11, fig.height=6.5}
+ggplot(ct_med, aes(sample, celltype, fill = med)) + geom_tile(colour = "white") +
+  geom_text(aes(label = sprintf("%.2f", med)), size = 3) +
+  scale_fill_gradient2(low = "#325A9B", mid = "white", high = "#B00068", midpoint = 0, name = "Median\nscore") +
+  scale_y_discrete(limits = rev) + theme_bw(base_size = 11) + theme(axis.text.x = element_text(angle = 30, hjust = 1)) +
+  labs(x = NULL, y = NULL, title = "Median primary Top score per cell type and section")
+```
+
+### Melanoma vs other cells, per section
+
+```{r mel-vs-other, fig.width=6, fig.height=6}
+ggplot(pair, aes(group, med)) + geom_boxplot(outlier.shape = NA, width = 0.5, fill = "grey95") +
+  geom_line(aes(group = sample), colour = "grey60") + geom_point(aes(colour = sample), size = 3) +
+  geom_signif(comparisons = list(c("Melanoma cells", "Other annotated cells")), test = "wilcox.test",
+              test.args = list(paired = TRUE, exact = TRUE), tip_length = 0.01,
+              map_signif_level = function(p) sprintf("%s  p = %.3g", ifelse(p < 0.001, "***", ifelse(p < 0.01, "**", ifelse(p < 0.05, "*", "ns"))), p)) +
+  scale_colour_brewer(palette = "Dark2", name = NULL) + theme_bw(base_size = 12) + theme(legend.position = "bottom") +
+  guides(colour = guide_legend(ncol = 2)) +
+  labs(x = NULL, y = "Median primary Top score per section", title = "Melanoma vs other cells (n = 6 sections)",
+       subtitle = "Paired Wilcoxon; 0.031 is the smallest p six pairs can give")
+```
+
+## Stemness vs cycling
+
+The Top set shares `r ov_n("Top", "Cell cycle")` gene with the cell-cycle set (`r cc_genes`); removing it changes the per-section correlation by at most `r sprintf("%.2f", cc_delta)`.
+
+```{r vs-cycling, fig.width=14, fig.height=8.5}
+hex_by_sample(mel, "panel_malignant_Top", "Cycling", lab_top, sprintf("Cycling score (PLAID, %d genes)", n_top["Cycling"]),
+              "Stemness vs cycling in melanoma cells")
+```
+
+```{r vs-cycling-lolli, fig.width=12, fig.height=4.5}
+lolli_b(data.table(score = prim_cols, covariate = "Cycling", label = c("Top vs cycling", "Bottom vs cycling", "Top - Bottom vs cycling")),
+        "Per-section correlation with the cycling score, melanoma cells")
+```
+
+## Stemness vs heat shock
+
+`r ov_n("Top", "Heat shock / IEG")` of the 50 Top genes are themselves in the heat-shock / IEG set (`r ov[direction == "Top" & ref == "Heat shock / IEG", genes]`), so part of this correlation is genes correlating with themselves; the middle panel removes them from the stemness set.
+
+```{r vs-heatshock, fig.width=14, fig.height=8.5}
+hex_by_sample(mel, "panel_malignant_Top", "HeatShock_IEG", lab_top, sprintf("Heat shock / IEG score (PLAID, %d genes)", n_top["HeatShock_IEG"]),
+              "Stemness vs heat shock / immediate-early genes in melanoma cells")
+```
+
+```{r vs-heatshock-lolli, fig.width=12, fig.height=4.5}
+lolli_b(data.table(score = c("panel_malignant_Top", "panel_malignant_Top_noHS", "panel_malignant_TmB"), covariate = "HeatShock_IEG",
+                   label = c("Top (50 genes) vs heat shock", sprintf("Top without shared genes (%d) vs heat shock", n_top["panel_malignant_Top_noHS"]),
+                             "Top - Bottom vs heat shock")),
+        "Per-section correlation with the heat-shock / IEG score, melanoma cells")
+```
+
+## Stemness vs gene detection
+
+```{r vs-nfeature, fig.width=14, fig.height=8.5}
+hex_by_sample(mel, "nFeature", "panel_malignant_Top", "Genes detected per cell (nFeature_Xenium)", lab_top,
+              "Stemness vs genes detected per cell in melanoma cells")
+```
+
+```{r vs-nfeature-lolli, fig.width=12, fig.height=4.5}
+lolli_b(data.table(score = prim_cols, covariate = "nFeature", label = c("Top vs nFeature", "Bottom vs nFeature", "Top - Bottom vs nFeature")),
+        "Per-section correlation with genes detected per cell, melanoma cells")
+```
+
+The Top genes are broadly expressed, so the Top score picks up more counts in cells where more is detected; Top - Bottom cancels part of this.
+
+## Stemness vs CNV
+
+```{r vs-cnv, fig.width=14, fig.height=10}
+save_panel(stem_cnv_scatter(mel[!is.na(cnv_jan), .(sample, stem = panel_malignant_Top, cnv_rms = cnv_jan)], lab_top,
+                           ylab = "CNV score (per-cell RMS, January InSituCNV run, no smoothing)"), "Fig2h_stemness_vs_cnv_boston", 14, 10)
+jan_cnv_r_txt <- mel[!is.na(cnv_jan), .(r = cor(panel_malignant_Top, cnv_jan)), by = sample][, sprintf("%.2f to %.2f", min(r), max(r))]
+n_mel_jan <- mel[!is.na(cnv_jan), .N]
+```
+
+One point per melanoma cell with a January CNV value (`r format(n_mel_jan, big.mark = ",")` of `r format(nrow(mel), big.mark = ",")`), black line = linear fit with 95% band, Pearson r per section (`r jan_cnv_r_txt`). **CNV = the January InSituCNV run without neighbour smoothing** (per-cell RMS from report 18, 2026-01-31), the CNV of the submitted Fig. 2h, as Victoria asked on 2026-10-20; stemness = the October panel-matched signature, as in the maps.
+
+**Caveat.** The January per-cell CNV score follows genes detected per cell (r 0.92-0.96, also in non-melanoma cells), and so does the stemness score; adjusted for genes detected the correlation is 0.03-0.17. With the smoothed rerun of 2026-02-05 (used everywhere else in this report) r is `r cnv_pr_txt` (`fig2h_correlation_decomposition.csv`).
+
+## Other signatures {.tabset}
+
+The October signatures as published by 01b are the genome-wide top / bottom 50 genes, and most of them are not on the Xenium panel: the malignant one keeps only `r n_top["new_malignant_Top"]` of 50 Top genes (`r paste(top7, collapse = ", ")`, `r length(top7_hs)` of them heat-shock / IEG genes), all of which are also the first `r length(top7)` genes of the panel-matched Top set. Those scores and the January score are shown here for comparison only.
+
+### Panel coverage
+
+```{r coverage, fig.width=10, fig.height=5}
+cv <- copy(L$coverage)
+cv[, sig := factor(c(malignant = "October malignant", healthy_melanocyte = "October healthy melanocyte",
+                     all_cells = "October all cells", january_malignant = "January malignant (report 14)")[signature],
+                   levels = rev(c("October malignant", "October healthy melanocyte", "October all cells", "January malignant (report 14)")))]
+ggplot(cv, aes(n_on_panel, sig, fill = direction)) +
+  geom_col(position = position_dodge(0.8), width = 0.75) +
+  geom_text(aes(label = sprintf("%d / %d", n_on_panel, n_signature)), position = position_dodge(0.8), hjust = -0.15, size = 3.6) +
+  scale_fill_manual(values = c(Top = "#B00068", Bottom = "#325A9B"), name = NULL) +
+  coord_cartesian(xlim = c(0, 58)) + theme_bw(base_size = 12) +
+  labs(x = "Signature genes on the Xenium panel", y = NULL, title = "Genome-wide signature genes on the 5,000-gene Xenium panel",
+       subtitle = "The October panel-matched signature is 50 / 50 by construction, like the January one")
+```
+
+### Gene overlap with January
+
+```{r venn-fn, include=FALSE}
+# venn2_interactive(): copied from p41080_Philipp_PatchSeq/analysis/_config.R (hover a region for its genes)
+venn2_interactive <- function(sets, title, colors = c("#66C2A5", "#FC8D62"), width = 620, height = 480, max_hover = 60) {
+  only1 <- setdiff(sets[[1]], sets[[2]]); both <- intersect(sets[[1]], sets[[2]]); only2 <- setdiff(sets[[2]], sets[[1]])
+  hover_txt <- function(g, label) {
+    if (length(g) == 0) return(sprintf("%s: none", label))
+    extra <- if (length(g) > max_hover) sprintf("<br>... +%d more", length(g) - max_hover) else ""
+    sprintf("<b>%s (%d)</b><br>%s%s", label, length(g), paste(utils::head(sort(g), max_hover), collapse = "<br>"), extra)
+  }
+  regions <- data.frame(x = c(-0.55, 0, 0.55), y = 0, n = c(length(only1), length(both), length(only2)),
+                        txt = c(hover_txt(only1, paste(names(sets)[1], "only")), hover_txt(both, "shared"),
+                                hover_txt(only2, paste(names(sets)[2], "only"))))
+  circ <- function(x0, col) list(type = "circle", xref = "x", yref = "y", x0 = x0 - 0.85, x1 = x0 + 0.85, y0 = -0.85, y1 = 0.85,
+                                 line = list(color = col, width = 2), fillcolor = col, opacity = 0.25)
+  plotly::plot_ly(regions, x = ~x, y = ~y, type = "scatter", mode = "markers+text", text = ~n, textfont = list(size = 22),
+                  hovertext = ~txt, hoverinfo = "text", marker = list(size = 70, opacity = 0), width = width, height = height) |>
+    plotly::layout(title = list(text = title), shapes = list(circ(-0.45, colors[1]), circ(0.45, colors[2])),
+                   annotations = list(list(x = -0.9, y = 1.0, text = names(sets)[1], showarrow = FALSE, font = list(color = colors[1], size = 14)),
+                                      list(x = 0.9, y = 1.0, text = names(sets)[2], showarrow = FALSE, font = list(color = colors[2], size = 14))),
+                   xaxis = list(visible = FALSE, range = c(-1.8, 1.8)), yaxis = list(visible = FALSE, range = c(-1.3, 1.4), scaleanchor = "x"),
+                   hoverlabel = list(align = "left"), showlegend = FALSE)
+}
+venn_sets <- list(Top = list(`January Top` = L$jan_top, `October panel Top` = sets$panel_malignant_Top),
+                  Bottom = list(`January Bottom` = L$jan_bot, `October panel Bottom` = sets$panel_malignant_Bottom))
+```
+
+Hover a region to see its genes. Both are top / bottom 50 panel genes, from the January and the October atlas correlations.
+
+```{r venn, fig.width=6, fig.height=5}
+htmltools::tagList(venn2_interactive(venn_sets$Top, "Stemness (Top) genes"),
+                   venn2_interactive(venn_sets$Bottom, "Differentiation (Bottom) genes", colors = c("#8DA0CB", "#E78AC3")))
+```
+
+```{r venn-static, fig.width=12, fig.height=5, fig.show='hide'}
+venn_static <- function(s, title) {
+  x <- data.table(region = c(paste(names(s)[1], "only"), "shared", paste(names(s)[2], "only")),
+                  n = c(length(setdiff(s[[1]], s[[2]])), length(intersect(s[[1]], s[[2]])), length(setdiff(s[[2]], s[[1]]))))
+  ggplot(x, aes(factor(region, levels = region), n)) + geom_col(fill = "grey60") + geom_text(aes(label = n), vjust = -0.3) +
+    theme_bw() + labs(x = NULL, y = "Genes", title = title)
+}
+venn_static(venn_sets$Top, "Top genes") | venn_static(venn_sets$Bottom, "Bottom genes")
+```
+
+### Per-cell agreement
+
+```{r agreement-lolli, fig.width=12, fig.height=4.5}
+lolli_b(data.table(score = c("jan_malignant_Top", "new_malignant_Top", "jan_malignant_TmB"), covariate = "panel_malignant_Top",
+                   label = c("January Top (50 genes)", sprintf("October genome-wide Top (%d genes)", n_top["new_malignant_Top"]), "January Top - Bottom")),
+        "Per-section correlation with the primary Top score, melanoma cells")
+```
+
+Against the January UCell score stored by report 14 the per-section rho is `r sprintf("%.2f to %.2f", min(jan_ucell_rho$rho), max(jan_ucell_rho$rho))`.
+
+### All scores and covariates
+
+```{r rho-heatmap, fig.width=12, fig.height=7.5}
+hm_cols <- c(prim_cols, cmp_cols)
+hm <- ps_med[score %in% hm_cols]
+hm[, score := factor(sapply(score, score_lab), levels = rev(sapply(hm_cols, score_lab)))]
+hm[, covariate := factor(cov_cols[covariate], levels = cov_cols)]
+ggplot(hm, aes(covariate, score, fill = med)) + geom_tile(colour = "white") +
+  geom_text(aes(label = sprintf("%.2f\n[%.2f, %.2f]", med, lo, hi)), size = 2.8) +
+  scale_fill_gradient2(low = "#325A9B", mid = "white", high = "#B00068", midpoint = 0, limits = c(-1, 1), name = "Median rho") +
+  theme_bw(base_size = 11) + theme(axis.text.x = element_text(angle = 25, hjust = 1)) +
+  labs(x = NULL, y = NULL, title = "Correlation of every score with the covariates, melanoma cells",
+       subtitle = "Median of the six per-section cell-level Spearman rho, [min, max] across sections")
+```
+
+## Methods
+
+- **Primary signature.** October 2026 atlas, report `01b_CytoTRACE2_2026b.Rmd`: Pearson correlation of the CytoTRACE2 score with log1p(CP10k) expression within malignant cells, genes detected in at least 1% of them (`Outputs/CytoTRACE2_2026b/gene_cor_malignant.csv`). Restricted to the `r length(L$panel)` panel genes (`r format(nrow(fread(file.path(stemness_sig_dir, "gene_cor_malignant.csv"))[gene %in% L$panel]), big.mark = ",")` of them in the table), the 50 most positive = Top (stemness), the 50 most negative = Bottom (differentiation). Saved as `Outputs/CytoTRACE2_2026b/stemness_signature_malignant_xenium_panel_top50.csv`. This is how report 14's January signature was made: applying the same rule to the January correlations (`cytotrace2_malignant_gene_correlations.csv`) reproduces its Top and Bottom files exactly (genes, order and values); no other filter was used. The Boston and pUM26 panels are identical.
+- **Comparison signatures.** October genome-wide top / bottom 50 (`stemness_signature_{malignant,healthy_melanocyte,all_cells}_top50.csv`), scored on the genes present on the panel; January signature of report 14 (copy in `Outputs/Xenium_Stemness_Boston_2026b/inputs/`).
+- **Scoring.** PLAID (`plaid_score.R`, the fast scorer of spatial-scribe): log1p(CP10k) of the raw Xenium counts, each gene z-scored across all `r format(nrow(d), big.mark = ",")` Boston cells, score = mean z over the set's genes. All sets in one call, so all scores share the same reference pool. Because the z-scores are pooled across sections, differences between sections include slide and tissue effects (two slides; five liver, one breast).
+- **Reference sets.** Cell cycle: Seurat `cc.genes` and `cc.genes.updated.2019` S + G2M genes (`r length(L$cycling)`, `r n_top["Cycling"]` on panel). Heat shock / immediate-early (`r length(hs_ieg)`, `r n_top["HeatShock_IEG"]` on panel), chaperones: `r paste(L$heat_shock, collapse = ", ")`; immediate-early / dissociation-stress genes after van den Brink et al. 2017: `r paste(L$ieg, collapse = ", ")`.
+- **Cells and cell types.** Boston cohort `merged_xenium_all_samples.qs2` as saved with scores by report 14 (`xenium_Boston_Sullivan_with_scores.qs2`, same `r format(nrow(d), big.mark = ",")` cells and counts); cell types are report 14's `CellType_Display` (RCTD labels merged to the atlas categories; Unknown = no RCTD label).
+- **CNV.** `06_InSituCNV_Outputs/cnv_scores_09method_all_samples.csv` (Boston cohort), joined on section + barcode: per-CNV-cluster mean |CNV| for melanoma cells, 0 for all other cells; `r format(sum(is.na(d$cnv_score)), big.mark = ",")` cells absent from the CNV run are grey on the maps. Correlations use the per-cell RMS, sqrt(mean(X_cnv^2)) over all CNV windows of the same InSituCNV h5ads (`UM_Atlas/14d_cnv_rms_per_cell.py`, cache `Outputs/Xenium_Stemness_Boston_2026b/cnv_rms_per_cell.csv`, joined on section + barcode). Positive control: averaged per CNV cluster it correlates with the per-cluster score at Pearson r = `r sprintf("%.3f", rms_ctrl_r)` (`r nrow(rms_ctrl)` clusters).
+- **Statistics.** Correlations are Spearman, computed per section on cells (cell-level, so they describe co-variation across cells within a section, not a patient-level effect) and summarised as the median and range of the six per-section values. The melanoma vs other comparison uses one median per section (paired Wilcoxon, n = 6).
+- Scripts: `UM_Atlas/14b_score_xenium_boston_2026b.R`, `UM_Atlas/14d_cnv_rms_per_cell.py`, gene sets and figure helpers `UM_Atlas/14b_stemness_common.R`; cache `Outputs/Xenium_Stemness_Boston_2026b/boston_scores_2026b.qs2`; figures (PNG + PDF) in `Figures_2026b/Xenium_Stemness_Boston/`, manuscript panels (Fig2g maps, Fig2h scatter; PDF + 300 dpi PNG) in `Figures_2026b/Manuscript_panels/`.
+
+## Session Info
+
+```{r session-info}
+sessionInfo()
+```

@@ -1,0 +1,367 @@
+---
+title: "UM Atlas - 3CA Cancer Metaprograms in Melanoma Cells and Melanocytes (October 2026 atlas)"
+output:
+  html_document:
+    self_contained: true
+    includes:
+      in_header: !expr system.file("templates/fgcz_header.html", package = "ezRun", lib.loc = .libPaths())
+    css: !expr system.file("templates/fgcz.css", package = "ezRun", lib.loc = .libPaths())
+    code_folding: hide
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+# Re-run of 02_Cancer_Metaprograms_Analysis.Rmd (January object) on the October 2026 atlas, restructured around the
+# groupings the Levesque lab asked for. Scores: UCell (score_3CA_ucell_2026b.R, as the submission and the manuscript panels;
+# Mauro 2026-10-27 asked to keep UCell). The PLAID scores of 02b_score_3CA_2026b.R are the cross-check in Methods. No Seurat object is loaded here. Every chunk figure is also written as PDF + 300 dpi PNG to
+# Figures_2026b/Metaprograms_3CA/, named after its chunk.
+FIG <- "../Figures_2026b/Metaprograms_3CA/"
+knitr::opts_chunk$set(dev = c("png", "cairo_pdf"), dpi = 300, fig.path = FIG)
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, comment = "", fig.width = 12, fig.height = 6)
+suppressPackageStartupMessages({
+  library(data.table); library(tidyverse); library(patchwork); library(ggsignif); library(ComplexHeatmap); library(circlize)
+})
+source("config_colors_2026b.R")
+
+VA  <- ".."
+OUT <- file.path(VA, "Outputs/Metaprograms_3CA_2026b")
+ORIGINS <- c("non-malignant", "primary", "metastasis")
+LOCS <- c("choroid", "iris", "ciliary body", "ciliochoroidal")
+MIN_CELLS <- 20   # a patient unit with fewer cells is left out of the statistics
+
+cells <- qs2::qs_read(file.path(OUT, "ucell_3CA_scores_per_cell.qs2"), nthreads = 1)
+agree <- fread(file.path(OUT, "ucell_vs_plaid_spearman.csv"))   # per-program cell-level Spearman, UCell vs PLAID
+cover <- fread(file.path(OUT, "mp_gene_coverage.csv"))
+mps <- cover$MP
+stopifnot(length(mps) == 67, all(mps %in% names(cells)), !anyNA(cells[, ..mps]),
+          "not UCell scores (outside 0-1)" = all(sapply(mps, function(m) all(cells[[m]] >= 0 & cells[[m]] <= 1))))
+cells[, origin := factor(origin, levels = ORIGINS)]
+stopifnot("origin level not in ORIGINS" = !anyNA(cells$origin),
+          "melanocytes outside non-malignant samples" = all(cells[majority_celltype == "Melanocytes", origin] == "non-malignant"),
+          "melanoma cells in non-malignant samples" = all(cells[majority_celltype == "Melanoma cells", origin] != "non-malignant"),
+          "Melanoma cells != iCNV Malignant" = all((cells$majority_celltype == "Melanoma cells") == (cells$Malignant == "Malignant")))
+short <- setNames(sub(" .*", "", mps), mps)
+requested <- mps[short %in% c("MP6", "MP9", "MP17", "MP45")]
+stopifnot(length(requested) == 4)
+
+# Patient units: cells averaged per patient within a group. Repeat libraries of one tumour pool into their patient;
+# a patient with a tumour and its adjacent normal gives one melanocyte unit and one tumour unit.
+unit_means <- function(by, d = cells) {
+  u <- d[, c(list(n_cells = .N), lapply(.SD, mean)), by = by, .SDcols = mps]
+  list(kept = u[n_cells >= MIN_CELLS], dropped = u[n_cells < MIN_CELLS])
+}
+pat_all <- unit_means(c("Patient_nr", "origin", "secondary_mutation", "primary_location", "primary_mutation"))
+stopifnot("a patient has two metadata values within one origin" =
+            nrow(rbind(pat_all$kept, pat_all$dropped)) == uniqueN(cells[, .(Patient_nr, origin)]))
+pat <- pat_all$kept
+prim <- pat[origin == "primary"]
+# P38 has a non-malignant iris AND a ciliary-body sample, so the healthy-location unit is patient x location.
+hloc <- unit_means(c("Patient_nr", "healthy_location"), cells[origin == "non-malignant"])$kept
+
+signif_label <- function(p) sprintf("%s  p %s",
+  as.character(cut(p, c(-Inf, 0.001, 0.01, 0.05, Inf), c("***", "**", "*", "ns"))),
+  ifelse(p < 2.2e-16, "< 2.2e-16", paste("=", formatC(p, digits = 2, format = "g"))))
+stars <- function(q) as.character(cut(q, c(-Inf, 0.001, 0.01, 0.05, Inf), c("***", "**", "*", "")))
+fmt_p <- function(p) formatC(p, digits = 2, format = "g")
+nfmt <- function(x) format(x, big.mark = ",")
+wrap <- function(x, w = 28) stringr::str_wrap(x, w)
+cap_wrap <- function(x, w = 110) paste(strwrap(x, w), collapse = "\n")
+
+# All 67 programs on patient means: Kruskal-Wallis (Wilcoxon for 2 groups) over the groups with >= 3 patients, plus
+# every pairwise Wilcoxon; BH over the 67 programs within each test.
+screen <- function(df, grp, levels) {
+  df <- as.data.table(df)[get(grp) %in% levels]
+  n_by <- table(factor(df[[grp]], levels = levels)); lv <- names(n_by)[n_by >= 3]
+  stopifnot("fewer than 2 testable groups" = length(lv) >= 2)
+  g <- df[[grp]]
+  omni <- rbindlist(lapply(mps, function(m) {
+    x <- df[[m]][g %in% lv]; gg <- factor(g[g %in% lv], levels = lv)
+    data.table(MP = m, p = if (length(lv) > 2) kruskal.test(x, gg)$p.value else wilcox.test(x ~ gg)$p.value)
+  }))[, q := p.adjust(p, "BH")]
+  pw <- rbindlist(lapply(combn(lv, 2, simplify = FALSE), function(pr) rbindlist(lapply(mps, function(m) {
+    a <- df[[m]][g == pr[1]]; b <- df[[m]][g == pr[2]]
+    data.table(MP = m, group1 = pr[1], group2 = pr[2], n1 = length(a), n2 = length(b),
+               median1 = median(a), median2 = median(b), p = wilcox.test(a, b)$p.value)
+  }))))[, q := p.adjust(p, "BH"), by = .(group1, group2)]
+  med <- melt(df[, lapply(.SD, median), by = grp, .SDcols = mps], id.vars = grp, variable.name = "MP", value.name = "median")
+  list(omni = omni, pw = pw, med = med, n = n_by[n_by > 0], lv = lv, grp = grp)
+}
+s_org  <- screen(pat, "origin", ORIGINS)
+s_sec  <- screen(prim, "secondary_mutation", c("BAP1", "SF3B1", "EIF1AX"))
+s_secc <- screen(prim[primary_location == "choroid"], "secondary_mutation", c("BAP1", "SF3B1", "EIF1AX"))
+s_loc  <- screen(prim, "primary_location", LOCS)
+s_hloc <- screen(hloc, "healthy_location", LOCS)
+ntxt <- function(s) paste(sprintf("%s %d", names(s$n), as.integer(s$n)), collapse = ", ")
+tests <- rbindlist(list(
+  s_org$pw[, .(MP, test = sprintf("%s vs %s", group1, group2), p, q)],
+  s_sec$omni[, .(MP, test = "secondary mutation, all pUM", p, q)],
+  s_secc$omni[, .(MP, test = "secondary mutation, choroidal pUM", p, q)],
+  s_loc$omni[, .(MP, test = "location, pUM", p, q)],
+  s_hloc$omni[, .(MP, test = "location, non-malignant", p, q)]))
+test_n <- c(setNames(sprintf("%s vs %s (%d vs %d patients)", s_org$pw$group1, s_org$pw$group2, s_org$pw$n1, s_org$pw$n2),
+                     sprintf("%s vs %s", s_org$pw$group1, s_org$pw$group2))[!duplicated(s_org$pw[, paste(group1, group2)])],
+            "secondary mutation, all pUM" = sprintf("secondary mutation, all pUM (%s)", ntxt(s_sec)),
+            "secondary mutation, choroidal pUM" = sprintf("secondary mutation, choroidal pUM (%s)", ntxt(s_secc)),
+            "location, pUM" = sprintf("location, pUM (%s)", ntxt(s_loc)),
+            "location, non-malignant" = sprintf("location, non-malignant (%s)", ntxt(s_hloc)))
+test_n <- setNames(stringr::str_wrap(test_n, 15), names(test_n))   # 7 columns of ~1.4 in: wrap or the labels overlap
+n_sig <- tests[, .(n = sum(q < 0.05)), by = test][, setNames(n, test)]
+
+# Patient-level boxplots, one facet per program; Wilcoxon brackets only between groups with >= 3 patients.
+box_pat <- function(df, grp, levels, cols, sel, title, note = NULL, ncol = 3) {
+  df <- as.data.table(df)[get(grp) %in% levels]
+  levels <- levels[levels %in% df[[grp]]]
+  n_by <- table(factor(df[[grp]], levels = levels)); lv <- names(n_by)[n_by >= 3]; small <- names(n_by)[n_by < 3]
+  stopifnot(nrow(df) > 0)
+  long <- melt(df, id.vars = grp, measure.vars = sel, variable.name = "MP", value.name = "score")
+  long[, (grp) := factor(get(grp), levels = levels)][, MP := factor(MP, levels = sel)]
+  cap <- paste(c("One point per patient. Brackets: two-sided Wilcoxon on patient means, unadjusted.",
+                 if (length(small)) paste0("Not tested (< 3 patients): ", paste(small, collapse = ", "), "."), note), collapse = " ")
+  ggplot(long, aes(.data[[grp]], score, fill = .data[[grp]])) +
+    geom_boxplot(outlier.shape = NA, alpha = 0.6) + geom_jitter(width = 0.12, height = 0, size = 1.6) +
+    {if (length(lv) >= 2) geom_signif(comparisons = combn(lv, 2, simplify = FALSE), test = "wilcox.test",
+                                      map_signif_level = signif_label, step_increase = 0.12, tip_length = 0.01, textsize = 2.8)} +
+    facet_wrap(~ MP, scales = "free_y", ncol = ncol, labeller = as_labeller(function(x) wrap(x, 32))) +
+    scale_x_discrete(labels = setNames(sprintf("%s\n(n = %d)", names(n_by), as.integer(n_by)), names(n_by))) +
+    scale_y_continuous(expand = expansion(mult = c(0.05, 0.4))) + scale_fill_manual(values = cols) +
+    labs(title = title, x = NULL, y = "Mean UCell score per patient", caption = cap_wrap(cap, 130)) +
+    theme_minimal(base_size = 12) + theme(legend.position = "none", plot.caption = element_text(hjust = 0))
+}
+top_hits <- function(s, k = 6) s$omni[order(p), MP][1:k]
+
+umap <- fread(file.path(VA, "Outputs/CytoTRACE2_2026b/atlas_umap.csv.gz"))
+um <- merge(umap, cells, by = "cell")
+stopifnot("UMAP misses melanocytic cells" = nrow(um) == nrow(cells))
+um <- um[sample(.N)]
+
+n_cells <- nrow(cells); n_pat <- uniqueN(cells$Patient_nr); n_lib <- uniqueN(cells$Sample)
+n_mel <- cells[majority_celltype == "Melanocytes", .N]
+n_mal_p <- cells[majority_celltype == "Melanoma cells" & origin == "primary", .N]
+n_mal_m <- cells[majority_celltype == "Melanoma cells" & origin == "metastasis", .N]
+pat_n <- table(pat$origin)
+rq <- s_org$omni[MP %in% requested][match(requested, MP)]
+# Text built from the numbers, so no sentence can contradict the scores it describes.
+rq_txt <- function(ok) { r <- rq[(p < 0.05) == ok]
+  if (!nrow(r)) return(NULL)
+  sprintf("%s %s (Kruskal-Wallis %s)", paste(sprintf("%s %s", short[r$MP], sub("^MP[0-9]+ ", "", r$MP)), collapse = ", "),
+          if (ok) "differ by origin" else if (nrow(r) == 1) "does not" else "do not",
+          paste(sprintf("p = %s", fmt_p(r$p)), collapse = ", ")) }
+sig_txt <- function(tt) { n <- n_sig[[tt]]
+  if (n == 0) "no program passes q < 0.05" else sprintf("%d of 67 program%s q < 0.05 (%s)", n, if (n == 1) " passes" else "s pass",
+                                                        paste(tests[test == tt & q < 0.05, MP], collapse = ", ")) }
+sec_minq <- c(all = min(s_sec$omni$q), choroid = min(s_secc$omni$q), loc = min(s_loc$omni$q), hloc = min(s_hloc$omni$q))
+n_side <- sum(agree$spearman_rho < 0.5)
+```
+
+Weizmann 3CA malignant metaprograms (67 programs) scored with UCell on the `r nfmt(n_cells)` melanoma cells and healthy melanocytes of the October 2026 atlas (`r n_lib` libraries, `r n_pat` patients). Every test is on patient means.
+
+<style>
+.main-container img { max-width: min(100%, 1400px) !important; height: auto !important; display: block; margin: 0 auto; }
+.main-container .html-widget { max-width: 1400px; margin: 0 auto; }
+</style>
+
+# {.tabset}
+
+## Summary
+
+- **Cells:** `r nfmt(n_mel)` healthy melanocytes (`r pat_n[["non-malignant"]]` patients), `r nfmt(n_mal_p)` primary and `r nfmt(n_mal_m)` metastatic melanoma cells (`r pat_n[["primary"]]` and `r pat_n[["metastasis"]]` patients).
+- **Origin:** `r n_sig[["non-malignant vs primary"]]`, `r n_sig[["non-malignant vs metastasis"]]` and `r n_sig[["primary vs metastasis"]]` of 67 programs differ at q < 0.05 for melanocytes vs primary, melanocytes vs metastasis and primary vs metastasis.
+- **Requested programs:** `r paste(c(rq_txt(TRUE), rq_txt(FALSE)), collapse = "; ")`.
+- **Secondary mutation and intra-ocular location:** all pUM, `r sig_txt("secondary mutation, all pUM")`; choroidal pUM, `r sig_txt("secondary mutation, choroidal pUM")`; pUM location, `r sig_txt("location, pUM")`; non-malignant location, `r sig_txt("location, non-malignant")`. Smallest q values: `r fmt_p(sec_minq[["all"]])`, `r fmt_p(sec_minq[["choroid"]])`, `r fmt_p(sec_minq[["loc"]])` and `r fmt_p(sec_minq[["hloc"]])`.
+- **Scores:** UCell, as in the submission and the manuscript panels. The October report first used PLAID; per cell the two agree with a median Spearman rho of `r sprintf("%.2f", median(agree$spearman_rho))` over the 67 programs (`r n_side` below 0.5).
+
+```{r summary_heatmap, fig.width = 13, fig.height = 16}
+o <- s_org$omni[order(p), MP]
+d <- copy(tests)[, `:=`(MP = factor(MP, levels = rev(o)), test = factor(test, levels = names(test_n)))]
+ggplot(d, aes(test, MP, fill = pmin(-log10(q), 6))) + geom_tile(colour = "white") +
+  geom_text(aes(label = stars(q)), size = 3, vjust = 0.75) +
+  scale_fill_gradient(low = "white", high = "#B2182B", limits = c(0, 6), name = "-log10 q\n(capped at 6)") +
+  scale_x_discrete(labels = test_n, position = "top") +
+  labs(title = "Patient-level tests of the 67 programs per grouping", x = NULL, y = NULL,
+       caption = cap_wrap("Origin: pairwise Wilcoxon; other columns: Kruskal-Wallis over groups with >= 3 patients. q = BH over 67 programs within each column; * q < 0.05, ** < 0.01, *** < 0.001. Rows ordered by the origin test.", 150)) +
+  theme_minimal(base_size = 11) + theme(panel.grid = element_blank(), axis.text.x.top = element_text(size = 9),
+                                        plot.caption = element_text(hjust = 0), plot.margin = margin(5.5, 5.5, 5.5, 40))
+```
+
+## Melanoma Cells vs Melanocytes {.tabset}
+
+### Programs by Origin
+
+Median of the patient mean UCell scores per origin, for the 30 programs with the lowest Kruskal-Wallis p (colour scaled per program, so each row shows where that program is highest). Healthy vs malignant compares cell types as well as disease stages, and `r sum(table(pat$Patient_nr) > 1)` patients contribute both a melanocyte and a tumour unit.
+
+```{r origin_medians, fig.width = 9, fig.height = 10}
+top30 <- s_org$omni[order(p)][1:30]
+d <- s_org$med[MP %in% top30$MP][, `:=`(MP = factor(MP, levels = rev(top30$MP)), origin = factor(origin, levels = ORIGINS))]
+d[, rel := (median - min(median)) / max(1e-9, max(median) - min(median)), by = MP]   # per-program min-max: UCell levels differ by program
+ggplot(d, aes(origin, MP, fill = rel)) + geom_tile(colour = "white") +
+  geom_text(aes(label = sprintf("%.3f", median)), size = 3) +
+  scale_fill_gradient(low = "white", high = "#B2182B", limits = c(0, 1), breaks = c(0, 1), labels = c("lowest", "highest"),
+                      name = "within program") +
+  scale_x_discrete(labels = setNames(sprintf("%s\n(n = %d)", names(s_org$n), as.integer(s_org$n)), names(s_org$n)), position = "top") +
+  labs(x = NULL, y = NULL) + theme_minimal(base_size = 11) + theme(panel.grid = element_blank(), plot.margin = margin(5.5, 20, 5.5, 60))
+```
+
+### Top Programs
+
+```{r origin_box, fig.width = 13, fig.height = 9}
+box_pat(pat, "origin", ORIGINS, origin_colors, top_hits(s_org), "Six programs with the lowest Kruskal-Wallis p, by origin")
+```
+
+### UMAP
+
+```{r umap, fig.width = 15, fig.height = 10}
+umap_mp <- function(m) {
+  lim <- quantile(um[[m]], c(0.01, 0.99))
+  ggplot(um, aes(UMAP_1, UMAP_2, colour = .data[[m]])) + scattermore::geom_scattermore(pointsize = 1.6) +
+    scale_colour_viridis_c(option = "magma", limits = lim, oob = scales::squish, name = "UCell") +
+    labs(title = wrap(m, 30)) + theme_void(base_size = 11) + theme(aspect.ratio = 1)
+}
+p0 <- ggplot(um, aes(UMAP_1, UMAP_2, colour = origin)) + scattermore::geom_scattermore(pointsize = 1.6) +
+  scale_colour_manual(values = origin_colors, name = NULL) + guides(colour = guide_legend(override.aes = list(size = 4))) +
+  labs(title = "Origin") + theme_void(base_size = 11) + theme(aspect.ratio = 1)
+wrap_plots(c(list(p0), lapply(c(requested, setdiff(top_hits(s_org, 10), requested)[1]), umap_mp)), ncol = 3)
+```
+
+Atlas UMAP, melanocytic cells only; colour capped at each program's 1st and 99th percentile.
+
+## Requested Programs: MP6, MP9, MP17, MP45
+
+Healthy melanocytes vs primary vs metastatic UM for stress (MP6, MP9), EMT-III (MP17) and skin pigmentation (MP45).
+
+```{r requested_box, fig.width = 12, fig.height = 10}
+box_pat(pat, "origin", ORIGINS, origin_colors, requested, "Requested programs by origin, patient level", ncol = 2,
+        note = sprintf("Kruskal-Wallis p: %s.", paste(sprintf("%s %s", short[rq$MP], fmt_p(rq$p)), collapse = ", ")))
+```
+
+```{r requested_cells, fig.width = 12, fig.height = 4.5}
+long <- melt(cells[, c("origin", requested), with = FALSE], id.vars = "origin", variable.name = "MP", value.name = "score")
+ggplot(long, aes(origin, score, fill = origin)) +
+  geom_violin(scale = "width", linewidth = 0.2) + geom_boxplot(width = 0.12, outlier.shape = NA, fill = "white") +
+  facet_wrap(~ MP, scales = "free_y", nrow = 1, labeller = as_labeller(function(x) wrap(x, 24))) +
+  scale_fill_manual(values = origin_colors) +
+  labs(x = NULL, y = "UCell score per cell", caption = "Cell level, descriptive only (cells of one patient are not independent).") +
+  theme_minimal(base_size = 11) + theme(legend.position = "none", axis.text.x = element_text(angle = 30, hjust = 1),
+                                        plot.caption = element_text(hjust = 0))
+```
+
+## Secondary Mutation {.tabset}
+
+### All Primary UM
+
+Malignant cells of primary tumours; `none` (1 patient) and `unknown` are left out. Across the 67 programs `r sig_txt("secondary mutation, all pUM")`; the six lowest p are shown.
+
+```{r sec_all, fig.width = 13, fig.height = 9}
+hits_sec <- top_hits(s_sec)
+box_pat(prim, "secondary_mutation", c("BAP1", "SF3B1", "EIF1AX"), second_mutations_col, hits_sec,
+        "Secondary mutation, all primary UM", note = sprintf("Screen over 67 programs: lowest BH q = %s.", fmt_p(min(s_sec$omni$q))))
+```
+
+### Choroidal Primary UM
+
+The same programs in choroidal primaries only, which removes the location confound (iris primaries carry no SF3B1 or EIF1AX).
+
+```{r sec_choroid, fig.width = 13, fig.height = 9}
+box_pat(prim[primary_location == "choroid"], "secondary_mutation", c("BAP1", "SF3B1", "EIF1AX"), second_mutations_col, hits_sec,
+        "Secondary mutation, choroidal primary UM", note = sprintf("Screen over 67 programs: lowest BH q = %s.", fmt_p(min(s_secc$omni$q))))
+```
+
+```{r sec_concordance, fig.width = 7, fig.height = 6.5}
+st <- merge(s_sec$omni[, .(MP, p_all = p)], s_secc$omni[, .(MP, p_ch = p)], by = "MP")
+st[, lab := ifelse(rank(p_all) <= 6 | rank(p_ch) <= 4, short[MP], NA)]
+ggplot(st, aes(-log10(p_all), -log10(p_ch))) +
+  geom_hline(yintercept = -log10(0.05), linetype = 2, colour = "grey60") + geom_vline(xintercept = -log10(0.05), linetype = 2, colour = "grey60") +
+  geom_abline(colour = "grey80") + geom_point(size = 2.2, colour = "#1F867B") +
+  ggrepel::geom_text_repel(aes(label = lab), size = 3.4, na.rm = TRUE) +
+  labs(x = "-log10 p, all primary UM", y = "-log10 p, choroidal primary UM",
+       caption = "Kruskal-Wallis p per program (dashed: p = 0.05).") +
+  theme_minimal(base_size = 12) + theme(plot.caption = element_text(hjust = 0))
+```
+
+## Intra-Ocular Location {.tabset}
+
+### Primary UM
+
+Malignant cells of primary tumours by `primary_location` (ciliochoroidal has 1 patient). Location and secondary mutation overlap: the iris primaries are BAP1 or unknown.
+
+```{r loc_pum, fig.width = 13, fig.height = 9}
+box_pat(prim, "primary_location", LOCS, primary_location_colors, top_hits(s_loc), "Intra-ocular location, primary UM (six lowest p)",
+        note = sprintf("Screen over 67 programs: lowest BH q = %s.", fmt_p(min(s_loc$omni$q))))
+```
+
+### Non-Malignant Samples
+
+Healthy melanocytes by `healthy_location`. One unit per patient and location (P38 has an iris and a ciliary-body sample).
+
+```{r loc_healthy, fig.width = 13, fig.height = 9}
+box_pat(hloc, "healthy_location", LOCS, setNames(healthy_location_colors, sub("non-malignant ", "", names(healthy_location_colors))),
+        top_hits(s_hloc), "Location, healthy melanocytes (six lowest p)",
+        note = sprintf("Screen over 67 programs: lowest BH q = %s.", fmt_p(min(s_hloc$omni$q))))
+```
+
+## Patient Heterogeneity
+
+Patient mean UCell scores of the 20 programs that vary most between patient units (standard deviation of the `r nrow(pat)` unit means), shown as z within each program.
+
+```{r patient_heatmap, fig.width = 12, fig.height = 14}
+top20 <- names(sort(sapply(mps, function(m) sd(pat[[m]])), decreasing = TRUE))[1:20]
+hm <- scale(as.matrix(pat[, ..top20])); colnames(hm) <- short[top20]   # z of the patient means within each program
+rownames(hm) <- sprintf("%s %s", pat$Patient_nr, pat$origin)
+lim <- quantile(abs(hm), 0.98)
+draw(Heatmap(hm, name = "patient mean\nUCell, z per\nprogram", col = colorRamp2(c(-lim, 0, lim), c("#2166AC", "white", "#B2182B")),
+             row_names_gp = gpar(fontsize = 8), column_names_gp = gpar(fontsize = 10),
+             right_annotation = rowAnnotation(Origin = as.character(pat$origin), Secondary = ifelse(pat$origin == "non-malignant", "n/a", pat$secondary_mutation),
+                                              Location = ifelse(is.na(pat$primary_location), "n/a", pat$primary_location),
+                                              col = list(Origin = origin_colors, Secondary = c(second_mutations_col, "n/a" = "grey90"),
+                                                         Location = c(primary_location_colors, "n/a" = "grey90")))),
+     padding = unit(c(8, 2, 2, 12), "mm"))
+```
+
+`r paste(sprintf("%s = %s", short[top20], sub("^MP[0-9]+ ", "", top20)), collapse = "; ")`.
+
+## Methods
+
+```{r methods_counts, fig.width = 13, fig.height = 4}
+up <- cells[, .(cells = .N, patients = uniqueN(Patient_nr), libraries = uniqueN(Sample)), by = origin]
+up <- melt(up, id.vars = "origin", variable.name = "what", value.name = "n")
+p1 <- ggplot(up, aes(origin, n, fill = origin)) + geom_col(width = 0.7) + geom_text(aes(label = nfmt(n)), vjust = -0.4, size = 3.6) +
+  facet_wrap(~ what, scales = "free_y") + scale_fill_manual(values = origin_colors) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15)), labels = scales::comma) +
+  labs(title = "Input per origin", x = NULL, y = NULL) + theme_minimal(base_size = 11) +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 30, hjust = 1))
+p2 <- ggplot(cover[, .N, by = n_found], aes(factor(n_found), N)) + geom_col(fill = "#B00068", width = 0.7) +
+  geom_text(aes(label = N), vjust = -0.4, size = 3.6) + scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
+  labs(title = "Program genes found in the atlas", x = "genes found (of 50)", y = "programs") + theme_minimal(base_size = 11)
+p1 + p2 + plot_layout(widths = c(3, 1.4))
+```
+
+- **Data:** `final_Subtyping_iCNV_reclustered.qs2` (October 2026 reprocessing, 349,696 cells, 63 libraries, 45 patients). `majority_celltype` "Melanoma cells" (`r nfmt(n_mal_p + n_mal_m)` cells, identical to iCNV Malignant) and "Melanocytes" (`r nfmt(n_mel)` cells, all from non-malignant samples): `r nfmt(n_cells)` cells, `r n_pat` patients.
+- **Gene sets:** `Weizman_3CA_meta_programs_2025-01-29.xlsx`, sheet `Malignant`, 67 programs of 50 genes; genes absent from the atlas are skipped (fewest: `r cover[which.min(n_found), sprintf("%s, %d of 50", MP, n_found)]`).
+- **Scores:** UCell (`UCell::ScoreSignatures_UCell`, script `score_3CA_ucell_2026b.R`), with the settings of the January report and the submission (maxRank 1500, the package defaults): each program's genes are ranked within each cell, so the score (0 to 1) does not depend on normalisation. These are the scores behind the manuscript panels (Fig. 3, Suppl. Fig. 6). Cross-check: PLAID (mean z of the program genes, `02b_score_3CA_2026b.R`) on the same cells agrees per cell with a median Spearman rho of `r sprintf("%.2f", median(agree$spearman_rho))` (range `r sprintf("%.2f-%.2f", min(agree$spearman_rho), max(agree$spearman_rho))`); below 0.5: `r paste(agree[spearman_rho < 0.5, MP], collapse = ", ")`.
+- **Statistics:** the unit is the patient (`Patient_nr`). Cells are averaged per patient within each group; units with fewer than `r MIN_CELLS` cells are dropped (`r paste(sprintf("%s %s, %d cells", pat_all$dropped$Patient_nr, pat_all$dropped$origin, pat_all$dropped$n_cells), collapse = "; ")`). Two-sided Wilcoxon between two groups, Kruskal-Wallis across more, groups with fewer than 3 patients are not tested; BH over the 67 programs per test. Brackets on boxplots are unadjusted. Cell-level plots are descriptive.
+- **Changes from the January report:** the primary-mutation, organ, mutation x origin and treatment-stage tabs are dropped (not among the requested groupings; treatment groups have 1-8 patients); cell-level p-values, separate ridge / violin / dot-plot views and the "top programs by mean score" view are gone (the manuscript panels keep it, Suppl. Fig. 6a); `primary_location` replaces the case-inconsistent `LocationPrimaryTumor`.
+
+```{r export, results='asis'}
+fwrite(pat[, c("Patient_nr", "origin", "primary_mutation", "secondary_mutation", "primary_location", "n_cells", mps), with = FALSE],
+       file.path(OUT, "ucell_3CA_patient_means.csv"))
+fwrite(rbind(tests, s_loc$pw[, .(MP, test = sprintf("pUM location: %s vs %s", group1, group2), p, q)],
+             s_hloc$pw[, .(MP, test = sprintf("non-malignant location: %s vs %s", group1, group2), p, q)],
+             s_sec$pw[, .(MP, test = sprintf("secondary mutation all pUM: %s vs %s", group1, group2), p, q)],
+             s_secc$pw[, .(MP, test = sprintf("secondary mutation choroidal pUM: %s vs %s", group1, group2), p, q)],
+             s_org$omni[, .(MP, test = "origin, Kruskal-Wallis", p, q)]),
+       file.path(OUT, "ucell_3CA_patient_level_tests.csv"))
+percell <- file.path(OUT, "ucell_3CA_scores_per_cell.csv.gz")
+if (!file.exists(percell)) fwrite(cells[, c("cell", "orig.ident", "Sample", "Patient_nr", "majority_celltype", "origin",
+                                            "secondary_mutation", "primary_location", "healthy_location", mps), with = FALSE], percell)
+cat("Downloads: ", xfun::embed_file(file.path(OUT, "ucell_3CA_patient_means.csv"), text = "patient mean UCell scores (CSV)"), " | ",
+    xfun::embed_file(file.path(OUT, "ucell_3CA_patient_level_tests.csv"), text = "all patient-level tests, p and q (CSV)"),
+    ". Per-cell scores: `Outputs/Metaprograms_3CA_2026b/ucell_3CA_scores_per_cell.csv.gz`.\n", sep = "")
+```
+
+<details><summary>Session info</summary>
+
+```{r session_info}
+sessionInfo()
+```
+
+</details>
