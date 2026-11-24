@@ -1,0 +1,570 @@
+---
+title: "De novo metaprograms (NMF) of the UM atlas melanocytic cells"
+output:
+  html_document:
+    self_contained: true
+    includes:
+      in_header: !expr system.file("templates/fgcz_header.html", package = "ezRun", lib.loc = .libPaths())
+    css: !expr system.file("templates/fgcz.css", package = "ezRun", lib.loc = .libPaths())
+    code_folding: hide
+params:
+  gavish_3ca_xlsx: "../Weizman_3CA_meta_programs_2025-01-29.xlsx"
+  tebe_object: ""
+editor_options:
+  chunk_output_type: console
+---
+
+```{r script-info, include=FALSE}
+# This script was used to create the following figures:
+# Figure 4a: Jaccard similarity of the 242 robust NMF programs, ordered by metaprogram (MP)
+# Figure 4b: UMAPs of the nine MP scores (UCell)
+# Figure 4c: gene overlap of the MPs with the 3CA malignant metaprograms
+# Figure 4d: Hallmark and GO BP enrichment of the MPs
+# Figure 4e: patient-level MP scores in non-malignant melanocytes, primary tumors and metastases
+# Figure 4f, g: MP8 and MP6 in primary tumors with disomy 3 or monosomy 3
+# Supplementary Figure 7a: gene-set overlap between the nine MPs
+# Supplementary Figure 7b: effect sizes of the patient-level comparisons
+# Supplementary Figure 7c: highest-scoring MP before and on tebentafusp
+# Supplementary Figure 7d: per-cell MP scores before and on tebentafusp
+# Supplementary Table 4: top 50 genes of each MP
+# (Figure 4h and Supplementary Figure 7e are drug-response assays, not produced here.)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, comment = "")
+suppressPackageStartupMessages({
+  library(Seurat); library(ComplexHeatmap); library(circlize); library(clusterProfiler)
+  library(scattermore); library(data.table); library(dplyr); library(ggplot2)
+})
+source("colors_2026b.R")
+
+obj_file <- "../new_data_2026b/Objects/MelanocyteMelanoma/MelanomaMelanocyteSubset_Revision.qs2"
+U  <- "../Outputs/GeneNMF_2026b/highK_melanocytes"    # NMF units: 500 cells per sample
+J  <- "../Outputs/GeneNMF_2026b/highK_centered"       # NMF programs, MP genes, enrichment
+S  <- file.path(J, "17k")                             # UCell scores of all melanocytic cells
+TB <- "../Outputs/GeneNMF_2026b/17l_mp_tebe_xenium"   # UCell scores of the tebentafusp tumour cells
+umap_file <- "../Outputs/CytoTRACE2_2026b/atlas_umap.csv.gz"   # atlas UMAP (CytoTRACE2.Rmd)
+dir.create("figures", showWarnings = FALSE); dir.create("tables", showWarnings = FALSE)
+ncores <- as.integer(Sys.getenv("SLURM_CPUS_PER_TASK", "4"))
+qread <- function(f) qs2::qs_read(f, nthreads = 1); qsave <- function(x, f) qs2::qs_save(x, f, nthreads = 1)
+
+# NMF and Gavish et al. 2023 parameters (Methods)
+MIN_CELLS <- 100; N_SUB <- 500; KS <- c(8, 10, 12); NTOP <- 50
+INTRA_MIN <- 35; INTER_MIN <- 10; REDUND <- 10; CLUST_MIN <- 10; MIN_GROUP <- 5; MIN_SAMPLE_FRAC <- 0.10
+MP_NAMES <- c(MP1 = "Immediate-early stress response / AP-1", MP2 = "Developmental regulation",
+              MP3 = "Respiratory electron transport / OXPHOS", MP4 = "Mitotic cell cycle (G2/M)", MP5 = "OXPHOS / MYC targets",
+              MP6 = "Interferon response / antigen presentation", MP7 = "DNA replication (G1/S)",
+              MP8 = "Guidance / cell adhesion", MP9 = "Neural-associated signalling")
+mps <- names(MP_NAMES); lab <- setNames(paste(mps, MP_NAMES), mps)
+MP_COLS <- setNames(c("#762A83", "#1B7837", "#C51B7D", "#B8E186", "#8073AC", "#4D9221", "#F1B6DA", "#80CDC1", "#D6606D"), mps)
+nm_rgx <- "^RP[SL][0-9]|^RPLP|^MT-|^MRP[SL][0-9]"   # ribosomal and mitochondrial genes are never NMF features
+
+save_gg <- function(p, id, w, h) {
+  ggsave(file.path("figures", paste0(id, ".pdf")), p, width = w, height = h, device = cairo_pdf)
+  ggsave(file.path("figures", paste0(id, ".png")), p, width = w, height = h, dpi = 300, bg = "white")
+  file.path("figures", paste0(id, ".png"))
+}
+save_ht <- function(draw_fun, id, w, h) {   # heatmaps are built inside the device
+  png(file.path("figures", paste0(id, ".png")), width = w, height = h, units = "in", res = 300); draw_fun(); invisible(dev.off())
+  cairo_pdf(file.path("figures", paste0(id, ".pdf")), width = w, height = h); draw_fun(); invisible(dev.off())
+  file.path("figures", paste0(id, ".png"))
+}
+wrap_cap <- function(x, width_in) paste(strwrap(x, floor(11 * width_in)), collapse = "\n")
+nfmt <- function(x) formatC(x, format = "d", big.mark = ",")
+hfont <- list(row_names_max_width = max_text_width(lab, gp = gpar(fontsize = 15)), row_names_gp = gpar(fontsize = 15),
+              column_names_gp = gpar(fontsize = 15), column_title_gp = gpar(fontsize = 17, fontface = "bold"),
+              heatmap_legend_param = list(title_gp = gpar(fontsize = 14, fontface = "bold"), labels_gp = gpar(fontsize = 12)))
+```
+
+<style>
+.main-container img { max-width: min(100%, 1400px) !important; height: auto !important; display: block; margin: 0 auto; }
+</style>
+
+# {.tabset}
+
+## Overview
+
+```{r nmf}
+# NMF units: every orig.ident with >= 100 melanoma cells or healthy melanocytes, 500 cells drawn per unit
+units_file <- file.path(U, "per_sample_cell_counts.csv"); sl_file <- file.path(U, "sample_list.qs2")
+nmf_file <- file.path(J, "17j_nmf_programs.qs2")
+if (!file.exists(nmf_file) && !file.exists(sl_file)) {
+  o <- qread(obj_file); md <- o@meta.data; md$cell <- rownames(md)
+  md$group <- case_when(md$majority_celltype == "Melanoma cells" ~ "malignant", md$majority_celltype == "Melanocytes" ~ "healthy")
+  keep <- md$cell[!is.na(md$group)]
+  units <- md[keep, ] |> summarise(n_cells = n(), .by = c(group, origin, orig.ident, Patient_nr)) |> mutate(used = n_cells >= MIN_CELLS)
+  write.csv(units, units_file, row.names = FALSE)
+  o[["RNA"]] <- JoinLayers(o[["RNA"]]); cnt <- SeuratObject::LayerData(o, assay = "RNA", layer = "counts")[, keep]; rm(o)
+  set.seed(42)
+  sl <- lapply(setNames(nm = sort(units$orig.ident[units$used])), function(s) {
+    cells <- keep[md[keep, "orig.ident"] == s]
+    if (length(cells) > N_SUB) cells <- sample(cells, N_SUB)
+    CreateSeuratObject(cnt[, cells], meta.data = md[cells, ], min.cells = 0, min.features = 0)
+  })
+  qsave(sl, sl_file); rm(cnt, sl); invisible(gc())
+}
+units <- read.csv(units_file)
+samples <- sort(units$orig.ident[units$used])
+
+# per unit: 2,000 variable genes, scaled (centred) regressing percent.mt, negatives set to 0, NMF at k = 8, 10, 12
+if (!file.exists(nmf_file)) {
+  sl <- qread(sl_file)[samples]
+  res <- parallel::mclapply(samples, function(s) {
+    o <- NormalizeData(sl[[s]], verbose = FALSE)
+    o[["percent.mt"]] <- PercentageFeatureSet(o, pattern = "^MT-")
+    o <- FindVariableFeatures(o, selection.method = "vst", nfeatures = nrow(o), verbose = FALSE)
+    hv <- HVFInfo(o); hv <- hv[!grepl(nm_rgx, rownames(hv)), ]
+    hvg <- head(rownames(hv)[order(hv$variance.standardized, decreasing = TRUE)], 2000)
+    o <- ScaleData(o, features = hvg, vars.to.regress = "percent.mt", verbose = FALSE)
+    m <- as.matrix(LayerData(o, assay = "RNA", layer = "scale.data"))[hvg, ]
+    m[m < 0] <- 0; m <- m[rowSums(m) > 0, ]
+    progs <- list()
+    for (k in KS) {
+      fit <- RcppML::nmf(m, k = k, seed = 123, verbose = FALSE)
+      w <- fit@w; rownames(w) <- rownames(m)
+      for (i in seq_len(k)) {
+        wi <- sort(w[, i], decreasing = TRUE)[1:NTOP]
+        progs[[sprintf("%s.k%d.%d", s, k, i)]] <- tibble(gene = names(wi), weight = unname(wi) / sum(w[, i]))
+      }
+    }
+    list(programs = progs, hvg = hvg, n_cells = ncol(o))
+  }, mc.cores = min(ncores, length(samples)), mc.preschedule = FALSE)
+  names(res) <- samples
+  stopifnot("an NMF worker failed" = !any(vapply(res, function(r) is.null(r) || inherits(r, "try-error"), logical(1))))
+  qsave(res, nmf_file)
+}
+res <- qread(nmf_file)
+stopifnot(setequal(names(res), samples))
+```
+
+```{r metaprograms}
+# robust programs (Gavish et al. 2023): >= 35/50 genes shared with a program of another k in the same unit,
+# >= 10 with a program of another unit, and no redundancy within a unit (>= 10 shared genes, best recurrence kept)
+prog <- unlist(lapply(res, `[[`, "programs"), recursive = FALSE)
+names(prog) <- sub("^[^.]+\\.", "", names(prog))
+pg <- lapply(prog, `[[`, "gene")
+pinfo <- tibble(program = names(prog), orig.ident = sub("\\.k\\d+\\.\\d+$", "", names(prog)),
+                k = as.integer(sub(".*\\.k(\\d+)\\.\\d+$", "\\1", names(prog)))) |>
+  left_join(dplyr::select(units, orig.ident, group, Patient_nr), by = "orig.ident")
+allg <- unique(unlist(pg))
+inc <- Matrix::sparseMatrix(i = match(unlist(pg), allg), j = rep(seq_along(pg), lengths(pg)), x = 1,
+                            dims = c(length(allg), length(pg)), dimnames = list(allg, names(pg)))
+O <- as.matrix(Matrix::crossprod(inc))
+same_s <- outer(pinfo$orig.ident, pinfo$orig.ident, "=="); same_k <- outer(pinfo$k, pinfo$k, "==")
+pinfo$intra_max <- apply(O * (same_s & !same_k), 1, max)
+pinfo$inter_max <- apply(O * (!same_s), 1, max)
+pinfo$inter_sum <- rowSums((O >= INTER_MIN) & !same_s)
+cand <- pinfo$intra_max >= INTRA_MIN & pinfo$inter_max >= INTER_MIN
+keep <- rep(FALSE, nrow(pinfo))
+for (s in samples) {
+  idx <- which(pinfo$orig.ident == s & cand)
+  idx <- idx[order(-pinfo$inter_max[idx], -pinfo$inter_sum[idx])]
+  kept <- integer(0)
+  for (i in idx) if (!length(kept) || all(O[i, kept] < REDUND)) kept <- c(kept, i)
+  keep[kept] <- TRUE
+}
+pinfo$robust <- keep
+rob <- pinfo$program[pinfo$robust]; Or <- O[rob, rob]
+
+# greedy clustering (Gavish et al. 2023): seed = program with most partners (>= 10 shared genes, >= 5 partners);
+# add the program sharing most genes with the current MP genes while >= 10; MP genes = top 50 by recurrence
+mp_genes_of <- function(members) {
+  bind_rows(lapply(members, function(p) prog[[p]])) |> group_by(gene) |>
+    summarise(n = n(), mean_w = mean(weight), .groups = "drop") |> arrange(desc(n), desc(mean_w)) |>
+    mutate(recurrence = n / length(members)) |> head(NTOP)
+}
+remaining <- rob; clusters <- list()
+repeat {
+  if (length(remaining) < 2) break
+  Orr <- Or[remaining, remaining, drop = FALSE]; diag(Orr) <- 0
+  nsim <- rowSums(Orr >= CLUST_MIN)
+  if (max(nsim) < MIN_GROUP) break
+  members <- names(which.max(nsim)); genes <- prog[[members]]$gene
+  repeat {
+    cands <- setdiff(remaining, members)
+    if (!length(cands)) break
+    ov <- vapply(cands, function(p) length(intersect(pg[[p]], genes)), numeric(1))
+    if (max(ov) < CLUST_MIN) break
+    members <- c(members, cands[which.max(ov)]); genes <- mp_genes_of(members)$gene
+  }
+  clusters[[length(clusters) + 1]] <- members
+  remaining <- setdiff(remaining, members)
+}
+n_samp <- function(m) n_distinct(pinfo$orig.ident[match(m, pinfo$program)])
+clusters <- clusters[sapply(clusters, n_samp) >= ceiling(MIN_SAMPLE_FRAC * length(samples)) & lengths(clusters) >= 2]
+clusters <- clusters[order(-sapply(clusters, n_samp))]
+names(clusters) <- paste0("MP", seq_along(clusters))
+stopifnot(length(clusters) == length(mps))
+mpg <- lapply(clusters, mp_genes_of)
+genes <- lapply(mpg, `[[`, "gene")
+pinfo <- left_join(pinfo, bind_rows(lapply(mps, function(k) tibble(program = clusters[[k]], MP = k))), by = "program")
+mp_file <- file.path(J, "17j_mp_genes.csv")
+if (file.exists(mp_file)) { g0 <- read.csv(mp_file); stopifnot("MP genes differ from the cache" = identical(genes, split(g0$gene, g0$MP)[mps])) }
+gene_tab <- bind_rows(lapply(mps, function(k) mpg[[k]] |>
+  transmute(MP = k, label = MP_NAMES[[k]], rank = row_number(), gene, recurrence = round(recurrence, 3), mean_weight = signif(mean_w, 3))))
+write.csv(gene_tab, "tables/SuppTable4_MP_top50_genes.csv", row.names = FALSE)
+
+# over-representation per MP (Hallmark, GO BP); universe = genes variable in at least one unit
+enr_file <- file.path(J, "17j_mp_enrichment.csv")
+if (!file.exists(enr_file)) {
+  universe <- unique(unlist(lapply(res, `[[`, "hvg")))
+  msig <- function(...) msigdbr::msigdbr(species = "Homo sapiens", ...) |> dplyr::select(gs_name, gene_symbol)
+  gsets <- list(Hallmark = msig(collection = "H"), `GO BP` = msig(collection = "C5", subcollection = "GO:BP"))
+  enr <- bind_rows(lapply(mps, function(k) bind_rows(lapply(names(gsets), function(src) {
+    e <- enricher(genes[[k]], TERM2GENE = gsets[[src]], universe = universe, pvalueCutoff = 1, qvalueCutoff = 1, minGSSize = 5, maxGSSize = 1000)
+    if (is.null(e)) return(NULL)
+    as_tibble(e@result) |> transmute(MP = k, source = src, term = ID, GeneRatio, BgRatio, overlap = Count, p = pvalue, padj = p.adjust, genes = geneID)
+  }))))
+  write.csv(enr, enr_file, row.names = FALSE)
+}
+enr <- fread(enr_file)
+```
+
+```{r scores}
+# UCell (maxRank 1500) of the nine MPs on every melanoma cell and healthy melanocyte of the atlas
+cell_file <- file.path(S, "17k_cell_scores.qs2")
+if (!file.exists(cell_file)) {
+  o <- qread(obj_file); md <- o@meta.data
+  keep <- rownames(md)[md$majority_celltype %in% c("Melanoma cells", "Melanocytes")]
+  cnt <- SeuratObject::LayerData(o, assay = "RNA", layer = "counts")[, keep]; md <- md[keep, ]; rm(o); invisible(gc())
+  sc <- UCell::ScoreSignatures_UCell(cnt, features = genes, maxRank = 1500, ncores = ncores, chunk.size = 1000)
+  colnames(sc) <- sub("_UCell$", "", colnames(sc))
+  cols <- c("orig.ident", "Sample", "Patient_nr", "origin", "majority_celltype", "primary_location", "healthy_location",
+            "secondary_mutation", "primary_mutation", "Gender", "has_loss_chr3", "has_dupli_chr8")
+  cells <- data.frame(cell = rownames(md), md[, cols], sc[rownames(md), ], check.names = FALSE)
+  cells$group <- ifelse(cells$majority_celltype == "Melanoma cells", "malignant", "healthy")
+  dir.create(S, showWarnings = FALSE); qsave(cells, cell_file)
+}
+cells <- qread(cell_file)
+stopifnot(all(mps %in% names(cells)), all(cells$origin[cells$group == "healthy"] == "non-malignant"))
+```
+
+```{r tests}
+# unit = patient: library means, then the mean of a patient's libraries within a group; a healthy unit is
+# patient x location (one patient has melanocytes from two sites). Monosomy 3 / chr8 gain = >= 50% of tumour cells.
+lib <- cells |> group_by(group, Sample, Patient_nr, origin) |>
+  summarise(n_cells = n(), chr3_frac = mean(has_loss_chr3 >= 0.5, na.rm = TRUE), chr8_frac = mean(has_dupli_chr8 >= 0.5, na.rm = TRUE),
+            secondary_mutation = dplyr::first(secondary_mutation), primary_mutation = dplyr::first(primary_mutation), Gender = dplyr::first(Gender),
+            primary_location = dplyr::first(primary_location), healthy_location = dplyr::first(healthy_location),
+            across(all_of(mps), mean), .groups = "drop")
+pat <- lib |> group_by(group, Patient_nr, origin, healthy_location) |>
+  summarise(n_cells = sum(n_cells), across(c(chr3_frac, chr8_frac, all_of(mps)), mean),
+            across(c(secondary_mutation, primary_mutation, Gender, primary_location), ~ paste(sort(unique(.x)), collapse = "|")), .groups = "drop") |>
+  mutate(chr3 = ifelse(chr3_frac >= 0.5, "monosomy 3", "disomy 3"), chr8 = ifelse(chr8_frac >= 0.5, "chr8 gain", "no chr8 gain"),
+         origin3 = factor(dplyr::recode(origin, `non-malignant` = "healthy melanocytes"), levels = c("healthy melanocytes", "primary", "metastasis")))
+pat_o <- pat |> group_by(group, Patient_nr, origin3) |> summarise(across(all_of(mps), mean), .groups = "drop")   # one row per patient and group
+pum <- dplyr::filter(pat, origin == "primary"); tum <- dplyr::filter(pat, group == "malignant")
+
+two <- function(d, v, gcol, g1, g2, family, cmp) {
+  x1 <- d[[v]][d[[gcol]] == g1]; x2 <- d[[v]][d[[gcol]] == g2]
+  if (length(x1) < 2 || length(x2) < 2) return(NULL)
+  w <- suppressWarnings(wilcox.test(x2, x1))
+  tibble(var = v, family = family, comparison = cmp, test = "Wilcoxon", groups = sprintf("%s (n=%d) vs %s (n=%d)", g2, length(x2), g1, length(x1)),
+         effect_rb = unname(2 * w$statistic / (length(x1) * length(x2)) - 1), median_diff = median(x2) - median(x1), p = w$p.value)
+}
+kw <- function(d, v, gcol, lv, family) {
+  d <- d[d[[gcol]] %in% lv, ]
+  tibble(var = v, family = family, comparison = paste(family, "(omnibus)"), test = "Kruskal-Wallis",
+         groups = paste(sprintf("%s (n=%d)", lv, as.integer(table(factor(d[[gcol]], levels = lv)))), collapse = " / "),
+         p = kruskal.test(d[[v]], factor(d[[gcol]]))$p.value)
+}
+three <- function(d, v, gcol, lv, family) bind_rows(kw(d, v, gcol, lv, family),
+  two(d, v, gcol, lv[1], lv[2], family, sprintf("%s: %s vs %s", family, lv[2], lv[1])),
+  two(d, v, gcol, lv[1], lv[3], family, sprintf("%s: %s vs %s", family, lv[3], lv[1])),
+  two(d, v, gcol, lv[2], lv[3], family, sprintf("%s: %s vs %s", family, lv[3], lv[2])))
+mut <- c("BAP1", "SF3B1", "EIF1AX"); loc <- c("choroid", "iris", "ciliary body")   # ciliochoroidal not tested
+run_tests <- function(v) bind_rows(
+  three(pat_o, v, "origin3", levels(pat$origin3), "origin"),
+  three(dplyr::filter(pum, secondary_mutation %in% mut), v, "secondary_mutation", mut, "secondary mutation, all pUM"),
+  three(dplyr::filter(pum, secondary_mutation %in% mut, primary_location == "choroid"), v, "secondary_mutation", mut, "secondary mutation, choroidal pUM"),
+  two(pum, v, "chr3", "disomy 3", "monosomy 3", "chr3, pUM", "chr3, pUM: monosomy 3 vs disomy 3"),
+  two(pum, v, "chr8", "no chr8 gain", "chr8 gain", "chr8, pUM", "chr8, pUM: gain vs no gain"),
+  three(pum, v, "primary_location", loc, "location, pUM"),
+  three(dplyr::filter(pat, group == "healthy"), v, "healthy_location", loc, "location, healthy melanocytes"),
+  two(dplyr::filter(tum, primary_mutation %in% c("GNAQ", "GNA11")), v, "primary_mutation", "GNAQ", "GNA11", "GNAQ/GNA11, all tumours", "GNAQ/GNA11, all tumours: GNA11 vs GNAQ"),
+  two(tum, v, "Gender", "F", "M", "sex, all tumours", "sex, all tumours: M vs F"))
+# BH over all tests of one grouping (9 MPs, Kruskal-Wallis omnibus included)
+tests <- bind_rows(lapply(mps, run_tests)) |> mutate(MP = var, label = lab[var], .before = 1) |> dplyr::select(-var) |>
+  group_by(family) |> mutate(padj_BH = p.adjust(p, "BH")) |> ungroup()
+write.csv(tests, "tables/Fig4e-g_SFig7b_MP_metadata_tests.csv", row.names = FALSE)
+```
+
+**Purpose**: find recurrent transcriptional programs of the melanocytic lineage de novo and compare them across clinical groups and under tebentafusp.
+
+- **Input**: melanoma cells and healthy melanocytes of the `MelanocyteMelanoma` subset (`majority_celltype`).
+- **NMF** (Gavish et al. 2023): `r length(samples)` samples (orig.ident) with at least 100 melanocytic cells, 500 cells drawn per sample. Per sample, the 2,000 most variable genes (ribosomal and mitochondrial genes excluded) are scaled with `percent.mt` regressed, negative values set to 0, and factorised with RcppML at k = 8, 10, 12; a program is its 50 top-weighted genes. `r sum(pinfo$robust)` of `r nrow(pinfo)` programs are robust; greedy clustering gives `r length(genes)` MPs of 50 genes, each in at least 10% of samples.
+- **Scores**: UCell (maxRank 1500) of each MP on all `r nfmt(nrow(cells))` melanocytic cells.
+- **Unit**: the patient (mean score of its cells, per group). Wilcoxon rank-sum tests (Kruskal-Wallis for three groups), Benjamini-Hochberg over all tests of one grouping (9 MPs); figures show adj. p.
+- **Tebentafusp**: tumour cells of three patients with paired liver metastasis biopsies before and on treatment, scored with the same MPs (maxRank 1500). Path to the object: parameter `tebe_object`. Tests within a patient compare cells (descriptive, unadjusted); the treatment test is a paired t-test on the three per-patient medians, BH over the testable MPs.
+
+## Figure 4a
+
+```{r fig4a, out.width = "80%"}
+pr <- dplyr::filter(pinfo, robust) |> mutate(MPf = factor(ifelse(is.na(MP), "none", MP), c(mps, "none")))
+stopifnot(nrow(pr) == 242)
+O2 <- O[pr$program, pr$program]; JJ <- O2 / (2 * NTOP - O2)
+ord <- unlist(lapply(levels(pr$MPf), function(m) { p <- pr$program[pr$MPf == m]
+  if (length(p) > 2) p[hclust(as.dist(1 - JJ[p, p]), "average")$order] else p }))
+JJ <- JJ[ord, ord]; mpo <- pr$MPf[match(ord, pr$program)]
+top_ann <- HeatmapAnnotation(MP = mpo, Group = pr$group[match(ord, pr$program)],
+  col = list(MP = c(MP_COLS, none = "grey85"), Group = c(healthy = "#1B9E77", malignant = "#D95F02")),
+  show_legend = c(MP = FALSE, Group = TRUE), annotation_name_gp = gpar(fontsize = 13),
+  annotation_legend_param = list(Group = list(title = "Sample", title_gp = gpar(fontsize = 13, fontface = "bold"), labels_gp = gpar(fontsize = 12))))
+f <- save_ht(function() draw(Heatmap(JJ, name = "Jaccard", col = colorRamp2(c(0, 0.1, 0.5), c("white", "#FDAE61", "#67001F")),
+  cluster_rows = FALSE, cluster_columns = FALSE, show_row_names = FALSE, show_column_names = FALSE, use_raster = FALSE,
+  row_split = mpo, column_split = mpo, row_gap = unit(0.6, "mm"), column_gap = unit(0.6, "mm"),
+  row_title_rot = 0, row_title_gp = gpar(fontsize = 13), column_title_gp = gpar(fontsize = 12), column_title_rot = 90,
+  left_annotation = rowAnnotation(MP = mpo, col = list(MP = c(MP_COLS, none = "grey85")), show_legend = FALSE, show_annotation_name = FALSE),
+  top_annotation = top_ann, heatmap_legend_param = list(title_gp = gpar(fontsize = 13, fontface = "bold"), labels_gp = gpar(fontsize = 12))),
+  column_title = sprintf("%d robust NMF programs ordered by meta-program (Jaccard of the top-50 genes)", nrow(pr)),
+  column_title_gp = gpar(fontsize = 16, fontface = "bold"), padding = unit(c(5, 5, 5, 5), "mm")),
+  "Fig4a_program_similarity_heatmap", 14, 13)
+knitr::include_graphics(f)
+```
+
+## Figure 4b
+
+```{r fig4b, out.width = "33%"}
+sc <- as.data.table(cells)
+cells_txt <- sprintf("%s melanocytic cells (%s melanoma cells, %s melanocytes)", nfmt(nrow(sc)),
+                     nfmt(sc[majority_celltype == "Melanoma cells", .N]), nfmt(sc[majority_celltype == "Melanocytes", .N]))
+umm <- merge(fread(umap_file), sc[, c("cell", mps), with = FALSE], by = "cell")
+stopifnot("UMAP misses melanocytic cells" = nrow(umm) == nrow(sc))
+set.seed(14); umm <- umm[sample(.N)]
+thm <- theme_classic(base_size = 16) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5), plot.caption = element_text(hjust = 0, size = 10),
+        plot.caption.position = "plot", plot.title.position = "plot", axis.text = element_text(size = 14, colour = "black"))
+f <- sapply(mps, function(m) {
+  lim <- quantile(umm[[m]], c(0.01, 0.99)); if (diff(lim) <= 0) lim <- range(umm[[m]])
+  p <- ggplot(umm[order(umm[[m]])], aes(UMAP_1, UMAP_2, colour = .data[[m]])) + geom_scattermore(pointsize = 2.8, pixels = c(2400, 2400)) +
+    scale_colour_viridis_c(option = "magma", limits = lim, oob = scales::squish, name = "UCell") +
+    labs(title = stringr::str_wrap(lab[[m]], 40), x = "UMAP 1", y = "UMAP 2",
+         caption = wrap_cap(sprintf("Atlas UMAP, %s. Highest score drawn on top. Colour capped at percentiles 1 and 99 (%.2f to %.2f).",
+                                    cells_txt, lim[1], lim[2]), 7.5)) +
+    thm + theme(aspect.ratio = 1)
+  save_gg(p, paste0("Fig4b_umap_", m), 7.5, 7.5)
+})
+knitr::include_graphics(f)
+```
+
+## Figure 4c
+
+```{r fig4c}
+w3 <- readxl::read_excel(params$gavish_3ca_xlsx, sheet = "Malignant")
+w3 <- lapply(as.list(w3), function(x) unique(na.omit(x))); names(w3) <- stringr::str_squish(names(w3))
+w3_shared <- t(sapply(genes, function(m) sapply(w3, function(x) length(intersect(m, x)))))
+w3_frac <- sweep(w3_shared, 2, lengths(w3), "/")
+best <- apply(w3_frac, 2, max)
+top <- names(best)[best >= 0.1]   # 3CA programs sharing >= 10% of their genes with an MP
+top <- top[order(apply(w3_frac[, top, drop = FALSE], 2, which.max), -best[top])]
+rownames(w3_frac) <- rownames(w3_shared) <- lab[rownames(w3_shared)]
+f <- save_ht(function() draw(
+  do.call(Heatmap, c(list(w3_frac[, top], name = "share of\n3CA genes", col = colorRamp2(c(0, max(w3_frac[, top])), c("white", "#B2182B")),
+    cluster_rows = FALSE, cluster_columns = FALSE, row_names_side = "left", column_names_rot = 45,
+    column_title = "Overlap with the Weizmann 3CA malignant meta-programs (number = shared genes)",
+    cell_fun = function(j, i, x, y, w, h, fill) grid.text(w3_shared[i, top[j]], x, y, gp = gpar(fontsize = 13))), hfont)),
+  padding = unit(c(5, 5, 5, 10), "mm")), "Fig4c_overlap_3CA", 11 + 0.6 * length(top), 8)
+knitr::include_graphics(f)
+```
+
+## Figure 4d
+
+```{r fig4d}
+e <- enr[padj < 0.05]
+clean <- function(t) { t <- sub("^HALLMARK_", "", sub("^GOBP_", "", t)); t <- tolower(gsub("_", " ", t))
+  t <- sub("^(.)", "\\U\\1", t, perl = TRUE); ifelse(nchar(t) > 55, paste0(substr(t, 1, 52), "..."), t) }
+top <- rbind(e[source == "Hallmark"][order(padj), head(.SD, 3), by = MP], e[source == "GO BP"][order(padj), head(.SD, 4), by = MP])
+d <- e[paste(source, term) %in% paste(top$source, top$term)]
+d[, `:=`(MPl = factor(MP, mps), src = factor(source, c("Hallmark", "GO BP")))]
+d[, key := factor(paste(source, term), rev(unique(top[order(match(MP, mps), source != "Hallmark", padj), paste(source, term)])))]
+none9 <- setdiff(mps, top$MP)
+p <- ggplot(d, aes(MPl, key, size = overlap, fill = padj)) + geom_point(shape = 21, colour = "black") +
+  facet_grid(src ~ ., scales = "free_y", space = "free_y") +
+  scale_y_discrete(labels = setNames(clean(sub("^(Hallmark|GO BP) ", "", levels(d$key))), levels(d$key))) +
+  scale_x_discrete(drop = FALSE, labels = lab) +
+  scale_fill_gradient(low = "#e06663", high = "#327eba", trans = "log10", guide = guide_colorbar(reverse = TRUE), name = "p.adjust") +
+  scale_size(range = c(2.5, 8), name = "Count") +
+  labs(x = NULL, y = NULL, title = "Enrichment of the 9 meta-programs",
+       caption = wrap_cap(sprintf("Over-representation of each MP's 50 genes (clusterProfiler enricher; Hallmark and GO BP, msigdbr); background = genes variable in at least one NMF sample; BH within each MP and collection. Up to 3 Hallmark and 4 GO BP terms per MP with p.adjust < 0.05.%s",
+         if (length(none9)) paste0(" No term: ", paste(lab[none9], collapse = ", "), ".") else ""), 11.5)) +
+  DOSE::theme_dose(13) + theme(axis.text.x = element_text(angle = 40, hjust = 1, size = 12), axis.text.y = element_text(size = 12),
+    plot.title = element_text(size = 17, face = "bold", hjust = 0.5), strip.text = element_text(size = 13),
+    plot.caption = element_text(size = 10, hjust = 0), plot.caption.position = "plot", plot.margin = margin(5.5, 5.5, 5.5, 60))
+knitr::include_graphics(save_gg(p, "Fig4d_enrichment_dotplot", 13, 4.5 + 0.3 * nlevels(d$key)))
+```
+
+## Figure 4e-g
+
+```{r fig4efg}
+stars_box <- function(q) as.character(cut(q, c(-Inf, 0.001, 0.01, 0.05, Inf), c("***", "**", "*", "ns")))
+pal <- c("healthy melanocytes" = origin_colors[["non-malignant"]], primary = origin_colors[["primary"]], metastasis = origin_colors[["metastasis"]],
+         "disomy 3" = "#4C9BD6", "monosomy 3" = "#C0392B")
+box_mp <- function(fam, d0, gcol, lv, ms, title) {
+  d <- d0 |> dplyr::select(Patient_nr, grp = all_of(gcol), all_of(ms)) |> tidyr::pivot_longer(all_of(ms), names_to = "MP", values_to = "score") |>
+    mutate(grp = factor(grp, levels = lv), panel = factor(lab[MP], levels = lab[mps]))
+  stopifnot(nrow(d) > 0)
+  nlab <- d |> distinct(Patient_nr, grp) |> count(grp)
+  levels(d$grp) <- sprintf("%s\n(n = %d)", lv, nlab$n[match(lv, nlab$grp)])
+  grp_col <- setNames(pal[lv], levels(d$grp))
+  pairs <- dplyr::filter(tests, family == fam, test == "Wilcoxon", MP %in% ms)
+  ann <- bind_rows(lapply(seq_len(nrow(pairs)), function(i) {
+    lv2 <- sub(" \\(n=\\d+\\) vs .*", "", pairs$groups[i]); lv1 <- sub(".* vs (.*) \\(n=\\d+\\)$", "\\1", pairs$groups[i])
+    tibble(panel = factor(lab[pairs$MP[i]], levels = lab[mps]), x1 = match(lv1, lv), x2 = match(lv2, lv),
+           lab = sprintf("%s  adj. p = %.2g", stars_box(pairs$padj_BH[i]), pairs$padj_BH[i]))
+  }))
+  ymax <- d |> group_by(panel) |> summarise(top = max(score), rng = diff(range(score)), .groups = "drop")
+  ann <- ann |> left_join(ymax, by = "panel") |> group_by(panel) |> mutate(y = top + rng * (0.1 + 0.16 * (row_number() - 1)), tip = rng * 0.02) |> ungroup()
+  ggplot(d, aes(grp, score)) + geom_boxplot(aes(fill = grp), outlier.shape = NA, width = 0.55, alpha = 0.45) +
+    geom_jitter(aes(colour = grp), width = 0.12, height = 0, size = 1.5, alpha = 0.9) +
+    scale_fill_manual(values = grp_col, guide = "none") + scale_colour_manual(values = grp_col, guide = "none") +
+    geom_segment(data = ann, aes(x = x1, xend = x2, y = y, yend = y), inherit.aes = FALSE, linewidth = 0.3) +
+    geom_segment(data = ann, aes(x = x1, xend = x1, y = y, yend = y - tip), inherit.aes = FALSE, linewidth = 0.3) +
+    geom_segment(data = ann, aes(x = x2, xend = x2, y = y, yend = y - tip), inherit.aes = FALSE, linewidth = 0.3) +
+    geom_text(data = ann, aes(x = (x1 + x2) / 2, y = y, label = lab), inherit.aes = FALSE, vjust = -0.4, size = 2.9) +
+    facet_wrap(~panel, scales = "free_y", ncol = min(4, length(ms)), labeller = label_wrap_gen(width = 30)) +
+    scale_y_continuous(expand = expansion(mult = c(0.05, 0.2))) +
+    labs(x = NULL, y = "UCell score (patient mean)", title = title,
+         caption = paste(strwrap(sprintf("One point per patient (mean UCell score of its cells); Wilcoxon rank-sum on patient means, two-sided, BH-adjusted within this grouping (%d tests over the 9 MPs%s); *** < 0.001, ** < 0.01, * < 0.05, ns >= 0.05.",
+                                         sum(tests$family == fam), if (length(lv) == 3) ", Kruskal-Wallis omnibus included" else ""), 110), collapse = "\n")) +
+    theme_classic(base_size = 12) + theme(plot.title = element_text(face = "bold", hjust = 0.5), plot.title.position = "plot", plot.caption.position = "plot",
+                                          plot.caption = element_text(hjust = 0, size = 8.5), strip.background = element_blank(), strip.text = element_text(face = "bold", size = 10))
+}
+set.seed(42)
+p <- box_mp("origin", pat_o, "origin3", levels(pat$origin3), mps, "MPs by origin")
+f1 <- save_gg(p, "Fig4e_box_disease_category", 15.4, 12)
+p <- box_mp("chr3, pUM", pum, "chr3", c("disomy 3", "monosomy 3"), c("MP6", "MP8"), "MP6 and MP8 by chr3, pUM")
+f2 <- save_gg(p, "Fig4fg_box_pUM_chr3_MP6_MP8", 7.5, 5.2)
+knitr::include_graphics(c(f1, f2))
+```
+
+## Supplementary Figure 7a
+
+```{r sfig7a}
+jac <- outer(mps, mps, Vectorize(function(a, b) length(intersect(genes[[a]], genes[[b]])) / length(union(genes[[a]], genes[[b]]))))
+shared <- outer(mps, mps, Vectorize(function(a, b) length(intersect(genes[[a]], genes[[b]]))))
+corr <- cor(as.matrix(sc[origin != "non-malignant", ..mps]))
+dimnames(jac) <- dimnames(shared) <- dimnames(corr) <- list(mps, mps)
+f <- save_ht(function() draw(
+  do.call(Heatmap, c(list(jac, name = "Jaccard", col = colorRamp2(c(0, 0.5, 1), c("white", "#F4A582", "#B2182B")),
+    cluster_rows = FALSE, cluster_columns = FALSE, row_names_side = "left", row_labels = lab[mps], column_names_rot = 0,
+    column_names_centered = TRUE, column_title = "Gene-set overlap: Jaccard (shared genes)",
+    cell_fun = function(j, i, x, y, w, h, fill) grid.text(sprintf("%.2f\n(%d)", jac[i, j], shared[i, j]), x, y, gp = gpar(fontsize = 11))), hfont)) +
+  do.call(Heatmap, c(list(corr, name = "Pearson r", col = colorRamp2(c(-1, 0, 1), c("blue", "white", "red")),
+    cluster_rows = FALSE, cluster_columns = FALSE, show_row_names = FALSE, column_names_rot = 0, column_names_centered = TRUE,
+    column_title = "MP score correlation across melanoma cells",
+    cell_fun = function(j, i, x, y, w, h, fill) grid.text(sprintf("%.2f", corr[i, j]), x, y, gp = gpar(fontsize = 11))), hfont)),
+  ht_gap = unit(1.5, "cm"), padding = unit(c(5, 5, 5, 10), "mm")), "SFig7a_MP_overlap_jaccard", 25, 8)
+knitr::include_graphics(f)
+```
+
+## Supplementary Figure 7b
+
+```{r sfig7b}
+stars <- function(q) as.character(cut(q, c(-Inf, 0.001, 0.01, 0.05, 0.1, Inf), c("***", "**", "*", ".", "")))
+hm <- tests |> dplyr::filter(test == "Wilcoxon") |>
+  mutate(label = factor(label, levels = rev(lab[mps])), comparison = factor(comparison, levels = unique(comparison)))
+p <- ggplot(hm, aes(comparison, label, fill = effect_rb)) + geom_tile(colour = "white") +
+  geom_text(aes(label = stars(padj_BH)), size = 4) +
+  scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B", limits = c(-1, 1), name = "rank-biserial\n(+ = first group\nhigher)") +
+  labs(x = NULL, y = NULL, title = "MP scores (UCell, patient means): effect size per comparison",
+       caption = paste(strwrap(sprintf("Columns read 'A vs B'; positive = A higher. Stars = BH-adjusted p within each grouping (%d tests in total, incl. %d Kruskal-Wallis omnibus tests not shown): *** < 0.001, ** < 0.01, * < 0.05, . < 0.1.",
+                                       nrow(tests), sum(tests$test != "Wilcoxon")), 160), collapse = "\n")) +
+  theme_minimal(base_size = 10) + theme(axis.text.x = element_text(angle = 50, hjust = 1), plot.caption = element_text(hjust = 0, size = 8), panel.grid = element_blank())
+knitr::include_graphics(save_gg(p, "SFig7b_effect_size_heatmap", 14, 7.5))
+```
+
+```{r tebe}
+# tumour cells (CellType "Melanoma") of the baseline (BL) and first on-treatment (FU1) biopsies
+te_file <- file.path(TB, "scores_ucell_tebe.csv.gz")
+if (!file.exists(te_file)) {
+  o <- qread(params$tebe_object)
+  o <- subset(o, subset = CellType_Harmonized_Detailed == "Melanoma" & Timepoint %in% c("BL", "FU1"))
+  o[["RNA"]] <- JoinLayers(o[["RNA"]])
+  sc_te <- UCell::ScoreSignatures_UCell(SeuratObject::LayerData(o, assay = "RNA", layer = "counts"), features = genes, name = "", maxRank = 1500, ncores = ncores)
+  dir.create(TB, showWarnings = FALSE)
+  fwrite(data.table(cell = colnames(o), patient = o$Patient, group = as.character(o$Timepoint), as.data.table(as.matrix(sc_te[colnames(o), mps]))), te_file)
+  rm(o); invisible(gc())
+}
+te <- fread(te_file)
+stopifnot(setequal(unique(te$group), c("BL", "FU1")), setequal(unique(te$patient), c("mUM13", "mUM14", "mUM16")))
+te[, timepoint := factor(c(BL = "pre", FU1 = "on")[group], c("pre", "on"))]
+te[, top_MP := mps[max.col(as.matrix(.SD), ties.method = "first")], .SDcols = mps]
+te_n <- te[, .N, by = .(patient, timepoint)]
+stars4 <- function(p) as.character(cut(p, c(-Inf, 0.001, 0.01, 0.05, Inf), c("***", "**", "*", "ns")))
+fmt_p <- function(p) ifelse(p == 0, "< 1e-300", ifelse(p < 0.001, sprintf("%.0e", p), sprintf("%.3f", p)))
+p_is <- function(p) ifelse(p == 0, "p < 1e-300", paste("p =", fmt_p(p)))
+
+# treatment test: paired t-test on the 3 per-patient medians; BH over the MPs whose differences vary
+pm <- dcast(melt(te, id.vars = c("patient", "timepoint"), measure.vars = mps, variable.name = "MP")[, .(m = median(value)), by = .(MP, patient, timepoint)],
+            MP + patient ~ timepoint, value.var = "m")
+pt <- pm[, .(up = sum(on > pre), down = sum(on < pre), p = tryCatch(t.test(on, pre, paired = TRUE)$p.value, error = function(e) NA_real_)), by = MP]
+pt[, padj := p.adjust(p, "BH")]
+pt[, line := ifelse(is.na(p), sprintf("%d/3 up; paired t not testable (no spread)", up), sprintf("%d/3 up; paired t (3 patients) adj. p = %s", up, fmt_p(padj)))]
+fwrite(pt[, .(MP, label = lab[as.character(MP)], patients_up = up, patients_down = down, p_paired_t = p, padj_BH = padj)], "tables/SFig7d_tebentafusp_paired_t.csv")
+
+# within-patient chi-squared test of the highest-program mix, pre vs on (descriptive)
+chi <- te[, { tb <- table(timepoint, top_MP); tb <- tb[, colSums(tb) > 0, drop = FALSE]; cs <- suppressWarnings(chisq.test(tb))
+  .(p = cs$p.value, cramers_v = sqrt(cs$statistic / (sum(tb) * (min(dim(tb)) - 1)))) }, by = patient]
+share <- te[, .N, by = .(patient, timepoint, top_MP)][, share := N / sum(N), by = .(patient, timepoint)]
+fwrite(dcast(share, patient + top_MP ~ timepoint, value.var = "share", fill = 0)[chi, on = "patient"], "tables/SFig7c_tebentafusp_highest_program.csv")
+```
+
+## Supplementary Figure 7c
+
+```{r sfig7c, out.width = "80%"}
+chi_lab <- chi[, setNames(sprintf("%s\nchi-squared %s %s\nCramer's V %.2f", patient, p_is(p), stars4(p), cramers_v), patient)]
+p <- ggplot(share, aes(timepoint, share, fill = factor(top_MP, mps))) + geom_col(width = 0.7) +
+  geom_text(aes(label = ifelse(share >= 0.05, scales::percent(share, 1), "")), position = position_stack(vjust = 0.5), size = 3.5, colour = "white") +
+  facet_wrap(~ patient, labeller = as_labeller(chi_lab)) + scale_y_continuous(labels = scales::percent) +
+  scale_fill_manual(values = MP_COLS, labels = lab, name = "Highest program", drop = FALSE) +
+  labs(x = NULL, y = "Tumour cells",
+       caption = paste("Each cell assigned to its highest meta-program score.",
+                       "Panel title: chi-squared test of the mix pre vs on, within that patient (within-patient tests on cells: descriptive, unadjusted).",
+                       "Cramer's V = size of the shift (0 to 1): with thousands of cells any shift is significant.", sep = "\n")) +
+  theme_classic(base_size = 13) + theme(legend.position = "bottom", legend.direction = "vertical", plot.caption = element_text(hjust = 0),
+                                        strip.background = element_blank(), strip.text = element_text(face = "bold"))
+knitr::include_graphics(save_gg(p, "SFig7c_tebentafusp_highest_program", 10, 8))
+```
+
+## Supplementary Figure 7d
+
+```{r sfig7d}
+tl <- melt(te, id.vars = c("cell", "patient", "timepoint"), measure.vars = mps, variable.name = "program", value.name = "score")
+tl[, program := factor(program, mps, lab[mps])]
+tl[, xlab := factor(sprintf("%s\npre %s\non %s", patient, format(te_n[timepoint == "pre"][match(tl$patient, patient), N], big.mark = ","),
+                            format(te_n[timepoint == "on"][match(tl$patient, patient), N], big.mark = ",")))]
+whisk <- tl[, .(hi = boxplot.stats(score)$stats[5], lo = boxplot.stats(score)$stats[1]), by = .(program, xlab, timepoint)][
+  , .(ytop = max(hi) + 0.06 * (max(hi) - min(lo)), span = max(hi) - min(lo)), by = program]
+cell_t <- tl[, .(d = median(score[timepoint == "on"]) - median(score[timepoint == "pre"]),
+                 p = wilcox.test(score[timepoint == "on"], score[timepoint == "pre"])$p.value), by = .(program, xlab)]
+cell_t[whisk, on = "program", `:=`(ytop = i.ytop, span = i.span)]
+cell_t[, `:=`(x = as.numeric(xlab), lab = sprintf("%+.3f %s\n%s", d, ifelse(d == 0, "", stars4(p)), p_is(p)))]   # no star when the median does not move
+strip <- setNames(paste0(lab[as.character(pt$MP)], "\n", pt$line), lab[as.character(pt$MP)])
+p <- ggplot(tl, aes(xlab, score, fill = timepoint)) +
+  geom_boxplot(outlier.shape = NA, coef = 1.5, width = 0.7, position = position_dodge(0.8)) +
+  geom_segment(data = cell_t, aes(x = x - 0.2, xend = x + 0.2, y = ytop, yend = ytop), inherit.aes = FALSE) +
+  geom_text(data = cell_t, aes(x = x, y = ytop + 0.02 * span, label = lab), inherit.aes = FALSE, vjust = 0, size = 3, lineheight = 0.9) +
+  geom_blank(data = cell_t, aes(x = x, y = ytop + 0.25 * span), inherit.aes = FALSE) +
+  scale_fill_manual(values = c(pre = "#0072B2", on = "#D55E00"), name = "Tebentafusp") +
+  facet_wrap(~ program, nrow = 3, scales = "free_y", labeller = as_labeller(strip)) +
+  labs(x = "Patient (tumour cells before / on treatment)", y = "Program score (UCell)",
+       caption = paste("UCell score per tumour cell. Boxes and whiskers (1.5 IQR) without outlier points; y axis per panel.",
+                       "Bracket: change in median score on - pre and Wilcoxon p on cells within that patient: within-patient tests on cells, descriptive, unadjusted",
+                       "(cells are not independent replicates of the treatment; no star when the median does not change).",
+                       sprintf("Panel title: the treatment test, paired t-test on the 3 per-patient medians, adj. p = BH over the %d testable panels of this figure.", sum(!is.na(pt$p))),
+                       sep = "\n")) +
+  theme_classic(base_size = 13) + theme(plot.caption = element_text(hjust = 0), strip.background = element_blank(), strip.text = element_text(face = "bold"))
+knitr::include_graphics(save_gg(p, "SFig7d_tebentafusp_scores_per_cell", 15, 13))
+```
+
+## Supplementary Table 4
+
+```{r stable4}
+DT::datatable(gene_tab, rownames = FALSE, filter = "top", options = list(pageLength = 50))
+```
+
+## Session Info
+
+```{r session}
+sessionInfo()
+```
