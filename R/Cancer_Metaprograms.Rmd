@@ -1,5 +1,5 @@
 ---
-title: "UM Atlas - Cancer Metaprogram Analysis (Melanocytic Cells: Healthy + Malignant)"
+title: "UM Atlas - Cancer Metaprograms (Weizmann 3CA) in Melanocytic Cells"
 output:
   html_document:
     self_contained: true
@@ -13,1194 +13,316 @@ editor_options:
 
 ```{r script-info, include=FALSE}
 # This script was used to create the following figures:
-# Figures 3, 4 (cancer metaprogram scoring with UCell on GeneNMF modules; EMT/Interferon analyses)
+# Figure 3a       correlation of the top 30 metaprograms
+# Figure 3c, 3d   MP30 Respiration 1: UMAP, disease category
+# Figure 3e, 3f   MP45 Skin-pigmentation: UMAP, disease category
+# Figure 3h, 3i   MP17 EMT-III: UMAP, disease category
+# Figure 3j, 3k   MP9 Stress 2: UMAP, disease category
+# Figure 3l       MP22-MP24 Interferon/MHC-II by disease category (dot plot; patient-level boxplots)
+# Figure 3m       MP22-MP24 in metastases by treatment (dot plot; boxplots)
+# Supplementary Figure 6a, 6b   top 20 metaprograms; MP45 in primary UM by location
 ```
 
-#  {.tabset}
+<style>
+.main-container img { max-width: min(100%, 1400px) !important; height: auto !important; display: block; margin: 0 auto; }
+.main-container .html-widget { max-width: 1400px; margin: 0 auto; }
+</style>
+
+# {.tabset}
 
 ## Overview
 
-Started on `r format(Sys.time(), "%Y-%m-%d %H:%M:%S")`
+**Purpose**: score the 67 malignant metaprograms of the Weizmann Curated Cancer Cell Atlas (3CA) in the melanocytic
+lineage (melanoma cells and non-malignant melanocytes) and compare them across disease category (non-malignant,
+primary, metastasis), intra-ocular location of primary tumours and treatment of metastases.
 
-This report analyzes **67 cancer metaprograms** (Weizmann 3CA) in **melanocytic cells** from the UM atlas, including both **healthy melanocytes** and **malignant melanoma cells** to enable direct comparison across disease progression.
+**Input**: the full atlas object (`../new_data_2026b/Objects/full Dataset/`), cells with `majority_celltype`
+"Melanoma cells" or "Melanocytes". UCell scores (default settings) are computed once and cached in
+`../Outputs/Metaprograms_3CA_2026b/`; UMAP coordinates are those of the atlas.
 
-**Dataset:**
-- ~194,476 total melanocytic cells
-  - 6,528 healthy melanocytes
-  - 187,946 malignant melanoma cells (130,551 primary + 57,395 metastatic)
-- 61 patients
-- 5 organs (eye, liver, brain, skin, thyroid)
+**Unit and tests**: the patient. Each point is one tumour or tissue (`orig.ident`, at least 10 cells); tests use the
+mean score per patient (`Patient_nr`), two-sided Wilcoxon rank-sum, groups with fewer than 3 patients are drawn but
+not tested. P-values are Benjamini-Hochberg adjusted over the comparisons of one panel (3 per program; 9 for
+MP22-MP24) and shown as adj. p, stars from adj. p. Ciliochoroidal tumours (1 patient) are not shown.
 
-**Metaprogram categories:**
-- Cell cycle (MP1-5)
-- Stress & hypoxia (MP6-9)
-- Protein processing (MP10-14)
-- EMT (MP15-20)
-- Interferon/MHC (MP22-24)
-- Tissue-specific programs (MP37-50)
-- And more...
-
-**Comparisons:**
-- **Origin (healthy melanocytes → primary UM → metastatic UM)** ← KEY ANALYSIS
-- Primary mutation (GNAQ, GNA11, PLCB4, none)
-- Secondary mutation (BAP1, SF3B1, EIF1AX, none)
-- Organ (eye, liver, brain, skin, thyroid)
-- Patient-level heterogeneity
-
-```{r setup, message = FALSE, warning = FALSE}
-knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 12, fig.height = 8)
-
-# Load libraries
-library(Seurat)
-library(qs)
-library(tidyverse)
-library(ggplot2)
-library(patchwork)
-library(cowplot)
-library(UCell)
-library(readxl)
-library(ComplexHeatmap)
-library(circlize)
-library(ggridges)
-library(ggpubr)  # For statistical comparisons on violin plots
-
-# Load Victoria's official color palettes
-source("colors.R")
-
-# Set output directory
-output_dir <- "Outputs/Metaprograms/"
-dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
-
-# Set parallel processing
-library(future)
-plan("multicore", workers = 16)
-options(future.globals.maxSize = 8000 * 1024^2)
-
-# Increased base font size for better readability (per collaborator request)
-theme_set(theme_minimal(base_size = 14))
-```
-
-## Load Data {.tabset}
-
-### Load UM Atlas
-
-```{r load_um_atlas}
-# Load UM atlas (updated dataset from Victoria, Jan 2025)
-um_atlas <- qread("../13_final_Dataset_reclustered_28012025.qs", nthreads = 16)
-
-# Fix GANQ → GNAQ typo
-um_atlas$primary_mutation[um_atlas$primary_mutation == "GANQ"] <- "GNAQ"
-
-cat("UM Atlas loaded:\n")
-cat("  - Cells:", ncol(um_atlas), "\n")
-cat("  - Features:", nrow(um_atlas), "\n\n")
-
-# Filter to melanocytic cells: healthy melanocytes + malignant melanoma cells
-malignant <- subset(um_atlas, subset = majority_celltype %in% c("Melanocytes", "Melanoma cells"))
-
-cat("Melanocytic cells (Healthy Melanocytes + Malignant Melanoma):\n")
-cat("  - Total cells:", ncol(malignant), "\n")
-cat("  - Percentage of atlas:", round(100 * ncol(malignant) / ncol(um_atlas), 2), "%\n\n")
-
-# Display distributions by cell type
-cat("Cell type distribution:\n")
-print(table(malignant$majority_celltype))
-
-# Display distributions by origin
-cat("\n\nOrigin distribution (KEY for healthy → primary → metastatic comparison):\n")
-origin_table <- table(malignant$origin, malignant$majority_celltype)
-print(origin_table)
-cat("\nTotal by origin:\n")
-print(rowSums(origin_table))
-
-cat("\n\nPrimary mutation distribution:\n")
-print(table(malignant$primary_mutation))
-
-cat("\n\nSecondary mutation distribution:\n")
-print(table(malignant$secondary_mutation))
-
-cat("\n\nOrgan distribution:\n")
-print(table(malignant$organ))
-
-cat("\n\nPrimary tumor location (pUM) distribution:\n")
-print(table(malignant$LocationPrimaryTumor))
-
-cat("\n\nSamples (biological replicates merged):", length(unique(malignant$orig.ident)), "\n")
-```
-
-### Load Metaprograms
-
-```{r load_metaprograms}
-# Load Weizmann 3CA metaprograms
-excel_path <- "../Weizman_3CA_meta_programs_2025-01-29.xlsx"
-
-# Read first sheet (Malignant programs)
-mp_df <- read_excel(excel_path, sheet = "Malignant")
-
-cat("Metaprograms loaded:\n")
-cat("  - Programs:", ncol(mp_df), "\n")
-cat("  - Genes per program:", nrow(mp_df), "\n\n")
-
-# Convert to list format for UCell
-metaprograms <- list()
-for (col in colnames(mp_df)) {
-  genes <- mp_df[[col]]
-  genes <- genes[!is.na(genes)]
-  metaprograms[[col]] <- genes
-}
-
-cat("Metaprogram categories:\n")
-cat("  - Cell Cycle (MP1-5):", sum(grepl("^MP[1-5] ", names(metaprograms))), "\n")
-cat("  - Stress (MP6-9):", sum(grepl("^MP[6-9] ", names(metaprograms))), "\n")
-cat("  - Protein Processing (MP10-14):", sum(grepl("^MP1[0-4] ", names(metaprograms))), "\n")
-cat("  - EMT (MP15-20):", sum(grepl("^MP1[5-9] |^MP20 ", names(metaprograms))), "\n")
-cat("  - Interferon/MHC (MP22-24):", sum(grepl("^MP2[2-4] ", names(metaprograms))), "\n")
-cat("  - Total:", length(metaprograms), "\n\n")
-
-cat("Example programs:\n")
-print(names(metaprograms)[1:10])
-```
-
-## Compute UCell Scores
-
-```{r compute_ucell}
-# Compute UCell scores for all metaprograms using 16 cores
-cat("Computing UCell scores for", length(metaprograms), "metaprograms...\n")
-cat("Using 16 cores for parallel processing\n\n")
-
-start_time <- Sys.time()
-
-malignant <- AddModuleScore_UCell(
-  malignant,
-  features = metaprograms,
-  ncores = 16,
-  name = NULL  # Use gene set names directly
-)
-
-end_time <- Sys.time()
-cat("UCell computation completed in", round(difftime(end_time, start_time, units = "mins"), 2), "minutes\n\n")
-
-# Get UCell score column names
-ucell_cols <- grep("^MP[0-9]+", colnames(malignant@meta.data), value = TRUE)
-cat("UCell scores added:", length(ucell_cols), "columns\n\n")
-
-cat("Sample UCell scores:\n")
-print(summary(malignant@meta.data[, ucell_cols[1:5]]))
-
-# Save melanocytic cells (healthy + malignant) with UCell scores
-cat("\nSaving melanocytic cells (healthy + malignant) with UCell scores...\n")
-qsave(malignant,
-      file.path("..", "melanocytic_metaprograms.qs2"),
-      nthreads = 16)
-cat("Saved to: melanocytic_metaprograms.qs2\n")
-```
-
-## Metaprogram Overview {.tabset}
-
-### Top Metaprograms
-
-```{r top_metaprograms, fig.width = 14, fig.height = 10}
-# Calculate mean scores for each metaprogram
-mp_means <- sapply(ucell_cols, function(col) mean(malignant@meta.data[[col]], na.rm = TRUE))
-mp_means_df <- data.frame(
-  Metaprogram = names(mp_means),
-  Mean_Score = mp_means
-) |>
-  arrange(desc(Mean_Score))
-
-# Top 20 metaprograms by mean score
-top20 <- head(mp_means_df, 20)
-
-p <- ggplot(top20, aes(x = reorder(Metaprogram, Mean_Score), y = Mean_Score)) +
-  geom_col(fill = "steelblue", alpha = 0.8) +
-  coord_flip() +
-  theme_cowplot() +
-  labs(title = "Top 20 Metaprograms by Mean UCell Score (All Melanocytic Cells)",
-       subtitle = "Includes healthy melanocytes + primary UM + metastatic UM",
-       x = "", y = "Mean UCell Score") +
-  theme(axis.text.y = element_text(size = 10))
-
-print(p)
-ggsave(file.path(output_dir, "top20_metaprograms.png"), p, width = 14, height = 10, dpi = 300, bg = "white")
-
-# Export table
-write.csv(mp_means_df, file.path(output_dir, "metaprogram_mean_scores.csv"), row.names = FALSE)
-```
-
-### Metaprogram Correlation
-
-```{r mp_correlation, fig.width = 16, fig.height = 15}
-# Calculate correlation matrix of top 30 metaprograms
-top30_mps <- head(mp_means_df$Metaprogram, 30)
-cor_mat <- cor(malignant@meta.data[, top30_mps], use = "complete.obs")
-
-# Shorten names for display
-rownames(cor_mat) <- gsub("^(MP[0-9]+) .*", "\\1", rownames(cor_mat))
-colnames(cor_mat) <- gsub("^(MP[0-9]+) .*", "\\1", colnames(cor_mat))
-
-# Create heatmap
-col_fun <- colorRamp2(c(-1, 0, 1), c("blue", "white", "red"))
-
-ht <- Heatmap(
-  cor_mat,
-  name = "Pearson\nCorrelation",
-  col = col_fun,
-  cluster_rows = TRUE,
-  cluster_columns = TRUE,
-  show_row_names = TRUE,
-  show_column_names = TRUE,
-  row_names_gp = gpar(fontsize = 8),
-  column_names_gp = gpar(fontsize = 8),
-  column_title = "Top 30 Metaprogram Correlations (All Melanocytic Cells)",
-  heatmap_legend_param = list(direction = "vertical")
-)
-
-png(file.path(output_dir, "metaprogram_correlation.png"), width = 16, height = 15, units = "in", res = 300)
-draw(ht)
-dev.off()
-
-# Display in report
-draw(ht)
-```
-
-## UMAP Visualizations {.tabset}
-
-### Cell Cycle Programs
-
-```{r umap_cell_cycle, fig.width = 18, fig.height = 12}
-cell_cycle_mps <- grep("^MP[1-5] ", ucell_cols, value = TRUE)
-
-plots <- lapply(cell_cycle_mps, function(mp) {
-  FeaturePlot(malignant, features = mp, reduction = "umap", raster = FALSE) +
-    coord_fixed() +
-    scale_color_viridis_c(option = "magma") +
-    ggtitle(gsub("^(MP[0-9]+) .*", "\\1", mp))
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+suppressPackageStartupMessages({
+  library(data.table); library(ggplot2); library(ggsignif); library(ggbeeswarm); library(scattermore)
+  library(ComplexHeatmap); library(circlize); library(patchwork)
 })
-
-combined <- wrap_plots(plots, ncol = 3)
-print(combined)
-ggsave(file.path(output_dir, "umap_cell_cycle.png"), combined, width = 18, height = 12, dpi = 300, bg = "white")
+source("colors_2026b.R")
+fig_dir <- "figures"; tab_dir <- "tables"
+dir.create(fig_dir, showWarnings = FALSE); dir.create(tab_dir, showWarnings = FALSE)
+out_dir <- "../Outputs/Metaprograms_3CA_2026b"
+ORIGINS <- c("non-malignant", "primary", "metastasis")
+LOCS <- c("choroid", "iris", "ciliary body")
+MIN_CELLS <- 10              # cells per orig.ident for a point
+UMAP_Q <- c(0.01, 0.99)      # colour cap of the score UMAPs
 ```
 
-### EMT Programs
-
-```{r umap_emt, fig.width = 18, fig.height = 12}
-emt_mps <- grep("^MP1[5-9] |^MP20 ", ucell_cols, value = TRUE)
-
-plots <- lapply(emt_mps, function(mp) {
-  FeaturePlot(malignant, features = mp, reduction = "umap", raster = FALSE) +
-    coord_fixed() +
-    scale_color_viridis_c(option = "magma") +
-    ggtitle(gsub("^(MP[0-9]+) .*", "\\1", mp))
-})
-
-combined <- wrap_plots(plots, ncol = 3)
-print(combined)
-ggsave(file.path(output_dir, "umap_emt.png"), combined, width = 18, height = 12, dpi = 300, bg = "white")
-```
-
-### Stress & Hypoxia Programs
-
-```{r umap_stress, fig.width = 18, fig.height = 8}
-stress_mps <- grep("^MP[6-9] ", ucell_cols, value = TRUE)
-
-plots <- lapply(stress_mps, function(mp) {
-  FeaturePlot(malignant, features = mp, reduction = "umap", raster = FALSE) +
-    coord_fixed() +
-    scale_color_viridis_c(option = "magma") +
-    ggtitle(gsub("^(MP[0-9]+) .*", "\\1", mp))
-})
-
-combined <- wrap_plots(plots, ncol = 4)
-print(combined)
-ggsave(file.path(output_dir, "umap_stress.png"), combined, width = 18, height = 8, dpi = 300, bg = "white")
-```
-
-### Interferon/MHC Programs
-
-```{r umap_interferon, fig.width = 18, fig.height = 6}
-ifn_mps <- grep("^MP2[2-4] ", ucell_cols, value = TRUE)
-
-plots <- lapply(ifn_mps, function(mp) {
-  FeaturePlot(malignant, features = mp, reduction = "umap", raster = FALSE) +
-    coord_fixed() +
-    scale_color_viridis_c(option = "magma") +
-    ggtitle(gsub("^(MP[0-9]+) .*", "\\1", mp))
-})
-
-combined <- wrap_plots(plots, ncol = 3)
-print(combined)
-ggsave(file.path(output_dir, "umap_interferon.png"), combined, width = 18, height = 6, dpi = 300, bg = "white")
-```
-
-### Top 30 Metaprograms - Comprehensive View
-
-```{r umap_top30_comprehensive, fig.width = 24, fig.height = 40}
-# Get top 30 metaprograms
-top30_mps <- head(mp_means_df$Metaprogram, 30)
-
-plots <- lapply(top30_mps, function(mp) {
-  FeaturePlot(malignant, features = mp, reduction = "umap", raster = FALSE) +
-    coord_fixed() +
-    scale_color_viridis_c(option = "magma") +
-    ggtitle(gsub("^(MP[0-9]+) (.*)", "\\1: \\2", mp)) +
-    theme(plot.title = element_text(size = 10))
-})
-
-combined <- wrap_plots(plots, ncol = 5)
-print(combined)
-ggsave(file.path(output_dir, "umap_top30_comprehensive.png"), combined, width = 24, height = 40, dpi = 300, bg = "white")
-```
-
-## Comparisons by Primary Mutation {.tabset}
-
-### Overview - Primary Mutation
-
-```{r primary_mutation_overview}
-# Filter to known mutations
-mal_known_prim <- subset(malignant, subset = primary_mutation != "unknown")
-
-cat("Cells by primary mutation (excluding unknown):\n")
-print(table(mal_known_prim$primary_mutation))
-```
-
-### Violin Plots - Top Metaprograms
-
-```{r violin_primary_top, fig.width = 16, fig.height = 20}
-top10_mps <- head(mp_means_df$Metaprogram, 10)
-
-plots <- lapply(top10_mps, function(mp) {
-  VlnPlot(mal_known_prim, features = mp, group.by = "primary_mutation", pt.size = 0) +
-    stat_summary(fun = median, geom = "crossbar", width = 0.5, color = "black") +
-    ggtitle(gsub("^(MP[0-9]+) (.*)", "\\1: \\2", mp)) +
-    theme(legend.position = "none", axis.title.x = element_blank())
-})
-
-combined <- wrap_plots(plots, ncol = 2)
-print(combined)
-ggsave(file.path(output_dir, "violin_primary_mutation_top10.png"), combined, width = 16, height = 20, dpi = 300, bg = "white")
-```
-
-### Ridge Plots - Cell Cycle
-
-```{r ridge_primary_cellcycle, fig.width = 14, fig.height = 12}
-cell_cycle_mps <- grep("^MP[1-5] ", ucell_cols, value = TRUE)
-
-plots <- lapply(cell_cycle_mps, function(mp) {
-  ggplot(mal_known_prim@meta.data, aes(x = .data[[mp]], y = primary_mutation, fill = primary_mutation)) +
-    geom_density_ridges(alpha = 0.7) +
-    theme_ridges() +
-    labs(title = gsub("^(MP[0-9]+) .*", "\\1", mp), x = "UCell Score", y = "") +
-    theme(legend.position = "none")
-})
-
-combined <- wrap_plots(plots, ncol = 3)
-print(combined)
-ggsave(file.path(output_dir, "ridge_primary_cellcycle.png"), combined, width = 14, height = 12, dpi = 300, bg = "white")
-```
-
-### DotPlot - EMT Programs
-
-```{r dotplot_primary_emt, fig.width = 10, fig.height = 8}
-emt_mps <- grep("^MP1[5-9] |^MP20 ", ucell_cols, value = TRUE)
-
-p <- DotPlot(mal_known_prim, features = emt_mps, group.by = "primary_mutation") +
-  coord_flip() +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
-  ggtitle("EMT Metaprograms by Primary Mutation")
-
-print(p)
-ggsave(file.path(output_dir, "dotplot_primary_emt.png"), p, width = 10, height = 8, dpi = 300, bg = "white")
-```
-
-## Comparisons by Secondary Mutation {.tabset}
-
-### Overview - Secondary Mutation
-
-```{r secondary_mutation_overview}
-# Filter to known mutations
-mal_known_sec <- subset(malignant, subset = secondary_mutation != "unknown")
-
-cat("Cells by secondary mutation (excluding unknown):\n")
-print(table(mal_known_sec$secondary_mutation))
-```
-
-### Violin Plots - Top Metaprograms
-
-```{r violin_secondary_top, fig.width = 16, fig.height = 20}
-top10_mps <- head(mp_means_df$Metaprogram, 10)
-
-plots <- lapply(top10_mps, function(mp) {
-  VlnPlot(mal_known_sec, features = mp, group.by = "secondary_mutation", pt.size = 0) +
-    stat_summary(fun = median, geom = "crossbar", width = 0.5, color = "black") +
-    ggtitle(gsub("^(MP[0-9]+) (.*)", "\\1: \\2", mp)) +
-    theme(legend.position = "none", axis.title.x = element_blank())
-})
-
-combined <- wrap_plots(plots, ncol = 2)
-print(combined)
-ggsave(file.path(output_dir, "violin_secondary_mutation_top10.png"), combined, width = 16, height = 20, dpi = 300, bg = "white")
-```
-
-### Ridge Plots - Stress Programs
-
-```{r ridge_secondary_stress, fig.width = 14, fig.height = 8}
-stress_mps <- grep("^MP[6-9] ", ucell_cols, value = TRUE)
-
-plots <- lapply(stress_mps, function(mp) {
-  ggplot(mal_known_sec@meta.data, aes(x = .data[[mp]], y = secondary_mutation, fill = secondary_mutation)) +
-    geom_density_ridges(alpha = 0.7) +
-    theme_ridges() +
-    labs(title = gsub("^(MP[0-9]+) .*", "\\1", mp), x = "UCell Score", y = "") +
-    theme(legend.position = "none")
-})
-
-combined <- wrap_plots(plots, ncol = 2)
-print(combined)
-ggsave(file.path(output_dir, "ridge_secondary_stress.png"), combined, width = 14, height = 8, dpi = 300, bg = "white")
-```
-
-### Heatmap - Top 20 by Secondary Mutation
-
-```{r heatmap_secondary_top20, fig.width = 12, fig.height = 10}
-top20_mps <- head(mp_means_df$Metaprogram, 20)
-
-# Calculate mean scores by secondary mutation
-mean_scores <- sapply(top20_mps, function(mp) {
-  tapply(mal_known_sec@meta.data[[mp]], mal_known_sec$secondary_mutation, mean, na.rm = TRUE)
-})
-
-# Shorten MP names
-colnames(mean_scores) <- gsub("^(MP[0-9]+) .*", "\\1", colnames(mean_scores))
-
-# Create heatmap
-col_fun <- colorRamp2(
-  quantile(mean_scores, c(0, 0.5, 1)),
-  c("blue", "white", "red")
-)
-
-ht <- Heatmap(
-  mean_scores,
-  name = "Mean\nUCell Score",
-  col = col_fun,
-  cluster_rows = TRUE,
-  cluster_columns = TRUE,
-  row_names_gp = gpar(fontsize = 10),
-  column_names_gp = gpar(fontsize = 9),
-  column_title = "Top 20 Metaprograms by Secondary Mutation",
-  cell_fun = function(j, i, x, y, width, height, fill) {
-    grid.text(sprintf("%.2f", mean_scores[i, j]), x, y, gp = gpar(fontsize = 7))
+```{r ucell-scores}
+f_scores <- file.path(out_dir, "ucell_3CA_scores_per_cell.qs2")
+f_umap <- "../Outputs/CytoTRACE2_2026b/atlas_umap.csv.gz"
+if (!file.exists(f_scores) || !file.exists(f_umap)) {
+  suppressPackageStartupMessages(library(Seurat))
+  obj <- qs2::qs_read("../new_data_2026b/Objects/full Dataset/final_Subtyping_iCNV_reclustered.qs2", nthreads = 1)
+  if (!file.exists(f_umap)) {
+    e <- Embeddings(obj, "umap")
+    fwrite(data.table(cell = rownames(e), UMAP_1 = e[, 1], UMAP_2 = e[, 2]), f_umap)
   }
-)
-
-png(file.path(output_dir, "heatmap_secondary_top20.png"), width = 12, height = 10, units = "in", res = 300)
-draw(ht)
-dev.off()
-
-draw(ht)
-```
-
-## ★ KEY ANALYSIS: Disease Progression (Healthy → Primary → Metastatic) {.tabset}
-
-### Overview - Disease Progression
-
-```{r origin_overview}
-cat("Cells by disease stage (origin):\n")
-origin_counts <- table(malignant$origin, malignant$majority_celltype)
-print(origin_counts)
-cat("\nTotal cells per stage:\n")
-print(rowSums(origin_counts))
-cat("\n\nThis is the KEY comparison requested: Healthy melanocytes → Primary UM → Metastatic UM\n")
-```
-
-### Violin Plots - Top Metaprograms
-
-```{r violin_origin_top, fig.width = 16, fig.height = 20}
-top10_mps <- head(mp_means_df$Metaprogram, 10)
-
-plots <- lapply(top10_mps, function(mp) {
-  VlnPlot(malignant, features = mp, group.by = "origin", pt.size = 0) +
-    stat_summary(fun = median, geom = "crossbar", width = 0.5, color = "black") +
-    ggtitle(gsub("^(MP[0-9]+) (.*)", "\\1: \\2", mp)) +
-    scale_fill_manual(values = origin_colors) +  # Victoria's official colors
-    labs(subtitle = "Healthy melanocytes vs Primary UM vs Metastatic UM") +
-    theme(legend.position = "none", axis.title.x = element_blank(),
-          text = element_text(size = 14))
-})
-
-combined <- wrap_plots(plots, ncol = 2)
-print(combined)
-ggsave(file.path(output_dir, "violin_origin_top10.png"), combined, width = 16, height = 20, dpi = 300, bg = "white")
-```
-
-### Statistical Analysis - MP6, MP9, MP17, MP45 (Collaborator Request)
-
-**Specific comparison requested:** Healthy vs Primary vs Metastasis for stress/hypoxia (MP6, MP9), EMT-III (MP17), and tissue-specific (MP45) metaprograms.
-
-```{r violin_mp6_mp9_mp17_mp45_stats, fig.width = 16, fig.height = 12}
-# Find the specific metaprogram columns
-stress_mps <- grep("^MP[6|9] ", ucell_cols, value = TRUE)
-mp17_col <- grep("^MP17 ", ucell_cols, value = TRUE)
-mp45_col <- grep("^MP45 ", ucell_cols, value = TRUE)
-selected_mps <- c(stress_mps, mp17_col, mp45_col)
-
-cat("Selected metaprograms for statistical analysis:\n")
-print(selected_mps)
-
-# Define pairwise comparisons
-comparisons <- list(
-  c("healthy", "primary"),
-  c("primary", "metastasis"),
-  c("healthy", "metastasis")
-)
-
-# Create violin plots with statistics for each metaprogram
-plots_with_stats <- lapply(selected_mps, function(mp) {
-  # Prepare data
-  plot_data <- malignant@meta.data %>%
-    dplyr::select(origin, score = all_of(mp)) %>%
-    filter(!is.na(origin), !is.na(score))
-
-  # Set factor levels for proper ordering
-  plot_data$origin <- factor(plot_data$origin, levels = c("healthy", "primary", "metastasis"))
-
-  # Create violin plot with Wilcoxon tests
-  p <- ggviolin(plot_data, x = "origin", y = "score", fill = "origin",
-                palette = origin_colors,  # Victoria's colors
-                add = "boxplot", add.params = list(fill = "white", width = 0.1)) +
-    stat_compare_means(comparisons = comparisons, method = "wilcox.test",
-                       label = "p.signif", hide.ns = FALSE,
-                       tip.length = 0.02, bracket.size = 0.5) +
-    stat_compare_means(method = "kruskal.test", label.y.npc = 0.95,
-                       label = "p.format") +
-    scale_x_discrete(limits = c("healthy", "primary", "metastasis")) +
-    labs(title = gsub("^(MP[0-9]+) (.*)", "\\1: \\2", mp),
-         subtitle = "Wilcoxon pairwise tests + Kruskal-Wallis overall",
-         x = "Origin", y = "UCell Score") +
-    theme_minimal(base_size = 14) +
-    theme(legend.position = "none",
-          plot.title = element_text(face = "bold", size = 14),
-          axis.title = element_text(size = 12),
-          axis.text = element_text(size = 11))
-
-  return(p)
-})
-
-# Combine plots (2 columns for 4 metaprograms)
-combined_stats <- wrap_plots(plots_with_stats, ncol = 2)
-print(combined_stats)
-
-ggsave(file.path(output_dir, "violin_mp6_mp9_mp17_mp45_with_statistics.png"),
-       combined_stats, width = 16, height = 14, dpi = 300, bg = "white")
-
-# Print detailed statistics
-cat("\n\n=== Detailed Statistical Results ===\n\n")
-for (mp in selected_mps) {
-  cat(paste0("\n--- ", mp, " ---\n"))
-
-  plot_data <- malignant@meta.data %>%
-    dplyr::select(origin, score = all_of(mp)) %>%
-    filter(!is.na(origin), !is.na(score))
-
-  # Kruskal-Wallis overall test
-  kw <- kruskal.test(score ~ origin, data = plot_data)
-  cat("Kruskal-Wallis test (overall):\n")
-  cat("  Chi-squared:", round(kw$statistic, 4), "\n")
-  cat("  p-value:", format.pval(kw$p.value, digits = 3), "\n\n")
-
-  # Pairwise Wilcoxon tests
-  pw <- pairwise.wilcox.test(plot_data$score, plot_data$origin,
-                              p.adjust.method = "BH")
-  cat("Pairwise Wilcoxon tests (BH-adjusted):\n")
-  print(pw$p.value)
-  cat("\n")
-
-  # Summary statistics by group
-  cat("Group means:\n")
-  group_stats <- plot_data %>%
-    group_by(origin) %>%
-    summarise(
-      n = n(),
-      mean = round(mean(score), 4),
-      median = round(median(score), 4),
-      sd = round(sd(score), 4)
-    )
-  print(as.data.frame(group_stats))
+  if (!file.exists(f_scores)) {
+    mp_df <- readxl::read_excel("../Weizman_3CA_meta_programs_2025-01-29.xlsx", sheet = "Malignant")
+    sets <- lapply(mp_df, function(g) unique(g[!is.na(g)]))
+    names(sets) <- stringr::str_squish(names(sets))   # "MP38  NPC (glioma)" has a double space
+    stopifnot(length(sets) == 67)
+    keep <- colnames(obj)[obj$majority_celltype %in% c("Melanoma cells", "Melanocytes")]
+    meta <- obj@meta.data[keep, c("orig.ident", "Sample", "Patient_nr", "origin", "majority_celltype", "Malignant",
+                                  "primary_mutation", "secondary_mutation", "organ", "primary_location",
+                                  "healthy_location", "metastatic_location", "TreatmentStage_ofProcessedSample")]
+    obj[["RNA"]] <- JoinLayers(obj[["RNA"]])
+    cnt <- LayerData(obj, assay = "RNA", layer = "counts")[, keep]
+    # UCell ranks genes within each cell, so counts and log-normalised data give the same score
+    sc <- UCell::ScoreSignatures_UCell(cnt, features = sets, name = "", ncores = 16)[keep, names(sets)]
+    dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+    qs2::qs_save(data.table(cell = keep, meta, sc, check.names = FALSE), f_scores, nthreads = 1)
+  }
+  rm(obj); invisible(gc())
 }
+uc <- qs2::qs_read(f_scores, nthreads = 1)
+mps <- grep("^MP[0-9]+ ", names(uc), value = TRUE)
+stopifnot(length(mps) == 67, all(uc$majority_celltype %in% c("Melanoma cells", "Melanocytes")))
+umap <- fread(f_umap)
 ```
 
-### Ridge Plots - EMT Programs
-
-```{r ridge_origin_emt, fig.width = 14, fig.height = 12}
-emt_mps <- grep("^MP1[5-9] |^MP20 ", ucell_cols, value = TRUE)
-
-plots <- lapply(emt_mps, function(mp) {
-  ggplot(malignant@meta.data, aes(x = .data[[mp]], y = origin, fill = origin)) +
-    geom_density_ridges(alpha = 0.7) +
-    scale_fill_manual(values = origin_colors) +
-    theme_ridges() +
-    labs(title = gsub("^(MP[0-9]+) .*", "\\1", mp), x = "UCell Score", y = "") +
-    theme(legend.position = "none")
-})
-
-combined <- wrap_plots(plots, ncol = 3)
-print(combined)
-ggsave(file.path(output_dir, "ridge_origin_emt.png"), combined, width = 14, height = 12, dpi = 300, bg = "white")
-```
-
-### DotPlot - Interferon Programs
-
-```{r dotplot_origin_interferon, fig.width = 8, fig.height = 6}
-ifn_mps <- grep("^MP2[2-4] ", ucell_cols, value = TRUE)
-
-# Set origin factor levels for proper ordering: healthy → primary → metastasis
-malignant$origin <- factor(malignant$origin, levels = c("healthy", "primary", "metastasis"))
-
-p <- DotPlot(malignant, features = ifn_mps, group.by = "origin") +
-  coord_flip() +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
-  ggtitle("Interferon/MHC Metaprograms by Origin")
-
-print(p)
-ggsave(file.path(output_dir, "dotplot_origin_interferon.png"), p, width = 8, height = 6, dpi = 300, bg = "white")
-```
-
-### DotPlot - Interferon Programs by Treatment (Metastases)
-
-```{r dotplot_ifn_treatment_metastasis, fig.width = 10, fig.height = 6}
-# Focus on metastatic samples and split by treatment
-met_cells <- subset(malignant, origin == "metastasis")
-
-cat("Metastatic cells:", ncol(met_cells), "\n\n")
-cat("Treatment distribution in metastases:\n")
-print(table(met_cells$TreatmentStage_ofProcessedSample, useNA = "always"))
-
-# Create DotPlot by treatment stage
-ifn_mps <- grep("^MP2[2-4] ", ucell_cols, value = TRUE)
-
-p <- DotPlot(met_cells, features = ifn_mps, group.by = "TreatmentStage_ofProcessedSample") +
-  coord_flip() +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
-  ggtitle("Interferon/MHC Metaprograms by Treatment (Metastases Only)")
-
-print(p)
-ggsave(file.path(output_dir, "dotplot_ifn_treatment_metastasis.png"), p, width = 10, height = 6, dpi = 300, bg = "white")
-```
-
-## Comparisons by Organ {.tabset}
-
-### Overview - Organ
-
-```{r organ_overview}
-cat("Cells by organ:\n")
-print(table(malignant$organ))
-```
-
-### Violin Plots - Top Metaprograms
-
-```{r violin_organ_top, fig.width = 18, fig.height = 20}
-top10_mps <- head(mp_means_df$Metaprogram, 10)
-
-plots <- lapply(top10_mps, function(mp) {
-  VlnPlot(malignant, features = mp, group.by = "organ", pt.size = 0) +
-    stat_summary(fun = median, geom = "crossbar", width = 0.5, color = "black") +
-    ggtitle(gsub("^(MP[0-9]+) (.*)", "\\1: \\2", mp)) +
-    theme(legend.position = "none", axis.title.x = element_blank(),
-          axis.text.x = element_text(angle = 45, hjust = 1))
-})
-
-combined <- wrap_plots(plots, ncol = 2)
-print(combined)
-ggsave(file.path(output_dir, "violin_organ_top10.png"), combined, width = 18, height = 20, dpi = 300, bg = "white")
-```
-
-### Heatmap - Top 30 by Organ
-
-```{r heatmap_organ_top30, fig.width = 14, fig.height = 12}
-top30_mps <- head(mp_means_df$Metaprogram, 30)
-
-# Calculate mean scores by organ
-mean_scores <- sapply(top30_mps, function(mp) {
-  tapply(malignant@meta.data[[mp]], malignant$organ, mean, na.rm = TRUE)
-})
-
-# Shorten MP names
-colnames(mean_scores) <- gsub("^(MP[0-9]+) .*", "\\1", colnames(mean_scores))
-
-# Create heatmap
-col_fun <- colorRamp2(
-  quantile(mean_scores, c(0, 0.5, 1)),
-  c("blue", "white", "red")
-)
-
-ht <- Heatmap(
-  mean_scores,
-  name = "Mean\nUCell Score",
-  col = col_fun,
-  cluster_rows = TRUE,
-  cluster_columns = TRUE,
-  row_names_gp = gpar(fontsize = 10),
-  column_names_gp = gpar(fontsize = 8),
-  column_title = "Top 30 Metaprograms by Organ"
-)
-
-png(file.path(output_dir, "heatmap_organ_top30.png"), width = 14, height = 12, units = "in", res = 300)
-draw(ht)
-dev.off()
-
-draw(ht)
-```
-
-## Combined Analysis: Mutation × Origin {.tabset}
-
-### Cell Cycle Programs
-
-```{r combined_mut_origin_cellcycle, fig.width = 18, fig.height = 12}
-# Filter to known primary mutations
-mal_known <- subset(malignant, subset = primary_mutation != "unknown")
-
-cell_cycle_mps <- grep("^MP[1-5] ", ucell_cols, value = TRUE)
-
-plots <- lapply(cell_cycle_mps, function(mp) {
-  ggplot(mal_known@meta.data, aes(x = primary_mutation, y = .data[[mp]], fill = origin)) +
-    geom_violin(alpha = 0.7, scale = "width", position = position_dodge(0.9)) +
-    geom_boxplot(width = 0.2, position = position_dodge(0.9), outlier.size = 0.3) +
-    scale_fill_manual(values = origin_colors) +
-    theme_cowplot() +
-    ggtitle(gsub("^(MP[0-9]+) .*", "\\1", mp)) +
-    theme(axis.text.x = element_text(angle = 45, hjust = 1),
-          axis.title.x = element_blank(),
-          legend.position = "bottom")
-})
-
-combined <- wrap_plots(plots, ncol = 3, guides = "collect") & theme(legend.position = "bottom")
-print(combined)
-ggsave(file.path(output_dir, "combined_mutation_origin_cellcycle.png"), combined, width = 18, height = 12, dpi = 300, bg = "white")
-```
-
-### EMT Programs
-
-```{r combined_mut_origin_emt, fig.width = 18, fig.height = 12}
-emt_mps <- grep("^MP1[5-9] |^MP20 ", ucell_cols, value = TRUE)
-
-plots <- lapply(emt_mps, function(mp) {
-  ggplot(mal_known@meta.data, aes(x = primary_mutation, y = .data[[mp]], fill = origin)) +
-    geom_violin(alpha = 0.7, scale = "width", position = position_dodge(0.9)) +
-    geom_boxplot(width = 0.2, position = position_dodge(0.9), outlier.size = 0.3) +
-    scale_fill_manual(values = origin_colors) +
-    theme_cowplot() +
-    ggtitle(gsub("^(MP[0-9]+) .*", "\\1", mp)) +
-    theme(axis.text.x = element_text(angle = 45, hjust = 1),
-          axis.title.x = element_blank(),
-          legend.position = "bottom")
-})
-
-combined <- wrap_plots(plots, ncol = 3, guides = "collect") & theme(legend.position = "bottom")
-print(combined)
-ggsave(file.path(output_dir, "combined_mutation_origin_emt.png"), combined, width = 18, height = 12, dpi = 300, bg = "white")
-```
-
-## Patient-Level Heterogeneity {.tabset}
-
-### Boxplot - Top Metaprograms
-
-```{r patient_boxplot_top, fig.width = 16, fig.height = 20}
-# Calculate per-sample mean scores for top 10 metaprograms (replicates merged)
-top10_mps <- head(mp_means_df$Metaprogram, 10)
-
-# Filter samples with >= 50 malignant cells (using orig.ident for merged replicates)
-sample_counts <- table(malignant$orig.ident)
-samples_filt <- names(sample_counts[sample_counts >= 50])
-mal_filt <- subset(malignant, subset = orig.ident %in% samples_filt)
-
-cat("Samples with >=50 malignant cells:", length(samples_filt), "\n")
-
-plots <- lapply(top10_mps, function(mp) {
-  sample_stats <- mal_filt@meta.data |>
-    group_by(orig.ident, origin, primary_mutation) |>
-    summarise(mean_score = mean(.data[[mp]], na.rm = TRUE), .groups = "drop")
-
-  ggplot(sample_stats, aes(x = primary_mutation, y = mean_score, fill = origin)) +
-    geom_boxplot(alpha = 0.7) +
-    geom_jitter(width = 0.2, size = 0.5, alpha = 0.5) +
-    scale_fill_manual(values = origin_colors) +
-    theme_cowplot() +
-    ggtitle(gsub("^(MP[0-9]+) (.*)", "\\1: \\2", mp)) +
-    ylab("Mean UCell Score per Sample") +
-    theme(axis.title.x = element_blank(),
-          axis.text.x = element_text(angle = 45, hjust = 1),
-          legend.position = "none")
-})
-
-combined <- wrap_plots(plots, ncol = 2)
-print(combined)
-ggsave(file.path(output_dir, "sample_boxplot_top10.png"), combined, width = 16, height = 20, dpi = 300, bg = "white")
-```
-
-### Heatmap - Sample Heterogeneity
-
-```{r patient_heatmap, fig.width = 16, fig.height = 12}
-top20_mps <- head(mp_means_df$Metaprogram, 20)
-
-# Calculate mean scores per sample (using orig.ident for merged replicates)
-sample_scores <- sapply(top20_mps, function(mp) {
-  tapply(mal_filt@meta.data[[mp]], mal_filt$orig.ident, mean, na.rm = TRUE)
-})
-
-# Shorten MP names
-colnames(sample_scores) <- gsub("^(MP[0-9]+) .*", "\\1", colnames(sample_scores))
-
-# Get sample metadata
-sample_meta <- mal_filt@meta.data |>
-  group_by(orig.ident) |>
-  summarise(
-    origin = unique(origin)[1],
-    primary_mutation = unique(primary_mutation)[1],
-    .groups = "drop"
-  )
-
-# Create annotation
-ha <- rowAnnotation(
-  Origin = sample_meta$origin[match(rownames(sample_scores), sample_meta$orig.ident)],
-  Mutation = sample_meta$primary_mutation[match(rownames(sample_scores), sample_meta$orig.ident)],
-  col = list(
-    Origin = origin_colors,
-    Mutation = primary_mutations_col
-  )
-)
-
-# Create heatmap
-col_fun <- colorRamp2(
-  quantile(sample_scores, c(0, 0.5, 1), na.rm = TRUE),
-  c("blue", "white", "red")
-)
-
-ht <- Heatmap(
-  sample_scores,
-  name = "Mean\nUCell Score",
-  col = col_fun,
-  cluster_rows = TRUE,
-  cluster_columns = TRUE,
-  show_row_names = TRUE,
-  row_names_gp = gpar(fontsize = 7),
-  column_names_gp = gpar(fontsize = 9),
-  column_title = "Sample Heterogeneity - Top 20 Metaprograms",
-  right_annotation = ha
-)
-
-png(file.path(output_dir, "sample_heatmap_top20.png"), width = 16, height = 12, units = "in", res = 300)
-draw(ht)
-dev.off()
-
-draw(ht)
-```
-
-## Export Results
-
-```{r export_results}
-# Export UCell scores for all cells (using orig.ident as Sample for merged replicates)
-ucell_scores <- malignant@meta.data[, c("orig.ident", "majority_celltype", "primary_mutation",
-                                         "secondary_mutation", "origin", "organ", "LocationPrimaryTumor", ucell_cols)]
-colnames(ucell_scores)[1] <- "Sample"  # Rename orig.ident to Sample
-
-write.csv(ucell_scores,
-          file.path(output_dir, "malignant_ucell_scores_all.csv"),
-          row.names = FALSE)
-
-# Export summary statistics by primary mutation
-prim_mut_stats <- mal_known_prim@meta.data |>
-  group_by(primary_mutation) |>
-  summarise(across(all_of(ucell_cols), ~mean(.x, na.rm = TRUE)), .groups = "drop")
-
-write.csv(prim_mut_stats,
-          file.path(output_dir, "ucell_stats_primary_mutation.csv"),
-          row.names = FALSE)
-
-# Export summary statistics by secondary mutation
-sec_mut_stats <- mal_known_sec@meta.data |>
-  group_by(secondary_mutation) |>
-  summarise(across(all_of(ucell_cols), ~mean(.x, na.rm = TRUE)), .groups = "drop")
-
-write.csv(sec_mut_stats,
-          file.path(output_dir, "ucell_stats_secondary_mutation.csv"),
-          row.names = FALSE)
-
-# Export summary statistics by origin
-origin_stats <- malignant@meta.data |>
-  group_by(origin) |>
-  summarise(across(all_of(ucell_cols), ~mean(.x, na.rm = TRUE)), .groups = "drop")
-
-write.csv(origin_stats,
-          file.path(output_dir, "ucell_stats_origin.csv"),
-          row.names = FALSE)
-
-cat("Exported results:\n")
-cat("  - malignant_ucell_scores_all.csv\n")
-cat("  - ucell_stats_primary_mutation.csv\n")
-cat("  - ucell_stats_secondary_mutation.csv\n")
-cat("  - ucell_stats_origin.csv\n")
-```
-
-## Comparisons by Treatment Stage {.tabset}
-
-Stratify metaprogram activity by treatment stage at the time of sample processing.
-
-### Treatment Overview
-
-```{r treatment_overview}
-# Check TreatmentStage_ofProcessedSample in melanocytic cells
-cat("=== Treatment Stage Distribution (Melanocytic Cells) ===\n\n")
-
-if ("TreatmentStage_ofProcessedSample" %in% colnames(malignant@meta.data)) {
-  treatment_table <- table(malignant$TreatmentStage_ofProcessedSample, useNA = "always")
-  print(treatment_table)
-
-  # Cross-tabulation with origin
-  cat("\n=== Treatment Stage by Origin ===\n")
-  print(table(malignant$TreatmentStage_ofProcessedSample, malignant$origin, useNA = "always"))
-
-  # Simplify treatment categories
-  malignant$treatment_simplified <- case_when(
-    malignant$TreatmentStage_ofProcessedSample %in% c("no treatment", NA) ~ "Untreated",
-    malignant$TreatmentStage_ofProcessedSample %in% c("Enucleation", "Iridocyclectomy", "Plaque", "Radiotherapy") ~ "Primary Treatment",
-    grepl("Recurrence", malignant$TreatmentStage_ofProcessedSample) ~ "Post-Recurrence",
-    malignant$TreatmentStage_ofProcessedSample %in% c("Tebentafusp", "Tebentafusp/Mekinist", "pip_nivo") ~ "Systemic Therapy",
-    grepl("NCT", malignant$TreatmentStage_ofProcessedSample) ~ "Clinical Trial",
-    TRUE ~ "Other"
-  )
-
-  cat("\n=== Simplified Treatment Categories ===\n")
-  print(table(malignant$treatment_simplified))
-} else {
-  cat("TreatmentStage_ofProcessedSample column not found.\n")
+The score table holds `r format(nrow(uc), big.mark = ",")` melanocytic cells
+(`r format(sum(uc$majority_celltype == "Melanoma cells"), big.mark = ",")` melanoma cells,
+`r format(sum(uc$majority_celltype == "Melanocytes"), big.mark = ",")` melanocytes) from
+`r uniqueN(uc$orig.ident)` tumours/tissues of `r uniqueN(uc$Patient_nr)` patients.
+
+```{r helpers}
+nfmt <- function(x) formatC(x, format = "d", big.mark = ",")
+mp_of <- function(s) { m <- grep(paste0("^", s, " "), mps, value = TRUE); stopifnot(length(m) == 1); m }
+wrap_cap <- function(x, width_in) paste(strwrap(x, floor(13 * width_in)), collapse = "\n")
+adj_label <- function(padj) sprintf("%s  adj. p %s",
+  as.character(cut(padj, c(-Inf, 0.001, 0.01, 0.05, Inf), c("***", "**", "*", "ns"))),
+  ifelse(padj < 2.2e-16, "< 2.2e-16", paste("=", trimws(formatC(padj, digits = 2, format = "g")))))
+thm <- theme_classic(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5), plot.caption = element_text(hjust = 0, size = 8.5),
+        plot.caption.position = "plot", plot.title.position = "plot")
+save_gg <- function(p, id, w, h) {
+  ggsave(file.path(fig_dir, paste0(id, ".pdf")), p, width = w, height = h, device = cairo_pdf)
+  ggsave(file.path(fig_dir, paste0(id, ".png")), p, width = w, height = h, dpi = 300, bg = "white")
 }
+show_png <- function(ids) knitr::include_graphics(file.path(fig_dir, paste0(ids, ".png")))
+cells_txt <- sprintf("%s melanocytic cells (%s melanoma cells, %s melanocytes)", nfmt(nrow(uc)),
+                     nfmt(uc[majority_celltype == "Melanoma cells", .N]), nfmt(uc[majority_celltype == "Melanocytes", .N]))
+
+# x: one row per cell with orig.ident, Patient_nr, the grouping column and the score v.
+# pts = one point per orig.ident (>= MIN_CELLS cells); pat = patient means, the unit of the test.
+units <- function(x, grp) {
+  pts <- x[, .(score = mean(v), n_cells = .N), by = c("orig.ident", "Patient_nr", grp)]
+  stopifnot("an orig.ident sits in two groups" = !anyDuplicated(pts$orig.ident))
+  pts <- pts[n_cells >= MIN_CELLS]
+  list(pts = pts, pat = x[orig.ident %in% pts$orig.ident, .(score = mean(v), n_cells = .N), by = c("Patient_nr", grp)])
+}
+pat_tests <- function(u, grp, levels, panel, what) {   # all pairs of groups with >= 3 patients
+  n_by <- table(factor(u$pat[[grp]], levels = levels)); lv <- names(n_by)[n_by >= 3]
+  if (length(lv) < 2) return(data.table())
+  rbindlist(lapply(combn(lv, 2, simplify = FALSE), function(pr) {
+    a <- u$pat[get(grp) == pr[1], score]; b <- u$pat[get(grp) == pr[2], score]
+    data.table(panel = panel, score = what, group1 = pr[1], group2 = pr[2], n_patients1 = length(a),
+               n_patients2 = length(b), median1 = median(a), median2 = median(b),
+               p = suppressWarnings(wilcox.test(a, b)$p.value))
+  }))
+}
+with_bh <- function(tt) { if (nrow(tt)) tt[, p_adj_BH := p.adjust(p, "BH")]; tt }
+box_panel <- function(u, grp, levels, tests, title, fill = NULL, note = NULL, width = 6.5, ylab = "Mean UCell score") {
+  pts <- u$pts[get(grp) %in% levels]; pat <- u$pat[get(grp) %in% levels]
+  levels <- levels[levels %in% pts[[grp]]]
+  stopifnot(nrow(pts) > 0)
+  pts[, x := factor(get(grp), levels = levels)]
+  n_pt <- table(pts$x); n_pa <- table(factor(pat[[grp]], levels = levels)); small <- names(n_pa)[n_pa < 3]
+  xlab <- setNames(sprintf("%s\nn = %d (%d pat.)", levels, as.integer(n_pt), as.integer(n_pa)), levels)
+  tt <- if (nrow(tests)) tests[group1 %in% levels & group2 %in% levels] else tests
+  cap <- paste(c(sprintf("Points = tumour/tissue (orig.ident, >= %d cells). n = orig.ident (patients).", MIN_CELLS),
+                 if (nrow(tt)) sprintf("Wilcoxon on patient means, two-sided, BH-adjusted within the panel (%d tests).", nrow(tt)),
+                 if (length(small)) sprintf("Not tested (< 3 patients): %s.", paste(small, collapse = ", ")), note),
+               collapse = " ")
+  p <- ggplot(pts, aes(x, score)) +
+    (if (is.null(fill)) geom_boxplot(fill = "grey85", alpha = 0.7, outlier.shape = NA, width = 0.6)
+     else geom_boxplot(aes(fill = x), alpha = 0.45, outlier.shape = NA, width = 0.6, show.legend = FALSE)) +
+    geom_quasirandom(width = 0.22, alpha = 0.85, colour = "black", size = 2.2) +
+    scale_x_discrete(labels = xlab) +
+    scale_y_continuous(expand = expansion(mult = c(0.05, 0.06 + 0.11 * nrow(tt)))) +
+    labs(title = title, x = NULL, y = ylab, caption = wrap_cap(cap, width)) + thm
+  if (!is.null(fill)) p <- p + scale_fill_manual(values = fill)
+  if (nrow(tt)) p <- p + geom_signif(comparisons = unname(Map(c, tt$group1, tt$group2)),
+                                     annotations = adj_label(tt$p_adj_BH), step_increase = 0.11,
+                                     tip_length = 0.01, textsize = 3.2, vjust = -0.2)
+  p
+}
+
+# Score UMAP: cells drawn in order of score, highest on top (random order among ties).
+umm <- merge(umap, uc[, c("cell", mps), with = FALSE], by = "cell")
+stopifnot("UMAP misses melanocytic cells" = nrow(umm) == nrow(uc))
+set.seed(14); umm <- umm[sample(.N)]
+umap_panel <- function(m, id) {
+  lim <- quantile(umm[[m]], UMAP_Q); if (diff(lim) <= 0) lim <- range(umm[[m]])
+  p <- ggplot(umm[order(umm[[m]])], aes(UMAP_1, UMAP_2, colour = .data[[m]])) +
+    geom_scattermore(pointsize = 2.8, pixels = c(2400, 2400)) +
+    scale_colour_viridis_c(option = "magma", limits = lim, oob = scales::squish, name = "UCell") +
+    labs(title = m, x = "UMAP 1", y = "UMAP 2",
+         caption = wrap_cap(sprintf("Atlas UMAP, %s. Highest score on top; colour capped at percentiles %g and %g (%.3f-%.3f).",
+                                    cells_txt, 100 * UMAP_Q[1], 100 * UMAP_Q[2], lim[1], lim[2]), 7.5)) +
+    thm + theme(aspect.ratio = 1)
+  save_gg(p, id, 7.5, 7)
+}
+# One program: UMAP + patient-level boxplot by disease category; returns the tests.
+program_panels <- function(s, umap_id, box_id) {
+  m <- mp_of(s)
+  umap_panel(m, umap_id)
+  u <- units(uc[, .(orig.ident, Patient_nr, origin, v = get(m))], "origin")
+  tt <- with_bh(pat_tests(u, "origin", ORIGINS, box_id, m))
+  save_gg(box_panel(u, "origin", ORIGINS, tt, m, fill = origin_colors,
+                    note = "Melanoma cells of tumours, melanocytes of non-malignant tissue."), box_id, 6.5, 6.5)
+  tt
+}
+tests <- list()
 ```
 
-### Metaprograms by Treatment (Primary Samples)
+## Fig. 3a / Suppl. Fig. 6a
 
-```{r treatment_primary_samples, fig.width=16, fig.height=24}
-if ("TreatmentStage_ofProcessedSample" %in% colnames(malignant@meta.data)) {
-  # Focus on primary tumors with different treatments
-  primary_cells <- subset(malignant, origin == "primary")
-  cat("Primary tumor cells:", ncol(primary_cells), "\n")
+Correlation (Pearson, cell level) of the 30 programs with the highest mean UCell score, and the top 20 programs.
 
-  # Get top 10 metaprograms
-  top_mps <- ucell_cols[1:min(10, length(ucell_cols))]
+```{r fig3a-sfig6a, fig.width = 10, fig.height = 9}
+mp_mean <- sort(colMeans(uc[, ..mps]), decreasing = TRUE)
+top30 <- names(mp_mean)[1:30]
+cm <- cor(as.matrix(uc[, ..top30]))
+dimnames(cm) <- list(sub(" .*", "", top30), sub(" .*", "", top30))
+# Heatmap built inside each device: a stored Heatmap object can crash a later ggsave
+make_ht <- function() Heatmap(cm, name = "Pearson r", col = colorRamp2(c(-1, 0, 1), c("blue", "white", "red")),
+                              row_names_gp = gpar(fontsize = 9), column_names_gp = gpar(fontsize = 9),
+                              column_title = sprintf("Top 30 metaprograms by mean UCell, cell-level correlation\n(%s melanocytic cells)", nfmt(nrow(uc))),
+                              column_title_gp = gpar(fontsize = 11, fontface = "bold"))
+png(file.path(fig_dir, "Fig3a_mp_top30_correlation.png"), width = 8.5, height = 8, units = "in", res = 300)
+draw(make_ht(), padding = unit(c(3, 3, 3, 12), "mm")); invisible(dev.off())
+cairo_pdf(file.path(fig_dir, "Fig3a_mp_top30_correlation.pdf"), width = 8.5, height = 8)
+draw(make_ht(), padding = unit(c(3, 3, 3, 12), "mm")); invisible(dev.off())
 
-  # Violin plots by treatment
-  plots <- lapply(top_mps, function(mp) {
-    VlnPlot(primary_cells, features = mp, group.by = "TreatmentStage_ofProcessedSample", pt.size = 0) +
-      theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
-            legend.position = "none") +
-      ggtitle(gsub("_UCell", "", mp))
+b <- data.table(MP = names(mp_mean)[1:20], mean = unname(mp_mean[1:20]))
+p <- ggplot(b, aes(mean, reorder(MP, mean))) + geom_col(fill = "steelblue", width = 0.75) +
+  geom_text(aes(label = sprintf("%.3f", mean)), hjust = -0.15, size = 3.2) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.12))) +
+  labs(title = "Top 20 metaprograms by mean UCell score", x = "Mean UCell score", y = NULL,
+       caption = wrap_cap(sprintf("All %s; cell-level mean.", cells_txt), 8)) + thm
+save_gg(p, "SFig6a_mp_top20_mean_ucell", 8, 7)
+show_png(c("Fig3a_mp_top30_correlation", "SFig6a_mp_top20_mean_ucell"))
+```
+
+## Fig. 3c-d MP30
+
+```{r fig3cd}
+tests$Fig3d <- program_panels("MP30", "Fig3c_umap_MP30", "Fig3d_box_MP30_origin")
+show_png(c("Fig3c_umap_MP30", "Fig3d_box_MP30_origin"))
+```
+
+## Fig. 3e-f MP45
+
+```{r fig3ef}
+tests$Fig3f <- program_panels("MP45", "Fig3e_umap_MP45", "Fig3f_box_MP45_origin")
+show_png(c("Fig3e_umap_MP45", "Fig3f_box_MP45_origin"))
+```
+
+## Fig. 3h-i MP17
+
+```{r fig3hi}
+tests$Fig3i <- program_panels("MP17", "Fig3h_umap_MP17", "Fig3i_box_MP17_origin")
+show_png(c("Fig3h_umap_MP17", "Fig3i_box_MP17_origin"))
+```
+
+## Fig. 3j-k MP9
+
+```{r fig3jk}
+tests$Fig3k <- program_panels("MP9", "Fig3j_umap_MP9", "Fig3k_box_MP9_origin")
+show_png(c("Fig3j_umap_MP9", "Fig3k_box_MP9_origin"))
+```
+
+## Fig. 3l-m Interferon/MHC-II
+
+Dot plots with Seurat `DotPlot` semantics on the UCell scores (colour: per-program z-score of the group average,
+clipped at +-2.5; size: % cells with a score > 0), and the same programs as patient-level boxplots.
+Treatment groups of the metastases have 1-3 patients each, so that comparison is descriptive.
+
+```{r fig3lm}
+ifn <- vapply(c("MP22", "MP23", "MP24"), mp_of, character(1))
+dot_panel <- function(x, grp, levels, labels, id, w, h) {
+  long <- melt(x[, c(grp, ifn), with = FALSE], id.vars = grp, variable.name = "MP", value.name = "s")
+  dd <- long[, .(avg = mean(expm1(s)), pct = 100 * mean(s > 0)), by = c(grp, "MP")]
+  dd[, z := pmin(pmax(as.numeric(scale(log1p(avg))), -2.5), 2.5), by = MP]
+  dd[, g := factor(get(grp), levels = levels)][, MP := factor(MP, levels = ifn)]
+  stopifnot(!anyNA(dd$g))
+  p <- ggplot(dd, aes(g, MP, colour = z, size = pct)) + geom_point() +
+    scale_colour_gradient(low = "lightgrey", high = "blue", name = "Average Expression") +
+    scale_radius(range = c(1, 6), name = "Percent Expressed") +
+    scale_x_discrete(labels = labels) + labs(x = NULL, y = NULL) + thm +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  save_gg(p, id, w, h)
+}
+ifn_boxes <- function(x, grp, levels, test, fill, id, title, cap, w, h, flip = FALSE) {
+  us <- lapply(ifn, function(m) units(x[, .(orig.ident, Patient_nr, g = get(grp), v = get(m))], "g"))
+  tt <- if (test) with_bh(rbindlist(Map(function(u, m) pat_tests(u, "g", levels, id, m), us, ifn))) else data.table()
+  ps <- lapply(seq_along(ifn), function(i) {
+    ti <- if (test) tt[score == ifn[i]] else data.table()
+    p <- box_panel(us[[i]], "g", if (flip) rev(levels) else levels, ti, ifn[i], fill = fill) + labs(caption = NULL)
+    if (flip) p <- p + coord_flip() + if (i > 1) theme(axis.text.y = element_blank(), axis.ticks.y = element_blank())
+    p
   })
-
-  combined <- wrap_plots(plots, ncol = 2)
-  print(combined)
-
-  ggsave(
-    file.path(output_dir, "violin_treatment_primary_top10.png"),
-    combined, width = 16, height = 20, dpi = 300, bg = "white"
-  )
+  save_gg(wrap_plots(ps, nrow = 1) + plot_annotation(title = title, caption = wrap_cap(cap, w), theme = thm), id, w, h)
+  tt
 }
+
+dot_panel(uc, "origin", ORIGINS, setNames(ORIGINS, ORIGINS), "Fig3l_dotplot_MP22_24_origin", 6.5, 4.5)
+tests$Fig3l <- ifn_boxes(uc, "origin", ORIGINS, TRUE, origin_colors, "Fig3l_box_MP22_24_origin",
+                         "Interferon/MHC-II programs by disease category",
+                         sprintf("Points = tumour/tissue (orig.ident, >= %d cells); %s. Wilcoxon on patient means, two-sided, BH-adjusted within the panel (9 tests: 3 programs x 3 comparisons). n = orig.ident (patients).",
+                                 MIN_CELLS, cells_txt), 14.5, 6.5)
+
+met <- uc[origin == "metastasis"]
+tr_lv <- sort(unique(met$TreatmentStage_ofProcessedSample))
+dot_panel(met, "TreatmentStage_ofProcessedSample", tr_lv, setNames(sub(" \\(", "\n(", tr_lv), tr_lv),
+          "Fig3m_dotplot_MP22_24_treatment", 8, 5)
+n_tr <- met[, .(n_pat = uniqueN(Patient_nr), n_cells = .N), by = TreatmentStage_ofProcessedSample][order(-n_pat, -n_cells)]
+ifn_boxes(met, "TreatmentStage_ofProcessedSample", n_tr$TreatmentStage_ofProcessedSample, FALSE, NULL,
+          "Fig3m_box_MP22_24_treatment", "Interferon/MHC-II programs by treatment, metastases",
+          sprintf("Points = tumour/tissue (orig.ident). %s melanoma cells of %d metastases (%d patients). n = orig.ident (patients). %d-%d patients per arm: descriptive, no test.",
+                  nfmt(nrow(met)), uniqueN(met$orig.ident), uniqueN(met$Patient_nr), min(n_tr$n_pat), max(n_tr$n_pat)),
+          14, 5.5, flip = TRUE)
+show_png(c("Fig3l_dotplot_MP22_24_origin", "Fig3l_box_MP22_24_origin",
+       "Fig3m_dotplot_MP22_24_treatment", "Fig3m_box_MP22_24_treatment"))
 ```
 
-### Metaprograms by Treatment (Metastatic Samples)
+## Suppl. Fig. 6b
 
-```{r treatment_metastatic_samples, fig.width=16, fig.height=24}
-if ("TreatmentStage_ofProcessedSample" %in% colnames(malignant@meta.data)) {
-  # Focus on metastatic samples with different treatments
-  met_cells <- subset(malignant, origin == "metastasis")
-  cat("Metastatic cells:", ncol(met_cells), "\n")
+MP45 in malignant cells of primary tumours by intra-ocular location.
 
-  # Get treatment distribution in metastatic samples
-  cat("\nTreatment distribution in metastatic samples:\n")
-  print(table(met_cells$TreatmentStage_ofProcessedSample))
-
-  # Violin plots by treatment for metastatic samples
-  plots <- lapply(top_mps, function(mp) {
-    VlnPlot(met_cells, features = mp, group.by = "TreatmentStage_ofProcessedSample", pt.size = 0) +
-      theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
-            legend.position = "none") +
-      ggtitle(gsub("_UCell", "", mp))
-  })
-
-  combined <- wrap_plots(plots, ncol = 2)
-  print(combined)
-
-  ggsave(
-    file.path(output_dir, "violin_treatment_metastatic_top10.png"),
-    combined, width = 16, height = 20, dpi = 300, bg = "white"
-  )
-}
+```{r sfig6b}
+m45 <- mp_of("MP45")
+u6 <- units(uc[Malignant == "Malignant" & origin == "primary", .(orig.ident, Patient_nr, primary_location, v = get(m45))],
+            "primary_location")
+tests$SFig6b <- with_bh(pat_tests(u6, "primary_location", LOCS, "SFig6b_box_MP45_pUM_location", m45))
+save_gg(box_panel(u6, "primary_location", LOCS, tests$SFig6b, paste(m45, "in primary UM"), fill = primary_location_colors,
+                  ylab = "Mean UCell score, malignant cells", note = "Ciliochoroidal (1 patient) not shown.", width = 7),
+        "SFig6b_box_MP45_pUM_location", 7, 6.5)
+show_png("SFig6b_box_MP45_pUM_location")
 ```
 
-### Pre-Treatment vs Post-Treatment Comparison
-
-```{r pretreatment_comparison, fig.width=14, fig.height=10}
-if ("treatment_simplified" %in% colnames(malignant@meta.data)) {
-  # Compare untreated vs treated (primary therapy) in primary samples
-  primary_cells <- subset(malignant, origin == "primary")
-
-  # Filter to primary treatment vs post-recurrence
-  treatment_compare <- subset(
-    primary_cells,
-    treatment_simplified %in% c("Primary Treatment", "Post-Recurrence")
-  )
-
-  cat("Cells for comparison:\n")
-  print(table(treatment_compare$treatment_simplified))
-
-  if (ncol(treatment_compare) > 100) {
-    # Statistical comparison
-    cat("\n=== Statistical Comparison: Primary Treatment vs Post-Recurrence ===\n\n")
-
-    results <- data.frame(
-      metaprogram = character(),
-      mean_primary = numeric(),
-      mean_recurrence = numeric(),
-      p_value = numeric(),
-      stringsAsFactors = FALSE
-    )
-
-    for (mp in top_mps) {
-      primary_vals <- treatment_compare@meta.data[[mp]][treatment_compare$treatment_simplified == "Primary Treatment"]
-      recurrence_vals <- treatment_compare@meta.data[[mp]][treatment_compare$treatment_simplified == "Post-Recurrence"]
-
-      if (length(primary_vals) > 10 && length(recurrence_vals) > 10) {
-        test <- wilcox.test(primary_vals, recurrence_vals)
-        results <- rbind(results, data.frame(
-          metaprogram = gsub("_UCell", "", mp),
-          mean_primary = mean(primary_vals, na.rm = TRUE),
-          mean_recurrence = mean(recurrence_vals, na.rm = TRUE),
-          p_value = test$p.value
-        ))
-      }
-    }
-
-    results$p_adj <- p.adjust(results$p_value, method = "BH")
-    results$significant <- results$p_adj < 0.05
-    results <- results[order(results$p_value), ]
-
-    print(results)
-
-    write.csv(
-      results,
-      file.path(output_dir, "treatment_comparison_stats.csv"),
-      row.names = FALSE
-    )
-
-    # Visualization
-    results_long <- results |>
-      pivot_longer(cols = c(mean_primary, mean_recurrence),
-                   names_to = "group", values_to = "mean_score") |>
-      mutate(group = gsub("mean_", "", group))
-
-    p_compare <- ggplot(results_long, aes(x = reorder(metaprogram, -mean_score), y = mean_score, fill = group)) +
-      geom_bar(stat = "identity", position = "dodge") +
-      scale_fill_manual(values = c("primary" = "#E41A1C", "recurrence" = "#377EB8"),
-                        labels = c("Primary Treatment", "Post-Recurrence")) +
-      labs(
-        title = "Metaprogram Activity: Primary Treatment vs Post-Recurrence",
-        x = "Metaprogram",
-        y = "Mean UCell Score",
-        fill = "Treatment Stage"
-      ) +
-      theme_classic(base_size = 12) +
-      theme(axis.text.x = element_text(angle = 45, hjust = 1))
-    print(p_compare)
-
-    ggsave(
-      file.path(output_dir, "barplot_primary_vs_recurrence.png"),
-      p_compare, width = 12, height = 6, dpi = 300, bg = "white"
-    )
-  }
-}
+```{r write-tests, include=FALSE}
+fwrite(rbindlist(tests), file.path(tab_dir, "tests_metaprograms.csv"))
 ```
 
-### Systemic Therapy Response (Metastases)
+## Session info
 
-```{r systemic_therapy, fig.width=14, fig.height=14}
-if ("treatment_simplified" %in% colnames(malignant@meta.data)) {
-  # Focus on metastatic samples: untreated vs systemic therapy
-  met_cells <- subset(malignant, origin == "metastasis")
-
-  cat("=== Metastatic Samples by Treatment ===\n")
-  print(table(met_cells$treatment_simplified))
-
-  # Compare untreated vs systemic therapy in metastatic samples
-  met_compare <- subset(
-    met_cells,
-    treatment_simplified %in% c("Untreated", "Systemic Therapy")
-  )
-
-  if (ncol(met_compare) > 100) {
-    cat("\nCells for comparison (Untreated vs Systemic Therapy):\n")
-    print(table(met_compare$treatment_simplified))
-
-    # Violin plots
-    plots <- lapply(top_mps[1:min(6, length(top_mps))], function(mp) {
-      VlnPlot(met_compare, features = mp, group.by = "treatment_simplified", pt.size = 0) +
-        theme(legend.position = "none") +
-        ggtitle(gsub("_UCell", "", mp))
-    })
-
-    combined <- wrap_plots(plots, ncol = 2)
-    print(combined)
-
-    ggsave(
-      file.path(output_dir, "violin_systemic_therapy_effect.png"),
-      combined, width = 12, height = 12, dpi = 300, bg = "white"
-    )
-  }
-}
-```
-
-### Export Treatment Statistics
-
-```{r export_treatment_stats}
-if ("TreatmentStage_ofProcessedSample" %in% colnames(malignant@meta.data)) {
-  # Export statistics by treatment
-  treatment_stats <- malignant@meta.data |>
-    filter(!is.na(TreatmentStage_ofProcessedSample)) |>
-    group_by(TreatmentStage_ofProcessedSample) |>
-    summarise(
-      n_cells = n(),
-      across(all_of(ucell_cols), ~mean(.x, na.rm = TRUE)),
-      .groups = "drop"
-    )
-
-  write.csv(
-    treatment_stats,
-    file.path(output_dir, "ucell_stats_treatment.csv"),
-    row.names = FALSE
-  )
-
-  # Export simplified treatment stats
-  if ("treatment_simplified" %in% colnames(malignant@meta.data)) {
-    simplified_stats <- malignant@meta.data |>
-      group_by(treatment_simplified) |>
-      summarise(
-        n_cells = n(),
-        across(all_of(ucell_cols), ~mean(.x, na.rm = TRUE)),
-        .groups = "drop"
-      )
-
-    write.csv(
-      simplified_stats,
-      file.path(output_dir, "ucell_stats_treatment_simplified.csv"),
-      row.names = FALSE
-    )
-  }
-
-  cat("Exported treatment statistics:\n")
-  cat("  - ucell_stats_treatment.csv\n")
-  cat("  - ucell_stats_treatment_simplified.csv\n")
-}
-```
-
-## Session Info
-
-```{r session_info}
+```{r session-info}
 sessionInfo()
 ```
