@@ -9,11 +9,11 @@ The analyses re-run for the revision on the October 2026 atlas object are in [`R
 | Metadata variable | Name in figure | Explanation |
 | --- | --- | --- |
 | primary_location  | Intraocular Location  | Location within the eye where the primary tumor arose. NA for samples that are not primary UM |
-| origin | Disease Progression | Indicates if cells come from a healthy sample, primary tumor or metastasis |
+| origin | Disease Category | Indicates if cells come from a healthy sample, primary tumor or metastasis |
 | orig.ident | Sample | Identifies physical tissue sample cells originate from |
 | location | Location | Location (intraocular location and location of metastasis) for all samples in the data set |
 | samplename | Sample Name | Identifies biological replicates sequenced in different libraries (use instead of Sample column (that shows projectnumber and Index from FGCZ |
-| healthy_location | Intraocular Location Healthy | Identifies intraocular location from healthy tissue |
+| healthy_location | Intraocular Location non-malignant | Identifies intraocular location of non-malignant tissue |
 | Condition | Batch | Indicates sequencing batch for each sample |
 | primary_mutation | Primary Mutation | Identifies primary mutation (GNAQ, GNA11, PLCB4 or CYSLTR2) for each sample (assessed by WES or targeted sequencing) |
 | secondary_mutation | Secondary Mutation | Identifies secondary mutation (BAP1, SF3B1 or EIF1AX) for each sample (assessed by WES or targeted sequencing) |
@@ -38,7 +38,7 @@ The analyses re-run for the revision on the October 2026 atlas object are in [`R
 | LocationPrimaryTumor | Location of Primary Tumor | Identifies intaocular location of primary tumor also for metastases samples |
 
 ## Symbols to Use in Plots for h-p-m
-- **healthy**: ● Circle (nr. 1)
+- **non-malignant**: ● Circle (nr. 1)
 - **primary**: ▲ Triangle (nr. 2)
 - **metastases**: ◆ Diamond (nr. 5)
 
