@@ -1,5 +1,7 @@
 ---
-title: "Xenium 3-Cohort Spatial Validation of Melanoma Stemness Signature"
+title: "Xenium 5K: spatial stemness and iCNV of uveal melanoma"
+params:
+  xenium_dir: "xenium_inputs"
 output:
   html_document:
     self_contained: true
@@ -13,1061 +15,302 @@ editor_options:
 
 ```{r script-info, include=FALSE}
 # This script was used to create the following figures:
-# Figure 2 (spatial validation of melanoma stemness signature on 3 Xenium cohorts: Boston, Zurich-B1, Zurich-B2)
+# Figure 2g (metastasis sections: cell types, stemness score and CNV score maps)
+# Figure 2h and Supplementary Figure 5b (chr3 loss / chr8 gain iCNV maps of the melanoma cells, metastasis sections)
+# Figure 2i (stemness vs CNV score per melanoma cell, metastasis sections, Pearson R)
+# Supplementary Figure 5a (pUM26 primary eye tumour and liver metastasis: cell types, stemness and iCNV maps)
+# Supplementary Figure 5c (stemness vs CNV score per melanoma cell, pUM26, Pearson R)
 ```
 
-#  {.tabset}
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+suppressPackageStartupMessages({ library(qs2); library(data.table); library(ggplot2); library(patchwork) })
+source("colors_2026b.R")
+
+# Raw inputs (Seurat objects, iCNV h5ad files), set on the render command; layout in the Methods tab
+xenium_dir <- params$xenium_dir
+out_boston <- "../Outputs/Xenium_Stemness_Boston_2026b"
+out_pum26  <- "../Outputs/Xenium_Stemness_pUM26_2026b"
+dir.create("figures", showWarnings = FALSE)
+dir.create("tables", showWarnings = FALSE)
+
+# Stemness signature on the 5,001-gene panel: gene correlations with the CytoTRACE2 score in malignant atlas cells
+# (CytoTRACE2.Rmd), restricted to panel genes; the 50 most positively correlated genes are scored.
+panel_top50 <- function(panel, n = 50) {
+  cr <- fread("../Outputs/CytoTRACE2_2026b/gene_cor_malignant.csv")[gene %in% panel & !is.na(correlation)]
+  cr[order(-correlation)][1:n, gene]
+}
+# UCell with maxRank 150: most Xenium cells detect < 500 panel genes, beyond rank ~150 only zero-count ties remain
+ucell_stemness <- function(counts) {
+  S <- UCell::ScoreSignatures_UCell(counts, features = list(Top = panel_top50(rownames(counts))), name = "",
+                                    maxRank = 150, ncores = 8)
+  S[colnames(counts), "Top"]
+}
+
+# Raster size and point radius of one section map: >= 4000 px on the short side, aspect ratio kept, point radius
+# 0.9 x the median distance between neighbouring cell centroids so the tissue reads as filled.
+spatial_raster <- function(x, y, short_px = 4000, max_px = 20000, frac = 0.9) {
+  xr <- diff(range(x)) * 1.1; yr <- diff(range(y)) * 1.1
+  ratio <- max(xr, yr) / min(xr, yr)
+  short_px <- min(short_px, max_px / ratio)
+  px <- if (yr >= xr) c(short_px, short_px * ratio) else c(short_px * ratio, short_px)
+  nn <- median(RANN::nn2(cbind(x, y), k = 2)$nn.dists[, 2])
+  list(px = round(px), pointsize = max(1, frac * nn * px[1] / xr))
+}
+map_theme <- theme_classic(base_size = 22) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5), legend.title = element_text(size = 33),
+        legend.text = element_text(size = 26.4), legend.key.size = unit(0.55, "in"))
+title_theme <- theme(plot.title = element_text(size = 30, face = "bold", hjust = 0.5))
+cytotrace_colors <- c("#000004FF", "#3B0F70FF", "#8C2981FF", "#DE4968FF", "#FE9F6DFF", "#FCFDBFFF")
+Q <- c(0.01, 0.99)   # colour caps (percentiles), values beyond take the end colour
+
+# Three maps of one section: cell types | stemness | CNV. f: x, y, celltype, stem, cnv
+spatial_3panel <- function(f, ct_cols, stem_lim, cnv_scale, cnv_title, title) {
+  ras <- spatial_raster(f$x, f$y)
+  pt <- function() scattermore::geom_scattermore(pointsize = ras$pointsize, pixels = ras$px)
+  ax <- labs(x = "x (µm)", y = "y (µm)")
+  p1 <- ggplot(f, aes(x, y, colour = celltype)) + pt() +
+    scale_colour_manual(values = ct_cols, drop = TRUE, name = "Cell type") +
+    guides(colour = guide_legend(override.aes = list(size = 9))) + coord_fixed() + map_theme + ax + labs(title = "Cell types")
+  p2 <- ggplot(f[order(stem)], aes(x, y, colour = stem)) + pt() +   # highest score drawn on top
+    scale_colour_gradientn(colours = cytotrace_colors, limits = stem_lim, oob = scales::squish,
+                           name = sprintf("Stemness\n(UCell)\ncapped at\n%g-%gth pct", 100 * Q[1], 100 * Q[2])) +
+    coord_fixed() + map_theme + ax + labs(title = "Stemness\n(Top 50 panel genes)")
+  p3 <- ggplot(f[order(!is.na(cnv), abs(cnv))], aes(x, y, colour = cnv)) + pt() + cnv_scale +
+    coord_fixed() + map_theme + ax + labs(title = cnv_title)
+  (p1 | p2 | p3) + plot_annotation(title = title, theme = title_theme)
+}
+map_height <- function(x, y, per_panel = 6.2) round(min(26, max(9.5, per_panel * diff(range(y)) / diff(range(x)) + 3)), 1)
+
+# Stemness vs per-cell CNV RMS in melanoma cells, one facet per section. Pearson R on cells within a section:
+# cell-level and descriptive, so no p-value (cells are not independent replicates).
+stem_cnv_scatter <- function(m, ylab, ncol = 3, labeller = "label_value") {
+  ggplot(as.data.frame(m), aes(stem, cnv_rms)) +
+    geom_point(colour = "grey50", alpha = 0.2, size = 0.5) +
+    geom_smooth(method = "lm", formula = y ~ x, colour = "black", se = TRUE, linewidth = 0.8) +
+    ggpubr::stat_cor(aes(label = after_stat(sprintf("italic(R)~`=`~%s", signif(r, 2)))), method = "pearson",
+                     label.x.npc = 0.05, label.y.npc = 0.95, size = 3.5, geom = "label", fill = "white", border.colour = NA) +
+    facet_wrap(~sample, scales = "free", ncol = ncol, labeller = labeller) +
+    theme_classic(base_size = 12) + theme(strip.text = element_text(face = "bold")) +
+    labs(x = "Stemness score (Top 50 panel genes, UCell)", y = ylab,
+         title = "Melanoma cells: CNV score vs stemness score (per section)",
+         subtitle = "Pearson R on cells within each section: cell-level, descriptive (no p-value)")
+}
+
+# Figure panels: PDF + PNG in figures/, PNG shown in the report
+save_panel <- function(p, name, w, h) {
+  png <- file.path("figures", paste0(name, ".png"))
+  ggsave(png, p, width = w, height = h, dpi = 300, bg = "white", limitsize = FALSE)
+  ggsave(file.path("figures", paste0(name, ".pdf")), p, width = w, height = h, device = cairo_pdf)
+  png
+}
+show_tabs <- function(pngs) for (s in names(pngs)) cat("###", s, "\n\n![](", pngs[[s]], ")\n\n", sep = "")
+need <- function(f, how) if (!file.exists(f)) stop(f, " is missing: ", how)
+```
+
+```{r boston-data, include=FALSE}
+# Per-cell stemness score, cell type, coordinates and per-cluster CNV score of the metastasis sections (computed once)
+boston_cache <- file.path(out_boston, "boston_scores_2026b.qs2")
+if (!file.exists(boston_cache)) {
+  library(Seurat)
+  obj <- qs_read(file.path(xenium_dir, "boston/xenium_boston.qs2"))
+  counts <- LayerData(obj, assay = "Xenium", layer = "counts")
+  md <- obj@meta.data
+  cells <- data.table(cell = colnames(obj), sample = md$Sample, tissue = md$Tissue_Type, timepoint = md$Timepoint,
+                      response = md$Best_Response, celltype = as.character(md$CellType_Display),
+                      panel_malignant_Top = ucell_stemness(counts))
+  coords <- rbindlist(lapply(Images(obj), function(f) as.data.table(GetTissueCoordinates(obj, image = f, which = "centroids"))))
+  cells[coords, on = "cell", `:=`(x = i.x, y = i.y)]
+  cnv <- fread(file.path(xenium_dir, "boston/cnv_scores_per_cluster.csv"))[, cell := paste0(sample, "_", cell_barcode)]
+  cells[cnv, on = "cell", cnv_score := i.cnv_score]
+  qs_save(list(cells = cells), boston_cache)
+}
+d <- qs_read(boston_cache, nthreads = 1)$cells[, .(cell, sample, tissue, timepoint, response, celltype, panel_malignant_Top,
+                                                   x, y, cnv_score)]
+d[, barcode := substring(cell, nchar(sample) + 2)]
+# Per-cell CNV RMS of the InSituCNV run without neighbour smoothing (Xenium_CNV_Stemness_Correlation.Rmd)
+jan <- fread(file.path(out_boston, "inputs/cnv_january_unsmoothed_report18.csv"), select = c("Sample", "barcode_suffix", "cnv_score"))
+d[jan, on = .(sample = Sample, barcode = barcode_suffix), cnv_rms := i.cnv_score]
+
+samples <- d[, .N, by = .(sample, tissue, timepoint, response)][order(tissue != "Liver", sample)]
+d[, sample := factor(sample, levels = samples$sample)]
+# Maps show the atlas cell types; hepatocytes, cholangiocytes, mast cells and unassigned cells are Other/Unknown
+atlas_ct <- intersect(d[celltype != "Unknown", .N, by = celltype][order(-N), celltype], names(majority_celltype_col))
+d[, celltype_atlas := factor(fifelse(celltype %in% atlas_ct, celltype, "Other/Unknown"), levels = c(atlas_ct, "Other/Unknown"))]
+ct_cols <- c(majority_celltype_col, "Other/Unknown" = "#D9D9D9")
+mel <- d[celltype == "Melanoma cells"]
+```
+
+```{r pum26-data, include=FALSE}
+pum_lab <- c(pUM26_eye = "pUM26 primary eye tumour", pUM26_liver = "pUM26 liver metastasis")
+# Stored iCNV per cell (chr3, chr8q, centroids), from Xenium_Stemness_icnv.py
+for (p in names(pum_lab)) need(file.path(out_pum26, paste0(p, "_icnv_obs.csv")),
+                               "run python -I Xenium_Stemness_icnv.py <xenium_dir> ../Outputs")
+pum_cache <- file.path(out_pum26, "pum26_scores_2026b.qs2")
+if (!file.exists(pum_cache)) {
+  objs <- lapply(names(pum_lab), function(p) qs_read(file.path(xenium_dir, "pUM26", p, "scData_SPLIT.qs2")))
+  counts <- lapply(objs, function(o) SeuratObject::LayerData(o, assay = "Xenium", layer = "counts"))
+  stopifnot(identical(rownames(counts[[1]]), rownames(counts[[2]])))
+  cells <- rbindlist(lapply(seq_along(objs), function(i)
+    data.table(cell = colnames(objs[[i]]), sample = names(pum_lab)[i], refined_immune_type = objs[[i]]$refined_immune_type)))
+  cells[, panel_malignant_Top := ucell_stemness(do.call(cbind, counts))]
+  icnv <- rbindlist(lapply(names(pum_lab), function(p) fread(file.path(out_pum26, paste0(p, "_icnv_obs.csv")))))
+  cells[icnv, on = c(cell = "barcode"), `:=`(chr3_cnv = i.chr3_cnv, chr8q_cnv = i.chr8q_cnv, x = i.x_centroid, y = i.y_centroid)]
+  cells[, cnv_directed := chr8q_cnv - chr3_cnv]   # UM hallmark: chr8q gain minus chr3 loss
+  qs_save(list(cells = cells), pum_cache)
+}
+pu <- qs_read(pum_cache, nthreads = 1)$cells[, .(cell, sample, refined_immune_type, panel_malignant_Top, x, y, cnv_directed)]
+# Per-cell CNV RMS without neighbour smoothing, from Xenium_Stemness_unsmoothed_icnv.py
+uns <- rbindlist(lapply(names(pum_lab), function(p) {
+  f <- file.path(out_pum26, paste0(p, "_icnv_unsmoothed.csv"))
+  need(f, sprintf("run python Xenium_Stemness_unsmoothed_icnv.py <xenium_dir> ../Outputs %s", p))
+  fread(f, select = c("barcode", "cnv_rms_unsmoothed"))
+}))
+pu[uns, on = c(cell = "barcode"), cnv_rms := i.cnv_rms_unsmoothed]
+stopifnot(!anyNA(pu$cnv_rms))
+
+# Refined RCTD labels coarsened to the atlas cell types
+coarsen <- function(x) {
+  x <- as.character(x); x[is.na(x)] <- "Unknown"
+  dplyr::case_when(
+    grepl("Malignant|Melanoma|Cancer", x, ignore.case = TRUE)                 ~ "Melanoma cells",
+    grepl("Melanocyt|pigmented epithelial", x, ignore.case = TRUE)            ~ "Melanocytes",
+    grepl("CD4|CD8|T_NK|T cell|Treg|MAIT|gdT|T_cytotoxic|T_naive|T_exhausted|T_helper|natural killer|NK_CYTO|NK_REST|NK cell|\\bNK\\b", x, ignore.case = TRUE) ~ "T/NK cells",
+    grepl("B cell|B_cell|Plasma", x, ignore.case = TRUE)                      ~ "B/Plasma cells",
+    grepl("Macrophage|TAM|Myeloid|Monocyte|Mono-derived|\\bDC\\b|cDC|pDC|dendritic|microglia|Basophil|Neutrophil|Mast|Kupffer|ISG expressing immune", x, ignore.case = TRUE) ~ "Myeloid cells",
+    grepl("Endothel|\\bLEC\\b|\\bVEC\\b", x, ignore.case = TRUE)              ~ "Endothelial cells",
+    grepl("Fibroblast", x, ignore.case = TRUE)                               ~ "Fibroblasts",
+    grepl("Pericyte", x, ignore.case = TRUE)                                 ~ "Pericytes",
+    grepl("Epithelial|Hepatocyte|Cholangiocyte", x, ignore.case = TRUE)      ~ "Epithelial cells",
+    TRUE ~ "Other/Unknown")
+}
+pu[, celltype := coarsen(refined_immune_type)]
+pu_levels <- c(setdiff(pu[, .N, by = celltype][order(-N), celltype], "Other/Unknown"), "Other/Unknown")
+pu[, `:=`(celltype = factor(celltype, levels = pu_levels), sample = factor(sample, levels = names(pum_lab)))]
+pu_mel <- pu[celltype == "Melanoma cells"]
+```
+
+<style>
+.main-container img { max-width: min(100%, 1400px) !important; height: auto !important; display: block; margin: 0 auto; }
+</style>
+
+# {.tabset}
 
 ## Overview
 
-This analysis validates melanoma stemness genes identified from the UM Atlas CytoTRACE2 analysis
-on Xenium spatial transcriptomics data from the p36005 Uveal Melanoma project.
+Started on `r format(Sys.time(), "%Y-%m-%d %H:%M:%S")`
 
-**Cohorts analyzed:**
+**Purpose**: map the atlas-derived stemness score and inferred CNV (iCNV) in single-cell spatial transcriptomics (Xenium 5K, 5,001-gene panel) and relate the two within melanoma cells.
 
-1. **Zurich Batch 1** - 8 samples (eye and subcutaneous metastases)
-2. **Zurich Batch 2** - 9 samples (eye and subcutaneous metastases)
-3. **Boston/Sullivan** - 6 samples (liver and breast metastases)
+**Data**: `r nrow(samples)` metastasis sections from five patients (`r sum(samples$tissue == "Liver")` liver, `r sum(samples$tissue == "Breast")` breast; `r format(nrow(d), big.mark = ",")` cells, `r format(nrow(mel), big.mark = ",")` melanoma cells), and patient pUM26 (primary eye tumour and liver metastasis, `r format(nrow(pu), big.mark = ",")` cells).
 
-**Objective:** Determine if stemness-associated genes cluster spatially or show specific patterns
-in the tumor microenvironment across different metastatic sites and treatment conditions.
+**Stemness score**: UCell score of the 50 panel genes most positively correlated with the CytoTRACE2 score in malignant atlas cells (CytoTRACE2.Rmd).
 
-```{r setup, message = FALSE, warning = FALSE}
-knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 12, fig.height = 10)
+**Statistics**: Pearson R between stemness and the per-cell CNV score, on the melanoma cells of each section. These are cell-level and descriptive (cells of one section are not independent replicates), so no p-value is given; no between-group test is made.
 
-library(Seurat)
-library(qs2)
-library(tidyverse)
-library(ggplot2)
-library(patchwork)
-library(pals)
+## Fig. 2g {.tabset}
 
-# Load Victoria's color palettes
-source("colors.R")
+Cell types, stemness score and CNV score on the same coordinates. Stemness colours are capped at the 1st and 99th percentile of all cells of the six sections, the CNV score at the 99th percentile of melanoma cells. The CNV score is the per-CNV-cluster mean |iCNV| of melanoma cells and 0 for all other cells; grey cells are absent from the iCNV run.
 
-# Set paths
-output_dir <- "Outputs/Xenium_Stemness/"
-dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
-
-# Load CytoTRACE2 gene signatures (top = stemness, bottom = differentiation)
-top_genes <- read.csv("Outputs/cytotrace2_top_genes_xenium.csv")
-bottom_genes <- read.csv("Outputs/cytotrace2_bottom_genes_xenium.csv")
-
-cat("=== TOP CytoTRACE2 Genes (Stemness-associated) ===\n")
-cat("N genes:", nrow(top_genes), "\n")
-print(head(top_genes, 15))
-
-cat("\n=== BOTTOM CytoTRACE2 Genes (Differentiation-associated) ===\n")
-cat("N genes:", nrow(bottom_genes), "\n")
-print(head(bottom_genes, 15))
-
-# Cell cycle genes (from Seurat's cc.genes / Tirosh 2015)
-# S phase genes
-s_genes <- c("MCM5", "PCNA", "TYMS", "FEN1", "MCM2", "MCM4", "RRM1", "UNG", "GINS2",
-             "MCM6", "CDCA7", "DTL", "PRIM1", "UHRF1", "MLF1IP", "HELLS", "RFC2",
-             "RPA2", "NASP", "RAD51AP1", "GMNN", "WDR76", "SLBP", "CCNE2", "UBR7",
-             "POLD3", "MSH2", "ATAD2", "RAD51", "RRM2", "CDC45", "CDC6", "EXO1",
-             "TIPIN", "DSCC1", "BLM", "CASP8AP2", "USP1", "CLSPN", "POLA1", "CHAF1B",
-             "BRIP1", "E2F8")
-
-# G2M phase genes
-g2m_genes <- c("HMGB2", "CDK1", "NUSAP1", "UBE2C", "BIRC5", "TPX2", "TOP2A", "NDC80",
-               "CKS2", "NUF2", "CKS1B", "MKI67", "TMPO", "CENPF", "TACC3", "FAM64A",
-               "SMC4", "CCNB2", "CKAP2L", "CKAP2", "AURKB", "BUB1", "KIF11", "ANP32E",
-               "TUBB4B", "GTSE1", "KIF20B", "HJURP", "CDCA3", "HN1", "CDC20", "TTK",
-               "CDC25C", "KIF2C", "RANGAP1", "NCAPD2", "DLGAP5", "CDCA2", "CDCA8",
-               "ECT2", "KIF23", "HMMR", "AURKA", "PSRC1", "ANLN", "LBR", "CKAP5",
-               "CENPE", "CTCF", "NEK2", "G2E3", "GAS2L3", "CBX5", "CENPA")
-
-cycling_genes <- unique(c(s_genes, g2m_genes))
-cat("\n=== Cell Cycle Genes (for overlap analysis) ===\n")
-cat("Total cell cycle genes:", length(cycling_genes), "\n")
+```{r fig2g, results='asis'}
+stem_lim <- quantile(d$panel_malignant_Top, Q)
+cnv_hi <- quantile(mel$cnv_score, Q[2], na.rm = TRUE)
+fig2g <- sapply(samples$sample, function(s) {
+  f <- d[sample == s, .(x, y, celltype = celltype_atlas, stem = panel_malignant_Top, cnv = cnv_score)]
+  i <- samples[sample == s]
+  p <- spatial_3panel(f, ct_cols, stem_lim,
+                      cnv_scale = scale_colour_viridis_c(limits = c(0, cnv_hi), oob = scales::squish, na.value = "grey80",
+                                                         name = sprintf("CNV score\ncapped at\n%gth pct\n(grey = no CNV)", 100 * Q[2])),
+                      cnv_title = "CNV score\n(0 = non-melanoma cell)",
+                      title = sprintf("%s | %s | %s | best response %s, %s cells", s, i$tissue, i$timepoint, i$response,
+                                      format(nrow(f), big.mark = ",")))
+  save_panel(p, paste0("Fig2g_spatial_", s), 34, map_height(f$x, f$y))
+})
+show_tabs(fig2g)
 ```
 
-## Load Xenium Data
+## Fig. 2h, Suppl. Fig. 5b {.tabset}
 
-```{r load_xenium}
-# Check if pre-computed objects with scores exist (much faster to load)
-precomputed_paths <- list(
-  Boston_Sullivan = "Outputs/Xenium_Stemness/xenium_Boston_Sullivan_with_scores.qs2",
-  Zurich_Batch1 = "Outputs/Xenium_Stemness/xenium_Zurich_Batch1_with_scores.qs2",
-  Zurich_Batch2 = "Outputs/Xenium_Stemness/xenium_Zurich_Batch2_with_scores.qs2"
-)
+Mean iCNV over the chr3 and over the chr8 windows in each melanoma cell (blue = loss, red = gain), other cells grey. Symmetric colour limit = 99th percentile of |iCNV| in the melanoma cells of the section.
 
-use_precomputed <- all(file.exists(unlist(precomputed_paths)))
-cat("Using pre-computed objects with scores:", use_precomputed, "\n\n")
-
-# Original paths (used only if pre-computed don't exist)
-cohort_paths <- list(
-  Boston_Sullivan = "../Xenium_Boston_Sullivan/merged_xenium_all_samples.qs2",
-  Zurich_Batch1 = "../2024-25-09-Xenium_UM/Seurat_Xenium_files_qs2/Xenium_samples_merged.qs2",
-  Zurich_Batch2 = "../Xenium_Zurich_SecondBatch/Seurat_Objects/merged_xenium_all_regions.qs2"
-)
-
-# CellType_Clean mapping (128 -> 22 categories)
-# Source: GPU_Analysis/marimo_multigpu_xenium.py lines 316-428
-celltype_mapping <- c(
-  # Tumor
-  "Melanoma" = "Melanoma",
-  # Unknown
-  "NA" = "Unknown", "unassigned" = "Unknown",
-  # B cells
-  "B_cell" = "B_cells", "B_cells" = "B_cells", "BC" = "B_cells",
-  "Memory_B_cells" = "B_cells", "Naive_B_cells" = "B_cells",
-  "Follicular_B_cells" = "B_cells", "Germinal_center_B_cells" = "B_cells",
-  "Cycling_B_cells" = "B_cells", "memory B cell" = "B_cells",
-  # T cells
-  "T_cells" = "T_cells", "T_cell" = "T_cells", "Th" = "T_cells", "Tc" = "T_cells",
-  "T_reg" = "T_cells", "Regulatory_T_cells" = "T_cells",
-  "CD8__T_RM" = "T_cells", "Trm_cytotoxic_T_cells" = "T_cells",
-  "Tem_Trm_cytotoxic_T_cells" = "T_cells", "Tem_Effector_helper_T_cells" = "T_cells",
-  "Tcm_Naive_helper_T_cells" = "T_cells", "gamma_delta_T_cells" = "T_cells",
-  "Follicular_helper_T_cells" = "T_cells", "T follicular helper cell" = "T_cells",
-  "Type_17_helper_T_cells" = "T_cells", "Type_1_helper_T_cells" = "T_cells",
-  "CD4-positive helper T cell" = "T_cells", "naive T cell" = "T_cells",
-  "CD4-positive, CD25-positive, CCR4-positive, alpha-beta regulatory T cell" = "T_cells",
-  "CD8-positive, alpha-beta regulatory T cell" = "T_cells",
-  "effector memory CD4-positive, alpha-beta T cell" = "T_cells",
-  "effector memory CD8-positive, alpha-beta T cell" = "T_cells",
-  "exhausted T cell" = "T_cells", "cycling T cell" = "T_cells",
-  # NK cells
-  "NK" = "NK_cells", "NK_cells" = "NK_cells", "Resident_NK" = "NK_cells",
-  "Circulating_NK_NKT" = "NK_cells", "ILC_NK" = "NK_cells", "ILC" = "NK_cells",
-  "natural killer cell" = "NK_cells", "natural_killer_cell" = "NK_cells",
-  # Macrophages
-  "Macrophages" = "Macrophages", "macrophage" = "Macrophages",
-  "Macro1_2" = "Macrophages", "Intestinal_macrophages" = "Macrophages",
-  "cycling macrophage" = "Macrophages",
-  # Dendritic cells
-  "DC1" = "Dendritic_cells", "DC2" = "Dendritic_cells",
-  "IL8__DC1" = "Dendritic_cells", "MigDC" = "Dendritic_cells",
-  "Mig_cDCs" = "Dendritic_cells", "cDC1s" = "Dendritic_cells", "cDC2s" = "Dendritic_cells",
-  "pDCs" = "Dendritic_cells", "conventional dendritic cell" = "Dendritic_cells",
-  "myeloid dendritic cell" = "Dendritic_cells", "plasmacytoid dendritic cell" = "Dendritic_cells",
-  # Monocytes
-  "Monocytes" = "Monocytes", "Mono_mono_derived_cells" = "Monocytes",
-  # Plasma cells
-  "Plasma_cells" = "Plasma_cells", "PlasmaC" = "Plasma_cells", "IgG plasma cell" = "Plasma_cells",
-  # Mast cells
-  "MastC" = "Mast_cells", "Mast_cells" = "Mast_cells", "mast cell" = "Mast_cells",
-  # Granulocytes
-  "Basophils" = "Granulocytes", "Neutrophils" = "Granulocytes",
-  # Fibroblasts
-  "Fibroblasts" = "Fibroblasts", "fibroblast" = "Fibroblasts",
-  "APOD__fibroblasts" = "Fibroblasts", "POSTN__fibroblasts" = "Fibroblasts",
-  "PTGDS__fibroblasts" = "Fibroblasts", "SFRP2__fibroblasts" = "Fibroblasts",
-  "Myofibroblasts" = "Fibroblasts", "myofibroblast cell" = "Fibroblasts",
-  "Stromal_1" = "Fibroblasts", "Stromal_2" = "Fibroblasts", "Stromal_3" = "Fibroblasts",
-  "cycling stromal cell" = "Fibroblasts",
-  # Endothelial
-  "Endothelial_cells" = "Endothelial", "VEC" = "Endothelial",
-  "Arterial_endothelial_cells" = "Endothelial", "Venous_endothelial_cells" = "Endothelial",
-  "Capillary_endothelial_cells" = "Endothelial", "Lymphatic_endothelial_cells" = "Endothelial",
-  "LEC" = "Endothelial", "endothelial cell" = "Endothelial", "endothelium" = "Endothelial",
-  "capillary endothelial cell" = "Endothelial", "endothelial cell of artery" = "Endothelial",
-  "endothelial cell of vascular tree" = "Endothelial", "vein endothelial cell" = "Endothelial",
-  # Pericytes/SMC
-  "Pericytes" = "Pericytes", "pericyte" = "Pericytes",
-  "RGS5__pericytes" = "Pericytes", "TAGLN__pericytes" = "Pericytes",
-  "SMC" = "Pericytes", "vascular associated smooth muscle cell" = "Pericytes",
-  "vascular_associated_smooth_muscle_cell" = "Pericytes",
-  # Melanocytes (non-tumor)
-  "Melanocytes" = "Melanocytes", "melanocyte" = "Melanocytes",
-  "pigmented_epithelial_cell" = "Melanocytes",
-  # Epithelial - Hepatic
-  "Hepatocytes" = "Hepatocytes", "Cholangiocytes" = "Cholangiocytes",
-  # Epithelial - Intestinal
-  "Enterocytes" = "Epithelial_GI", "Colonocytes" = "Epithelial_GI",
-  "BEST4__enterocytes" = "Epithelial_GI", "Goblet_cells" = "Epithelial_GI",
-  "Immature_goblet_cells" = "Epithelial_GI", "Paneth" = "Epithelial_GI",
-  "Enteroendocrine_cells" = "Epithelial_GI", "Tuft_cells" = "Epithelial_GI",
-  "Cycling_Secretory_TA" = "Epithelial_GI", "TA" = "Epithelial_GI",
-  # Epithelial - Skin
-  "Suprabasal_keratinocytes" = "Keratinocytes", "Basal_keratinocytes" = "Keratinocytes",
-  # Neural
-  "Neuronal_SchwannC" = "Neural", "Schwann_cell" = "Neural",
-  "myelinating_Schwann_cell" = "Neural", "Glia" = "Neural",
-  "astrocyte" = "Neural", "microglial_cell" = "Neural",
-  "oligodendrocyte" = "Neural", "oligodendrocyte_precursor_cell" = "Neural",
-  # Stem cells
-  "Stem_cells" = "Stem_progenitor"
-)
-
-# Load each cohort
-cat("Loading 3 cohorts...\n\n")
-xenium_list <- list()
-
-for (cohort in names(cohort_paths)) {
-  # Use precomputed if available
-  if (use_precomputed) {
-    path <- precomputed_paths[[cohort]]
-    cat("Loading PRECOMPUTED", cohort, "from:", path, "\n")
-  } else {
-    path <- cohort_paths[[cohort]]
-    cat("Loading", cohort, "from original:", path, "\n")
-  }
-
-  if (!file.exists(path)) {
-    stop("File not found: ", path)
-  }
-
-  obj <- qs2::qs_read(path, nthreads = 16)
-  obj <- UpdateSeuratObject(obj)  # Fix compatibility with newer SeuratObject version
-  obj$Cohort <- cohort
-
-  # Add CellType_Clean if not already present or needs update
-  if (!"CellType_Clean" %in% colnames(obj@meta.data) || any(is.na(obj$CellType_Clean))) {
-    if ("CellType_Harmonized" %in% colnames(obj@meta.data)) {
-      obj$CellType_Clean <- dplyr::recode(obj$CellType_Harmonized, !!!celltype_mapping, .default = "Other")
-    } else if ("predicted.celltype" %in% colnames(obj@meta.data)) {
-      obj$CellType_Clean <- dplyr::recode(obj$predicted.celltype, !!!celltype_mapping, .default = "Other")
-    } else if ("cell_type" %in% colnames(obj@meta.data)) {
-      obj$CellType_Clean <- dplyr::recode(obj$cell_type, !!!celltype_mapping, .default = "Other")
-    } else if (!"CellType_Clean" %in% colnames(obj@meta.data)) {
-      obj$CellType_Clean <- "Unknown"
-    }
-  }
-
-  # CRITICAL: Convert actual R NA values to "Unknown" (not just the string "NA")
-  obj$CellType_Clean[is.na(obj$CellType_Clean)] <- "Unknown"
-
-  # Standardize organ and treatment columns across cohorts
-  # Organ standardization
-  if ("organ" %in% colnames(obj@meta.data)) {
-    # Zurich Batch 1
-    obj$organ_std <- tolower(obj$organ)
-  } else if ("Tissue_Type" %in% colnames(obj@meta.data)) {
-    # Zurich Batch 2 and Boston Sullivan (fix case inconsistency)
-    obj$organ_std <- tolower(obj$Tissue_Type)
-  } else {
-    obj$organ_std <- "unknown"
-  }
-
-  # Treatment standardization (BL = baseline/pre, FU = follow-up/on/post)
-  if ("treatment" %in% colnames(obj@meta.data)) {
-    # Zurich Batch 1: already BL/FU
-    obj$treatment_std <- obj$treatment
-  } else if ("Treatment_Status" %in% colnames(obj@meta.data)) {
-    # Zurich Batch 2 and Boston Sullivan: need mapping
-    obj$treatment_std <- dplyr::case_when(
-      grepl("baseline|Pre|pre", obj$Treatment_Status) ~ "BL",
-      grepl("on_treatment|Post|post", obj$Treatment_Status) ~ "FU",
-      TRUE ~ "Unknown"
-    )
-  } else {
-    obj$treatment_std <- "Unknown"
-  }
-
-  # Fix Zurich Batch 2 'fov' sample - load properly annotated B25.28468
-  # Root cause: 02d_RCTD_B25_28468_Annotation.Rmd line 76 has hard-coded fov="fov"
-  if (cohort == "Zurich_Batch2" && "fov" %in% names(obj@images)) {
-    cat("  - Fixing 'fov' sample: loading properly annotated B25.28468 (Subcutaneous)...\n")
-
-    # Load the RCTD-annotated object (has cell types from skin reference)
-    b25_path <- "../Xenium_Zurich_SecondBatch/Outputs_RCTD_B25_28468/xenium_Region4_0056806_rctd_annotated.qs2"
-    b25_obj <- qs2::qs_read(b25_path, nthreads = 16)
-    b25_obj <- UpdateSeuratObject(b25_obj)  # Fix compatibility with newer SeuratObject version
-
-    # Fix FOV name in the annotated object
-    names(b25_obj@images)[names(b25_obj@images) == "fov"] <- "Region4_0056806"
-
-    # Add standardized metadata to B25 object
-    b25_obj$organ_std <- "subcutaneous"
-    b25_obj$treatment_std <- "BL"
-    b25_obj$Cohort <- "Zurich_Batch2"
-
-    # Apply CellType_Clean mapping to B25 object
-    if ("predicted.celltype" %in% colnames(b25_obj@meta.data)) {
-      b25_obj$CellType_Clean <- dplyr::recode(b25_obj$predicted.celltype, !!!celltype_mapping, .default = "Other")
-      b25_obj$CellType_Clean[is.na(b25_obj$CellType_Clean)] <- "Unknown"
-    } else {
-      b25_obj$CellType_Clean <- "Unknown"
-    }
-
-    # Remove the broken 'fov' cells from merged object
-    fov_cells <- Cells(obj@images[["fov"]])
-    keep_cells <- setdiff(Cells(obj), fov_cells)
-    obj <- subset(obj, cells = keep_cells)
-
-    # Merge the properly annotated object
-    obj <- merge(obj, b25_obj, add.cell.ids = c("", "B25"))
-
-    cat("    B25.28468 merged:", ncol(b25_obj), "cells with cell type annotations\n")
-    rm(b25_obj); gc()
-  }
-
-  cat("  - Cells:", ncol(obj), "\n")
-  cat("  - Genes:", nrow(obj), "\n")
-  cat("  - FOVs:", length(names(obj@images)), "\n")
-  cat("  - FOV names:", paste(names(obj@images), collapse = ", "), "\n")
-  cat("  - CellType_Clean categories:", length(unique(obj$CellType_Clean)), "\n")
-  if ("Stemness_UCell" %in% colnames(obj@meta.data)) {
-    cat("  - Stemness_UCell already computed: YES\n\n")
-  } else {
-    cat("  - Stemness_UCell: NOT YET COMPUTED\n\n")
-  }
-
-  xenium_list[[cohort]] <- obj
-  gc()
+```{r fig2h, results='asis'}
+chr_csv <- file.path(out_boston, "cnv_chr3_chr8_per_cell.csv")
+need(chr_csv, "run python -I Xenium_Stemness_icnv.py <xenium_dir> ../Outputs")
+pc <- fread(chr_csv)[, is_mel := grepl("melanoma", cell_type, ignore.case = TRUE)]
+icnv_map <- function(f, col, title, ras) {
+  m <- f[is_mel == TRUE][order(abs(get(col)))][, v := fcoalesce(get(col), 0)]
+  lim <- as.numeric(quantile(abs(m$v), Q[2]))
+  ggplot() +
+    scattermore::geom_scattermore(data = f[is_mel == FALSE], aes(x, y), colour = "grey85", pointsize = ras$pointsize, pixels = ras$px) +
+    scattermore::geom_scattermore(data = m, aes(x, y, colour = v), pointsize = ras$pointsize, pixels = ras$px) +
+    scale_colour_distiller(palette = "RdBu", limits = c(-lim, lim), oob = scales::squish, name = "inferred\nCNV") +
+    coord_fixed() + labs(title = title, x = "x (µm)", y = "y (µm)") + map_theme +
+    theme(legend.key.height = unit(0.9, "in"), legend.key.width = unit(0.45, "in"))
 }
-
-# Total summary
-total_cells <- sum(sapply(xenium_list, ncol))
-total_fovs <- sum(sapply(xenium_list, function(x) length(names(x@images))))
-cat("=== TOTAL ===\n")
-cat("Total cells:", total_cells, "\n")
-cat("Total FOVs:", total_fovs, "\n")
-
-# Check available genes using first cohort
-available_top <- intersect(top_genes$gene, rownames(xenium_list[[1]]))
-available_bottom <- intersect(bottom_genes$gene, rownames(xenium_list[[1]]))
-
-cat("\n=== CytoTRACE2 Genes in Xenium Panel ===\n")
-cat("Top (stemness) genes available:", length(available_top), "of", nrow(top_genes), "\n")
-cat("Bottom (differentiation) genes available:", length(available_bottom), "of", nrow(bottom_genes), "\n")
-cat("\nTop genes:", paste(head(available_top, 10), collapse = ", "), "\n")
-cat("Bottom genes:", paste(head(available_bottom, 10), collapse = ", "), "\n")
-
-# Check cycling genes in Xenium panel
-available_cycling <- intersect(cycling_genes, rownames(xenium_list[[1]]))
-cat("\n=== Cell Cycle Genes in Xenium Panel ===\n")
-cat("Cell cycle genes available:", length(available_cycling), "of", length(cycling_genes), "\n")
-cat("Cycling genes:", paste(head(available_cycling, 10), collapse = ", "), "...\n")
+fig2h <- sapply(samples$sample, function(s) {
+  f <- pc[sample == s]
+  ras <- spatial_raster(f$x, f$y)
+  p <- (icnv_map(f, "chr3_cnv", "chr3 (loss = blue)", ras) | icnv_map(f, "chr8_cnv", "chr8 (gain = red)", ras)) +
+    plot_annotation(title = sprintf("%s | %s | %s melanoma cells, grey = other cells", s, samples[sample == s, tissue],
+                                    format(sum(f$is_mel), big.mark = ",")), theme = title_theme)
+  save_panel(p, paste0("Fig2h_SFig5b_iCNV_chr3_chr8_", s), 23, map_height(f$x, f$y, per_panel = 8.5))
+})
+show_tabs(fig2h)
 ```
 
-## Calculate CytoTRACE2 Scores {.tabset}
+## Fig. 2i
 
-### Signature Scoring (UCell)
-
-```{r calculate_scores}
-# Create signature lists for both top and bottom CytoTRACE2 genes
-cytotrace_signatures <- list(
-  CytoTRACE2_Top = available_top,      # Stemness-associated (high potency)
-  CytoTRACE2_Bottom = available_bottom  # Differentiation-associated (low potency)
-)
-
-cat("=== CytoTRACE2 Signatures for Xenium ===\n")
-cat("Top (stemness) genes:", length(cytotrace_signatures$CytoTRACE2_Top), "\n")
-cat("  ", paste(head(cytotrace_signatures$CytoTRACE2_Top, 10), collapse = ", "), "...\n")
-cat("Bottom (differentiation) genes:", length(cytotrace_signatures$CytoTRACE2_Bottom), "\n")
-cat("  ", paste(head(cytotrace_signatures$CytoTRACE2_Bottom, 10), collapse = ", "), "...\n")
-
-# Check if scores already exist in pre-computed objects
-# NOTE: Set force_recalculate = TRUE to use updated maxRank parameter
-force_recalculate <- TRUE  # Force recalculation with tuned maxRank for Xenium
-scores_exist <- all(sapply(xenium_list, function(x) "Stemness_UCell" %in% colnames(x@meta.data)))
-
-if (scores_exist && !force_recalculate) {
-  cat("\n=== SCORES ALREADY COMPUTED - SKIPPING UCell calculation ===\n")
-  cat("Set force_recalculate = TRUE to recalculate with tuned maxRank parameter.\n")
-} else {
-  # Calculate module scores for each cohort using UCell
-  # UCell is better for small gene panels like Xenium (rank-based, no control gene issues)
-  cat("\nCalculating module scores using UCell for each cohort...\n")
-  library(UCell)
-
-  # Define signatures for UCell (including cycling for overlap analysis)
-  signatures <- list(
-    CytoTRACE2_Top = available_top,
-    CytoTRACE2_Bottom = available_bottom,
-    Cycling = available_cycling
-  )
-
-  for (cohort in names(xenium_list)) {
-    cat("Processing", cohort, "...\n")
-    obj <- xenium_list[[cohort]]
-
-    # JoinLayers if needed
-    obj <- JoinLayers(obj)
-
-    # Calculate UCell scores
-    # With name = NULL, UCell creates columns with exact signature names
-    # CRITICAL: Use maxRank = 200 for better resolution with Xenium's limited gene panel
-    xenium_gene_count <- nrow(obj)
-    optimal_maxRank <- 200  # Fixed at 200 for consistent scoring across samples
-    cat("  Gene panel size:", xenium_gene_count, "- Using maxRank:", optimal_maxRank, "\n")
-    obj <- AddModuleScore_UCell(obj, features = signatures, name = NULL,
-                                 maxRank = optimal_maxRank)
-
-    # Calculate combined CytoTRACE2-like score as difference: Top - Bottom
-    obj$CytoTRACE2_Score <- obj$CytoTRACE2_Top - obj$CytoTRACE2_Bottom
-
-    # Also keep "Stemness_UCell" for backward compatibility
-    obj$Stemness_UCell <- obj$CytoTRACE2_Top
-
-    xenium_list[[cohort]] <- obj
-    gc()
-  }
-}
-
-# Summary across all cohorts
-cat("\n=== CytoTRACE2 Score Summary (All Cohorts) ===\n")
-for (cohort in names(xenium_list)) {
-  obj <- xenium_list[[cohort]]
-  cat("\n", cohort, ":\n", sep = "")
-  cat("  Top Score - Mean:", round(mean(obj$CytoTRACE2_Top, na.rm = TRUE), 4), "\n")
-  cat("  Bottom Score - Mean:", round(mean(obj$CytoTRACE2_Bottom, na.rm = TRUE), 4), "\n")
-  cat("  Combined Score - Mean:", round(mean(obj$CytoTRACE2_Score, na.rm = TRUE), 4), "\n")
-  cat("  Combined Score - Range:", paste(round(range(obj$CytoTRACE2_Score, na.rm = TRUE), 4), collapse = " to "), "\n")
-}
+```{r fig2i, results='asis'}
+m <- mel[!is.na(cnv_rms), .(sample, stem = panel_malignant_Top, cnv_rms)]
+r_boston <- m[, .(n_cells = .N, pearson_r = cor(stem, cnv_rms)), by = sample]
+fwrite(r_boston, "tables/Fig2i_pearson_r.csv")
+cat("![](", save_panel(stem_cnv_scatter(m, "CNV score (per-cell RMS, iCNV without smoothing)"), "Fig2i_stemness_vs_cnv", 14, 10), ")\n\n", sep = "")
 ```
 
-### CytoTRACE2 Score Distribution
+One point per melanoma cell with a CNV value, black line = linear fit with 95% band. CNV score = per-cell RMS of the iCNV profile over all windows, from the InSituCNV run without neighbour smoothing.
 
-```{r score_distribution, fig.width=16, fig.height=10}
-# Combine metadata from all cohorts for distribution plots
-# Note: Include Cycling score and nFeature_Xenium for correlation analyses
-# Note: CellType_Display is the merged cell type matching Victoria's UM Atlas naming
-# It may not exist yet if cell type merging hasn't been applied
-all_meta <- do.call(rbind, lapply(names(xenium_list), function(cohort) {
-  obj <- xenium_list[[cohort]]
-  cols <- c("CytoTRACE2_Top", "CytoTRACE2_Bottom", "CytoTRACE2_Score", "Stemness_UCell", "Cohort", "CellType_Clean")
-  # Add CellType_Display if present (created in later chunk)
-  if ("CellType_Display" %in% colnames(obj@meta.data)) {
-    cols <- c(cols, "CellType_Display")
-  }
-  # Add Cycling if present
-  if ("Cycling" %in% colnames(obj@meta.data)) {
-    cols <- c(cols, "Cycling")
-  }
-  # Add nFeature_Xenium if present
-  if ("nFeature_Xenium" %in% colnames(obj@meta.data)) {
-    cols <- c(cols, "nFeature_Xenium")
-  }
-  df <- obj@meta.data[, cols]
-  df$cell_id <- rownames(df)
-  df
-}))
+## Suppl. Fig. 5a {.tabset}
 
-cat("Combined metadata from all cohorts:", nrow(all_meta), "cells\n")
+As Fig. 2g for pUM26, with the directed iCNV score (chr8q gain minus chr3 loss) as CNV panel. Both colour scales are shared by the two sections: stemness capped at the 1st and 99th percentile, the CNV score at the 99th percentile of its absolute value.
 
-# Score distributions as histograms (faceted by cohort)
-p1 <- ggplot(all_meta, aes(x = CytoTRACE2_Top, fill = Cohort)) +
-  geom_histogram(bins = 50, alpha = 0.7, position = "identity") +
-  facet_wrap(~Cohort, ncol = 1) +
-  theme_minimal() +
-  scale_fill_brewer(palette = "Set1") +
-  ggtitle("CytoTRACE2 Top (Stemness) Score Distribution")
-
-p2 <- ggplot(all_meta, aes(x = CytoTRACE2_Bottom, fill = Cohort)) +
-  geom_histogram(bins = 50, alpha = 0.7, position = "identity") +
-  facet_wrap(~Cohort, ncol = 1) +
-  theme_minimal() +
-  scale_fill_brewer(palette = "Set1") +
-  ggtitle("CytoTRACE2 Bottom (Differentiation) Score Distribution")
-
-p3 <- ggplot(all_meta, aes(x = CytoTRACE2_Score, fill = Cohort)) +
-  geom_histogram(bins = 50, alpha = 0.7, position = "identity") +
-  facet_wrap(~Cohort, ncol = 1) +
-  theme_minimal() +
-  scale_fill_brewer(palette = "Set1") +
-  ggtitle("CytoTRACE2 Combined Score (Top - Bottom)")
-
-p_all <- p1 + p2 + p3 + plot_layout(ncol = 3, guides = "collect")
-print(p_all)
-
-ggsave(
-  file.path(output_dir, "histogram_cytotrace2_scores_by_cohort.png"),
-  p_all,
-  width = 18, height = 10, dpi = 300, bg = "white"
-)
+```{r sfig5a, results='asis'}
+pu_stem_lim <- quantile(pu$panel_malignant_Top, Q)
+cnv_lim <- quantile(abs(pu$cnv_directed), Q[2])
+sfig5a <- sapply(levels(pu$sample), function(s) {
+  f <- pu[sample == s, .(x, y, celltype, stem = panel_malignant_Top, cnv = cnv_directed)]
+  p <- spatial_3panel(f, ct_cols, pu_stem_lim,
+                      cnv_scale = scale_colour_gradient2(low = "#2166AC", mid = "grey70", high = "#B2182B", midpoint = 0,
+                                                         limits = c(-cnv_lim, cnv_lim), oob = scales::squish,
+                                                         name = sprintf("chr8q - chr3\nCNV, capped at\n%gth pct of |value|", 100 * Q[2])),
+                      cnv_title = "Directed iCNV score\n(chr8q gain minus chr3 loss)",
+                      title = sprintf("%s, %s cells", pum_lab[s], format(nrow(f), big.mark = ",")))
+  save_panel(p, paste0("SFig5a_spatial_", s), 34, map_height(f$x, f$y))
+})
+show_tabs(sfig5a)
 ```
 
-## Stemness vs Cell Cycle Analysis {.tabset}
+## Suppl. Fig. 5c
 
-### Gene Overlap Analysis
-
-```{r stemness_cycling_gene_overlap, fig.width=12, fig.height=10}
-# Check direct overlap between stemness signature genes and cell cycle genes
-# This determines if "stemness" is actually measuring proliferation
-
-stemness_genes <- available_top
-cat("=== Stemness vs Cell Cycle Gene Overlap ===\n")
-cat("Stemness signature genes (in Xenium panel):", length(stemness_genes), "\n")
-cat("Cell cycle genes (in Xenium panel):", length(available_cycling), "\n")
-
-# Direct gene overlap
-cycle_overlap <- intersect(stemness_genes, cycling_genes)
-cat("\nOverlapping genes:", length(cycle_overlap), "\n")
-
-if (length(cycle_overlap) > 0) {
-  cat("\nSTEMNESS GENES THAT ARE CELL CYCLE-RELATED:\n")
-  print(cycle_overlap)
-  cat("\nProportion of stemness signature that is cell cycle:",
-      round(length(cycle_overlap) / length(stemness_genes) * 100, 1), "%\n")
-} else {
-  cat("\nNo overlap - stemness signature is independent of cell cycle genes.\n")
-}
-
-# Venn diagram for gene overlap
-library(ggVennDiagram)
-gene_sets <- list(
-  Stemness = stemness_genes,
-  CellCycle = available_cycling
-)
-p_venn <- ggVennDiagram(gene_sets) +
-  scale_fill_gradient(low = "white", high = "steelblue") +
-  ggtitle("Overlap: Stemness vs Cell Cycle Genes in Xenium Panel")
-print(p_venn)
-
-ggsave(
-  file.path(output_dir, "venn_stemness_vs_cycling_genes.png"),
-  p_venn, width = 8, height = 8, dpi = 300, bg = "white"
-)
-
-# Also check bottom genes (differentiation)
-bottom_overlap <- intersect(available_bottom, cycling_genes)
-cat("\n=== Differentiation Genes vs Cell Cycle ===\n")
-cat("Differentiation signature genes:", length(available_bottom), "\n")
-cat("Overlap with cell cycle:", length(bottom_overlap), "\n")
-if (length(bottom_overlap) > 0) {
-  cat("Overlapping genes:", paste(bottom_overlap, collapse = ", "), "\n")
-}
+```{r sfig5c, results='asis'}
+m <- pu_mel[, .(sample, stem = panel_malignant_Top, cnv_rms)]
+r_pum26 <- m[, .(n_cells = .N, pearson_r = cor(stem, cnv_rms)), by = sample]
+fwrite(r_pum26, "tables/SFig5c_pearson_r.csv")
+p <- stem_cnv_scatter(m, "CNV score (per-cell RMS, iCNV without smoothing)", ncol = 2, labeller = as_labeller(pum_lab))
+cat("![](", save_panel(p, "SFig5c_stemness_vs_cnv_pUM26", 12, 5.5), ")\n\n", sep = "")
 ```
 
-### Score Correlation: Stemness vs Cycling
-
-```{r stemness_cycling_correlation, fig.width=14, fig.height=12}
-library(ggpubr)
-
-# Check if Cycling column exists
-if (!"Cycling" %in% colnames(all_meta)) {
-  cat("NOTE: Cycling score not yet calculated in pre-computed objects.\n")
-  cat("Run without pre-computed objects to see this analysis.\n")
-} else {
-  # Scatter plot: Stemness vs Cycling scores by cohort
-  p_corr_cohort <- ggplot(all_meta, aes(x = Stemness_UCell, y = Cycling)) +
-    geom_point(alpha = 0.05, size = 0.3) +
-    geom_smooth(method = "lm", color = "red", se = TRUE) +
-    stat_cor(method = "pearson", label.x.npc = 0.05, label.y.npc = 0.95) +
-    facet_wrap(~Cohort, scales = "free") +
-    theme_minimal() +
-    ggtitle("Correlation: Stemness Score vs Cycling Score by Cohort") +
-    xlab("Stemness Score (UCell)") + ylab("Cycling Score (UCell)")
-  print(p_corr_cohort)
-
-  ggsave(
-    file.path(output_dir, "scatter_stemness_vs_cycling_by_cohort.png"),
-    p_corr_cohort, width = 14, height = 10, dpi = 300, bg = "white"
-  )
-
-  # By cell type (for Melanoma specifically - using CellType_Display if available, else CellType_Clean)
-  if ("CellType_Display" %in% colnames(all_meta)) {
-    melanoma_meta <- all_meta[all_meta$CellType_Display == "Melanoma cells", ]
-  } else {
-    melanoma_meta <- all_meta[all_meta$CellType_Clean == "Melanoma cells", ]
-  }
-  if (nrow(melanoma_meta) > 100) {
-    p_corr_melanoma <- ggplot(melanoma_meta, aes(x = Stemness_UCell, y = Cycling)) +
-      geom_point(alpha = 0.1, size = 0.5, color = "darkred") +
-      geom_smooth(method = "lm", color = "black", se = TRUE) +
-      stat_cor(method = "pearson", label.x.npc = 0.05, label.y.npc = 0.95) +
-      facet_wrap(~Cohort, scales = "free") +
-      theme_minimal() +
-      ggtitle("Stemness vs Cycling - MELANOMA CELLS ONLY") +
-      xlab("Stemness Score") + ylab("Cycling Score")
-    print(p_corr_melanoma)
-
-    ggsave(
-      file.path(output_dir, "scatter_stemness_vs_cycling_melanoma_only.png"),
-      p_corr_melanoma, width = 14, height = 10, dpi = 300, bg = "white"
-    )
-  }
-
-  # Interpretation guide
-  cat("\n=== Interpretation Guide ===\n")
-  cat("HIGH gene overlap + HIGH score correlation:\n")
-  cat("  -> Stemness signal may be driven by proliferation, not true 'stemness'\n")
-  cat("\nLOW gene overlap + HIGH score correlation:\n")
-  cat("  -> Stem-like cells are proliferative (biological, not artifact)\n")
-  cat("\nLOW gene overlap + LOW score correlation:\n")
-  cat("  -> Stemness and cycling are independent characteristics\n")
-}
-```
-
-### Correlation: Stemness vs Gene Detection
-
-```{r stemness_nfeature_correlation, fig.width=14, fig.height=10}
-# Check if nFeature_Xenium exists
-if (!"nFeature_Xenium" %in% colnames(all_meta)) {
-  cat("NOTE: nFeature_Xenium not found in metadata.\n")
-  cat("This QC metric may have a different column name.\n")
-} else {
-  # Correlation plot: Stemness vs nFeature_Xenium
-  p_nfeat <- ggplot(all_meta, aes(x = nFeature_Xenium, y = Stemness_UCell)) +
-    geom_point(alpha = 0.05, size = 0.3) +
-    geom_smooth(method = "lm", color = "red", se = TRUE) +
-    stat_cor(method = "pearson", label.x.npc = 0.05, label.y.npc = 0.95) +
-    facet_wrap(~Cohort, scales = "free") +
-    theme_minimal() +
-    ggtitle("Correlation: Stemness Score vs Number of Detected Genes") +
-    xlab("Number of Detected Genes (nFeature_Xenium)") + ylab("Stemness Score")
-  print(p_nfeat)
-
-  ggsave(
-    file.path(output_dir, "scatter_stemness_vs_nfeature.png"),
-    p_nfeat, width = 14, height = 10, dpi = 300, bg = "white"
-  )
-
-  # Melanoma only
-  if (nrow(melanoma_meta) > 100) {
-    p_nfeat_mel <- ggplot(melanoma_meta, aes(x = nFeature_Xenium, y = Stemness_UCell)) +
-      geom_point(alpha = 0.1, size = 0.5, color = "darkred") +
-      geom_smooth(method = "lm", color = "black", se = TRUE) +
-      stat_cor(method = "pearson", label.x.npc = 0.05, label.y.npc = 0.95) +
-      facet_wrap(~Cohort, scales = "free") +
-      theme_minimal() +
-      ggtitle("Stemness vs nFeature - MELANOMA CELLS ONLY") +
-      xlab("Number of Detected Genes") + ylab("Stemness Score")
-    print(p_nfeat_mel)
-
-    ggsave(
-      file.path(output_dir, "scatter_stemness_vs_nfeature_melanoma_only.png"),
-      p_nfeat_mel, width = 14, height = 10, dpi = 300, bg = "white"
-    )
-  }
-
-  cat("\n=== Interpretation ===\n")
-  cat("Strong positive correlation: Stemness score may be confounded by gene detection.\n")
-  cat("Weak/no correlation: Stemness is biologically meaningful independent of QC.\n")
-}
-```
-
-## Spatial Visualization {.tabset}
-
-### Sample Overview
-
-```{r spatial_overview, fig.width=12, fig.height=8}
-# Get FOV/sample information for each cohort
-cat("=== Available FOVs/Samples by Cohort ===\n\n")
-
-total_fovs <- 0
-for (cohort in names(xenium_list)) {
-  obj <- xenium_list[[cohort]]
-  fov_names <- names(obj@images)
-  total_fovs <- total_fovs + length(fov_names)
-
-  cat(cohort, ":\n")
-  cat("  Number of FOVs:", length(fov_names), "\n")
-  cat("  FOV names:", paste(fov_names, collapse = ", "), "\n\n")
-}
-
-cat("TOTAL FOVs:", total_fovs, "\n")
-
-# Cell type column is CellType_Clean (22 categories)
-ct_col <- "CellType_Clean"
-cat("\nUsing cell type column:", ct_col, "\n")
-
-# Count unique cell types across all cohorts
-all_celltypes <- unique(unlist(lapply(xenium_list, function(x) unique(x$CellType_Clean))))
-cat("Unique CellType_Clean categories:", length(all_celltypes), "\n")
-print(sort(all_celltypes))
-```
-
-### Individual Sample Spatial Plots {.tabset}
-
-```{r individual_fov_plots, results='asis', fig.width=20, fig.height=10}
-# First: Create stemness categories for all cohorts BEFORE plotting
-# Use PER-COHORT quantiles so each cohort has its own distribution
-# This prevents cohorts with lower absolute scores (e.g., Boston_Sullivan)
-# from appearing mostly "Low" due to global quantile calculation
-
-cat("=== Per-Cohort Stemness Category Breaks ===\n")
-
-# Add stemness_category to each cohort using cohort-specific quantiles
-for (cohort_name in names(xenium_list)) {
-  obj <- xenium_list[[cohort_name]]
-
-  # Calculate quantile breaks for THIS cohort only
-  cohort_stemness <- obj$Stemness_UCell
-  cohort_breaks <- quantile(cohort_stemness, probs = c(0, 0.25, 0.75, 1), na.rm = TRUE)
-  cat(cohort_name, "breaks:", paste(round(cohort_breaks, 3), collapse = ", "), "\n")
-
-  # Use -Inf and Inf as outer bounds to capture all values
-  obj$stemness_category <- cut(
-    obj$Stemness_UCell,
-    breaks = c(-Inf, cohort_breaks[2], cohort_breaks[3], Inf),
-    labels = c("Low", "Medium", "High"),
-    include.lowest = TRUE
-  )
-
-  # CRITICAL: Handle any NA values in stemness_category (from NA scores)
-  obj$stemness_category[is.na(obj$stemness_category)] <- "Low"
-  obj$stemness_category <- factor(obj$stemness_category, levels = c("Low", "Medium", "High"))
-
-  xenium_list[[cohort_name]] <- obj
-}
-
-# ===========================================================================
-# Cell Type Merging to Match Victoria's Dataset
-# ===========================================================================
-# Merge cell types to match the UM Atlas naming convention
-celltype_merge <- c(
-  "B_cells" = "B/Plasma cells",
-  "Plasma_cells" = "B/Plasma cells",
-  "T_cells" = "T/NK cells",
-  "NK_cells" = "T/NK cells",
-  "Dendritic_cells" = "Myeloid cells",
-  "Macrophages" = "Myeloid cells",
-  "Monocytes" = "Myeloid cells",
-  "Endothelial" = "Endothelial cells",
-  "Melanoma" = "Melanoma cells"
-)
-
-# Apply merging to create CellType_Display column
-for (cohort_name in names(xenium_list)) {
-  obj <- xenium_list[[cohort_name]]
-
-  # Create display version of cell types
-  obj$CellType_Display <- as.character(obj$CellType_Clean)
-
-  # Apply merging
-  for (old_name in names(celltype_merge)) {
-    obj$CellType_Display[obj$CellType_Display == old_name] <- celltype_merge[[old_name]]
-  }
-
-  xenium_list[[cohort_name]] <- obj
-}
-
-cat("Cell type merging applied:\n")
-print(celltype_merge)
-
-# Get unique cell types after merging
-all_celltypes_display <- sort(unique(unlist(lapply(xenium_list, function(x) unique(x$CellType_Display)))))
-cat("\nCell types after merging:", length(all_celltypes_display), "\n")
-print(all_celltypes_display)
-
-# Use Victoria's colors where available, polychrome for others
-celltype_colors <- majority_celltype_col[all_celltypes_display]
-# Fill missing colors with polychrome
-missing_colors <- is.na(celltype_colors)
-if (any(missing_colors)) {
-  n_missing <- sum(missing_colors)
-  extra_colors <- unname(pals::polychrome())[1:n_missing]
-  celltype_colors[missing_colors] <- extra_colors
-  names(celltype_colors)[missing_colors] <- all_celltypes_display[missing_colors]
-}
-cat("\nCell type colors (Victoria's palette + polychrome fallback):\n")
-print(celltype_colors)
-
-# Stemness category colors (named)
-stemness_cat_colors <- c("Low" = "#2166AC", "Medium" = "#999999", "High" = "#B2182B")
-
-# Convert CellType_Display to factor with proper levels for each cohort
-for (cohort_name in names(xenium_list)) {
-  obj <- xenium_list[[cohort_name]]
-  obj$CellType_Display <- factor(obj$CellType_Display, levels = all_celltypes_display)
-  xenium_list[[cohort_name]] <- obj
-}
-
-# Debug: Check for NA values in metadata
-cat("\n=== NA Value Check ===\n")
-for (cohort_name in names(xenium_list)) {
-  obj <- xenium_list[[cohort_name]]
-  cat(cohort_name, ":\n")
-  cat("  CellType_Clean NAs:", sum(is.na(obj$CellType_Clean)), "\n")
-  cat("  stemness_category NAs:", sum(is.na(obj$stemness_category)), "\n")
-  cat("  Stemness_UCell NAs:", sum(is.na(obj$Stemness_UCell)), "\n")
-}
-
-# Plot spatial stemness and cell type for each cohort and FOV
-for (cohort_name in names(xenium_list)) {
-  cat("### ", cohort_name, " {.tabset}\n\n", sep = "")
-
-  obj <- xenium_list[[cohort_name]]
-  fov_names <- names(obj@images)
-
-  if (length(fov_names) == 0) {
-    cat("No FOVs found for this cohort.\n\n")
-    next
-  }
-
-  for (fov in fov_names) {
-    cat("#### ", fov, "\n\n", sep = "")
-
-    tryCatch({
-      # Debug: Check data for this specific FOV
-      fov_cells <- Cells(obj@images[[fov]])
-      cat("FOV:", fov, "- Cells in FOV:", length(fov_cells), "\n")
-
-      # Check metadata for FOV cells
-      fov_meta <- obj@meta.data[fov_cells, ]
-      cat("  CellType_Clean NAs in FOV:", sum(is.na(fov_meta$CellType_Clean)), "\n")
-      cat("  stemness_category NAs in FOV:", sum(is.na(fov_meta$stemness_category)), "\n")
-
-      # Extract dominant organ and treatment for this FOV
-      fov_organ <- names(sort(table(fov_meta$organ_std), decreasing = TRUE))[1]
-      fov_treatment <- names(sort(table(fov_meta$treatment_std), decreasing = TRUE))[1]
-      fov_organ <- tools::toTitleCase(fov_organ)  # Capitalize for display
-
-      # 1. Stemness score plot (continuous)
-      p_stemness <- ImageFeaturePlot(
-        obj,
-        features = "Stemness_UCell",
-        fov = fov,
-        size = 0.5,
-        alpha = 0.9
-      ) +
-        scale_fill_viridis_c(option = "magma") +
-        ggtitle("Stemness Score (continuous)") +
-        theme(
-          legend.position = "right",
-          plot.title = element_text(hjust = 0.5, size = 12, face = "bold")
-        )
-
-      # 2. Stemness category plot (Low/Medium/High) - simplified
-      p_stemness_cat <- ImageDimPlot(
-        obj,
-        group.by = "stemness_category",
-        fov = fov,
-        size = 0.5,
-        alpha = 0.9,
-        cols = stemness_cat_colors
-      ) +
-        ggtitle("Stemness Category") +
-        theme(
-          legend.position = "right",
-          plot.title = element_text(hjust = 0.5, size = 12, face = "bold")
-        )
-
-      # 3. Cell type plot (categorical) - using merged cell types (Victoria's naming)
-      p_celltype <- ImageDimPlot(
-        obj,
-        group.by = "CellType_Display",
-        fov = fov,
-        size = 0.5,
-        alpha = 0.9,
-        cols = celltype_colors
-      ) +
-        ggtitle("Cell Types (Victoria's Categories)") +
-        theme(
-          legend.position = "right",
-          plot.title = element_text(hjust = 0.5, size = 12, face = "bold")
-        )
-
-      # Combined 3-panel plot
-      p_combined <- p_stemness + p_stemness_cat + p_celltype +
-        plot_layout(ncol = 3) +
-        plot_annotation(
-          title = paste0(cohort_name, " - ", fov, " | ", fov_organ, " | ", fov_treatment),
-          theme = theme(plot.title = element_text(hjust = 0.5, size = 14, face = "bold"))
-        )
-      print(p_combined)
-
-      # Save combined plot
-      safe_name <- gsub("[^a-zA-Z0-9_-]", "_", paste(cohort_name, fov, sep = "_"))
-      ggsave(
-        file.path(output_dir, paste0("spatial_combined_", safe_name, ".png")),
-        p_combined, width = 24, height = 10, dpi = 300, bg = "white"
-      )
-
-      cat("\n\n")
-    }, error = function(e) {
-      cat("WARNING: Could not plot", cohort_name, "-", fov, ":", conditionMessage(e), "\n\n")
-    })
-  }
-}
-```
-
-### By Cell Type {.tabset}
-
-```{r stemness_by_celltype, fig.width=16, fig.height=12}
-# Using combined metadata from all cohorts (all_meta created in score_distribution)
-# Determine which cell type column to use (CellType_Display if available, else CellType_Clean)
-if ("CellType_Display" %in% colnames(all_meta)) {
-  all_meta$CellType_ForPlot <- all_meta$CellType_Display
-  cat("Using cell type column: CellType_Display (Victoria's naming)\n")
-} else {
-  all_meta$CellType_ForPlot <- all_meta$CellType_Clean
-  cat("Using cell type column: CellType_Clean (original naming)\n")
-}
-cat("Unique cell types:", length(unique(all_meta$CellType_ForPlot)), "\n")
-print(table(all_meta$CellType_ForPlot))
-
-# Update celltype_colors to match available cell types
-available_types <- unique(all_meta$CellType_ForPlot)
-celltype_colors_plot <- celltype_colors[names(celltype_colors) %in% available_types]
-# Add default colors for any missing types
-missing_types <- setdiff(available_types, names(celltype_colors_plot))
-if (length(missing_types) > 0) {
-  default_colors <- polychrome()[1:length(missing_types)]
-  names(default_colors) <- missing_types
-  celltype_colors_plot <- c(celltype_colors_plot, default_colors)
-}
-
-# Violin plot by cell type (using combined metadata)
-p_violin <- ggplot(all_meta, aes(x = CellType_ForPlot, y = Stemness_UCell, fill = CellType_ForPlot)) +
-  geom_violin(scale = "width", trim = TRUE) +
-  geom_boxplot(width = 0.1, fill = "white", outlier.size = 0.5) +
-  scale_fill_manual(values = celltype_colors_plot) +
-  theme_minimal() +
-  theme(
-    axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
-    legend.position = "none"
-  ) +
-  ggtitle("Stemness Score by Cell Type (All Cohorts) - Victoria's Categories") +
-  xlab("Cell Type") + ylab("Stemness Score")
-print(p_violin)
-
-ggsave(
-  file.path(output_dir, "violin_stemness_by_celltype.png"),
-  p_violin,
-  width = 16, height = 10, dpi = 300, bg = "white"
-)
-
-# Violin plot faceted by cohort
-p_violin_cohort <- ggplot(all_meta, aes(x = CellType_ForPlot, y = Stemness_UCell, fill = Cohort)) +
-  geom_violin(scale = "width", trim = TRUE) +
-  facet_wrap(~Cohort, ncol = 1) +
-  scale_fill_brewer(palette = "Set1") +
-  theme_minimal() +
-  theme(
-    axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
-    legend.position = "none"
-  ) +
-  ggtitle("Stemness Score by Cell Type (Per Cohort)") +
-  xlab("Cell Type") + ylab("Stemness Score")
-print(p_violin_cohort)
-
-ggsave(
-  file.path(output_dir, "violin_stemness_by_celltype_cohort.png"),
-  p_violin_cohort,
-  width = 16, height = 14, dpi = 300, bg = "white"
-)
-
-# Cell type distribution barplot
-ct_counts <- as.data.frame(table(all_meta$CellType_ForPlot))
-colnames(ct_counts) <- c("CellType", "Count")
-p_ct_bar <- ggplot(ct_counts, aes(x = reorder(CellType, -Count), y = Count, fill = CellType)) +
-  geom_bar(stat = "identity") +
-  scale_fill_manual(values = celltype_colors_plot) +
-  theme_minimal() +
-  theme(
-    axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
-    legend.position = "none"
-  ) +
-  ggtitle("Cell Type Distribution (All Cohorts)") +
-  xlab("Cell Type") + ylab("Number of Cells")
-print(p_ct_bar)
-
-ggsave(
-  file.path(output_dir, "barplot_celltype_distribution.png"),
-  p_ct_bar,
-  width = 14, height = 8, dpi = 300, bg = "white"
-)
-```
-
-## Stemness Analysis Summary {.tabset}
-
-### Stemness Category Distribution
-
-```{r stemness_clusters, fig.width=14, fig.height=10}
-# For summary view: use GLOBAL quantiles to compare absolute stemness across cohorts
-# (Individual cohort plots use per-cohort quantiles for internal distribution)
-summary_breaks <- quantile(all_meta$Stemness_UCell, probs = c(0, 0.25, 0.75, 1), na.rm = TRUE)
-cat("Summary (global) breaks:", paste(round(summary_breaks, 3), collapse = ", "), "\n")
-
-all_meta$stemness_category <- cut(
-  all_meta$Stemness_UCell,
-  breaks = c(-Inf, summary_breaks[2], summary_breaks[3], Inf),
-  labels = c("Low", "Medium", "High"),
-  include.lowest = TRUE
-)
-
-cat("=== Stemness Category Distribution (All Cohorts) ===\n")
-print(table(all_meta$stemness_category))
-
-cat("\n=== By Cohort ===\n")
-print(table(all_meta$Cohort, all_meta$stemness_category))
-
-# Barplot by category and cohort
-p_cat_bar <- ggplot(all_meta, aes(x = stemness_category, fill = Cohort)) +
-  geom_bar(position = "dodge") +
-  scale_fill_brewer(palette = "Set1") +
-  theme_minimal() +
-  ggtitle("Stemness Category Distribution by Cohort") +
-  xlab("Stemness Category") + ylab("Number of Cells")
-print(p_cat_bar)
-
-ggsave(
-  file.path(output_dir, "barplot_stemness_categories_by_cohort.png"),
-  p_cat_bar,
-  width = 12, height = 8, dpi = 300, bg = "white"
-)
-
-# Percentage stacked bar
-p_cat_pct <- ggplot(all_meta, aes(x = Cohort, fill = stemness_category)) +
-  geom_bar(position = "fill") +
-  scale_fill_manual(values = c("Low" = "#2166AC", "Medium" = "#999999", "High" = "#B2182B")) +
-  scale_y_continuous(labels = scales::percent) +
-  theme_minimal() +
-  ggtitle("Stemness Category Proportions by Cohort") +
-  xlab("Cohort") + ylab("Percentage")
-print(p_cat_pct)
-
-ggsave(
-  file.path(output_dir, "barplot_stemness_proportions_by_cohort.png"),
-  p_cat_pct,
-  width = 10, height = 8, dpi = 300, bg = "white"
-)
-```
-
-### Summary Statistics
-
-```{r summary_stats}
-cat("=== Xenium 3-Cohort CytoTRACE2 Validation Summary ===\n\n")
-
-# Calculate totals
-total_cells <- sum(sapply(xenium_list, ncol))
-total_fovs <- sum(sapply(xenium_list, function(x) length(names(x@images))))
-
-cat("1. Dataset\n")
-cat("   - Total cells:", total_cells, "\n")
-cat("   - Total FOVs:", total_fovs, "\n")
-cat("   - Cohorts:\n")
-for (cohort in names(xenium_list)) {
-  obj <- xenium_list[[cohort]]
-  cat("     *", cohort, ":", ncol(obj), "cells,", length(names(obj@images)), "FOVs\n")
-}
-
-cat("\n2. CytoTRACE2 Signatures (MALIGNANT-SPECIFIC)\n")
-cat("   - Source: cytotrace2_malignant_gene_correlations.csv\n")
-cat("   - Top genes (stemness-associated):", length(available_top), "of", nrow(top_genes), "\n")
-cat("   - Bottom genes (differentiation-associated):", length(available_bottom), "of", nrow(bottom_genes), "\n")
-cat("   - Top genes include: HSPD1, MYC, DNAJA1, ATF4, DUSP6, ...\n\n")
-
-cat("3. Score Interpretation\n")
-cat("   - Positive = stem-like (Top signature enriched)\n")
-cat("   - Negative = differentiated (Bottom signature enriched)\n\n")
-
-cat("4. Cell Type Annotation\n")
-cat("   - Using CellType_Clean (22 consolidated categories)\n")
-cat("   - Mapped from original CellType_Harmonized (128 categories)\n\n")
-
-cat("5. Key Observations\n")
-cat("   - Check if high score regions cluster at tumor margins\n")
-cat("   - Compare with cell type annotations\n")
-cat("   - Correlate with immune infiltration patterns\n")
-
-# Export combined CytoTRACE2 scores (all_meta already has all data)
-# Include both CellType_Clean (22 categories) and CellType_Display (Victoria's naming)
-export_cols <- c("Cohort", "CellType_Clean", "CellType_Display", "CytoTRACE2_Top", "CytoTRACE2_Bottom", "CytoTRACE2_Score", "stemness_category")
-export_cols <- intersect(export_cols, colnames(all_meta))
-stemness_export <- all_meta[, export_cols]
-write.csv(stemness_export, file.path(output_dir, "xenium_cytotrace2_scores_all_cohorts.csv"), row.names = TRUE)
-cat("\nExported: xenium_cytotrace2_scores_all_cohorts.csv\n")
-
-# Save each cohort with scores
-for (cohort in names(xenium_list)) {
-  save_path <- file.path(output_dir, paste0("xenium_", cohort, "_with_scores.qs2"))
-  cat("Saving", cohort, "to:", save_path, "\n")
-  qs2::qs_save(xenium_list[[cohort]], save_path, nthreads = 8)
-}
-cat("All objects saved.\n")
-```
+One point per melanoma cell, black line = linear fit with 95% band. CNV score = per-cell RMS of the iCNV profile without neighbour smoothing.
+
+## Methods
+
+- **Inputs** under `params$xenium_dir`: `boston/xenium_boston.qs2` (Seurat object of the six metastasis sections, raw Xenium counts, RCTD cell types merged to the atlas names in `CellType_Display`), `boston/cnv_scores_per_cluster.csv` (per-CNV-cluster score), `boston/cnv/<section>_cnv.h5ad` (InSituCNV results); `pUM26/<section>/scData_SPLIT.qs2` (SPLIT-purified counts, refined RCTD labels), `pUM26/<section>/icnv_cnv.h5ad` and `icnv_input.h5ad` (iCNV run and its input).
+- **Stemness**: UCell (maxRank 150) of the Top 50 panel genes on the counts of every cell; ranks are within a cell, so scores do not depend on the other cells. Cached in `../Outputs/Xenium_Stemness_{Boston,pUM26}_2026b/*_scores_2026b.qs2`.
+- **iCNV** (infercnvpy, macrophages as diploid reference, window 100 genes, step 10): Fig. 2g CNV score = mean |iCNV| per CNV cluster of melanoma cells, 0 for other cells (smoothed run). Fig. 2h / Suppl. Fig. 5b = mean iCNV over the chr3 and chr8 windows (`Xenium_Stemness_icnv.py`). Suppl. Fig. 5a = mean iCNV over the chr8q windows (distal half of chr8) minus the chr3 mean. Fig. 2i / Suppl. Fig. 5c = per-cell RMS over all windows of the run without neighbour smoothing (pUM26: `Xenium_Stemness_unsmoothed_icnv.py`).
+- **Statistics**: Pearson R per section on melanoma cells (`tables/`), cell-level and descriptive, no p-value.
+- **Run order**: `python -I Xenium_Stemness_icnv.py <xenium_dir> ../Outputs`, then `python Xenium_Stemness_unsmoothed_icnv.py <xenium_dir> ../Outputs <section>` for both pUM26 sections (infercnvpy env), then render with `params = list(xenium_dir = ...)`.
 
 ## Session Info
 
-```{r session_info}
+```{r session-info}
 sessionInfo()
 ```
