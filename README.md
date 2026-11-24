@@ -1,23 +1,20 @@
-# UMscAtlas
-Analysis of healthy, primary, and metastatic uveal melanoma using scRNA-seq and Xenium spatial transcriptomics. This repository includes workflows for preprocessing, integration, cell-type annotation, and characterization of malignant and TME states.
-
-The analyses re-run for the revision on the October 2026 atlas object are in [`R/revision_2026b/`](R/revision_2026b/README.md).
-
+# Uveal Melanoma scAtlas
+Analysis of non-malignant, primary, and metastatic uveal melanoma using scRNA-seq and Xenium spatial transcriptomics. This repository includes workflows for preprocessing, integration, cell-type annotation, and characterization of malignant and TME states.
 
 ## Metadata variables documentation
 
 | Metadata variable | Name in figure | Explanation |
 | --- | --- | --- |
-| primary_location  | Intraocular Location  | Location within the eye where the primary tumor arose. NA for samples that are not primary UM |
-| origin | Disease Category | Indicates if cells come from a healthy sample, primary tumor or metastasis |
+| primary_location  | Intraocular Location  | Location within the eye where the primary tumor arose. NA for samples that are not primary tumors (non-malignant tissue or metastases) |
+| origin | Disease Category | Indicates if sample originates from a non-malignant, primary or metastasis |
 | orig.ident | Sample | Identifies physical tissue sample cells originate from |
 | location | Location | Location (intraocular location and location of metastasis) for all samples in the data set |
-| samplename | Sample Name | Identifies biological replicates sequenced in different libraries (use instead of Sample column (that shows projectnumber and Index from FGCZ |
+| samplename | Sample Name | Identifies biological replicates sequenced in different libraries |
 | healthy_location | Intraocular Location non-malignant | Identifies intraocular location of non-malignant tissue |
 | Condition | Batch | Indicates sequencing batch for each sample |
 | primary_mutation | Primary Mutation | Identifies primary mutation (GNAQ, GNA11, PLCB4 or CYSLTR2) for each sample (assessed by WES or targeted sequencing) |
 | secondary_mutation | Secondary Mutation | Identifies secondary mutation (BAP1, SF3B1 or EIF1AX) for each sample (assessed by WES or targeted sequencing) |
-| Patient_nr | Patient Number | assigns a patient number (P1-P36) to each sequenced sample and shows which patients have multiple samples sequenced |
+| Patient_nr | Patient Number | assigns a patient number (P1-P46) to each sequenced sample, shows which patients have multiple samples sequenced |
 | organ | Organ | Identifies organ from which sample is originating |
 | Gender | Gender | Identifies gender of patient sample was derived from |
 | TreatmentStage_ofProcessedSample | Treatment | Indicates last treatment of patient before sampling of the sequenced sample |
@@ -25,10 +22,10 @@ The analyses re-run for the revision on the October 2026 atlas object are in [`R
 | Mets_atDiagnosis | Metastasis at Diagnosis | Identifies if metastasis was present at disease prognosis |
 | Age_atDiagnosisY | Age at Diagnosis | Identifies age at diagnosis of tumor in years |
 | RiskCategory | Risk Category | Identifies risk category assigned by collaborators in Australia for primary tumors |
-| Time_sinceDiagnosis | Time since Diagnosis | Shows calculated time since diagnosis in years until October 2025 |
+| Time_sinceDiagnosis | Time since Diagnosis | Shows calculated time since diagnosis in years until July 2026 |
 | PrimaryTreatment | Primary Treatment | Identifies treatment of primary tumor |
 | LocalProgressionPrimary | Local Progression Primary Tumor | Indicates wheter primary tumor showed disease progression or not |
-| LocalProgressionTreatment | Treatment of Local Progression | Identifies which treatment was used if didease was locally progressive |
+| LocalProgressionTreatment | Treatment of Local Progression | Identifies which treatment was used if disease was locally progressive |
 | DevelopmentOfMetastasis | Metastasis Development | Indicates whether disease developed into metastatic disease from primary tumor |
 | Time_Primary-Met.Y | Time to Metastasis | Indicates time in years from primary tumor to metastasis development |
 | MetastaticSite | Metastatic Site | Identifies site of metastasis development |
@@ -53,8 +50,8 @@ The analyses re-run for the revision on the October 2026 atlas object are in [`R
 
 - **Full Dataset**: All cells across all samples.
 - **TME Subset**: Tumor microenvironment cells, subsetted from Full Dataset (all cells except Melanocytes and Melanoma cells).
-- **Melanoma/Melanocytes Subset**: Melanoma cells and melanocytes from healthy - primary - metastases subsetted from Full Dataset.
-- **Melanoma Subset**: Subset of melanoma cells from p-m UM samples subsetted from Full Dataset.
+- **Melanoma/Melanocytes Subset**: Melanoma cells and melanocytes from non-malignant - primary - metastases subsetted from Full Dataset.
+- **Melanoma Subset**: Subset of melanoma cells from primary and metastases UM samples subsetted from Full Dataset.
 
 > **Notes:**
 > - Melanoma cells were defined using inferred copy number variation (iCNV) profiles to distinguish malignant cells from non-malignant Melanocytes populations.
@@ -70,29 +67,10 @@ graph TD
 
 ## Reference genome and annotation
 
-**Pinned in [`R/genome_annotation.R`](R/genome_annotation.R).** `source()` it in any script that
-filters, renames or joins genes.
-
+The following reference genome was used:
 ```
 Homo_sapiens/GENCODE/GRCh38.p13/Annotation/Release_42-2023-01-30
 ```
-
-GENCODE 42 / Ensembl 108, 62,684 genes. All libraries in the atlas were aligned and quantified
-against this one reference, so genome build and annotation are not a batch or cohort difference.
-
-Two things the pin exists to catch:
-
-- **The chromatin modalities are on a different build.** The scATAC and multiome (ARC) runs used
-  `GRCh38.p14 / Release_48-2025-07-03`. Release 42 -> 48 changes the gene set and some symbols, so any
-  ATAC or multiome join to the atlas must be checked for alias drift rather than assumed to line up.
-- **Annotation packages are not part of the reference but do move results.** `org.Hs.eg.db` **3.21.0** was
-  used for every GO/KEGG mapping (`Augur.R`, `Milo.R`, `CytoTRACE2.Rmd`,
-  `DEA_degPatterns_GO_KEGG_of_location.R`). `check_annotation_packages()` warns when the installed
-  version differs. The `GWASTools` version (`centromeres.hg38` in `CNV_Arm_Analysis.Rmd`) is not asserted.
-
-`check_features_against_reference(object, features_file)` verifies a Seurat object's features against
-the reference's gene annotation table and stops if fewer than 95 % are found, which is what a build
-mismatch looks like.
 
 ## Metadata Structure in Objects
 
@@ -102,10 +80,8 @@ Each Seurat object contains the following components:
 Cell-level annotations and sample information:
 - **`majority_celltype`**: Broad cell type annotation.
 - **`SubTyping`**: Detailed immune cell subtypes.
-- **`orig.ident`**: Original sample identifier (use for all analyses except GloScope).
+- **`orig.ident`**: Sample identifier (use for all analyses except GloScope).
 - **`samplename`**: Library identifier.
-
-> **Tip:** Refer to the summary table at the top and the provided R script for recommended naming conventions and color palettes.
 
 ---
 
@@ -114,8 +90,6 @@ Dimensionality reduction results for visualization and integration:
 - **`umap`**: UMAP coordinates for clustering and visualization.
 - **`pca`**: PCA embeddings for exploratory analysis.
 - **Integration**: All subsets are Harmony-corrected (except the Full Dataset).
--   use reduction: **`umap`** for **Full Dataset**
--   use reduction: **`umap_Condition_and_orig.ident_50PC_theta2`** for **Harmony-corrected Datasets**
 
 ---
 
