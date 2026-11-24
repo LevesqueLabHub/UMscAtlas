@@ -1,5 +1,5 @@
 ---
-title: "UM Atlas - GloScope Full Cohort Analysis (No Downsampling)"
+title: "GloScope Sample-Level Divergence of the Uveal Melanoma Atlas"
 output:
   html_document:
     self_contained: true
@@ -13,3512 +13,415 @@ editor_options:
 
 ```{r script-info, include=FALSE}
 # This script was used to create the following figures:
-# Extended Data (GloScope sample-level transcriptomic divergence: MDS, ANOSIM, divergence heatmaps)
+# Figure 1h (ANOSIM summary heatmap of GloScope sample divergence)
+# Figure 1i (MDS of all samples by disease category)
+# Figure 1j (MDS of primary tumors by secondary mutation)
+# Figure 1k (MDS of primary tumors by uveal location)
+# Supplementary Figure 3b (GloScope KL divergence heatmap)
+# Supplementary Figure 3c (MDS of all samples by organ, sample names shown)
+# Supplementary Figure 3d (MDS of all samples by primary driver mutation)
 ```
 
-#  {.tabset}
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 10, fig.height = 8)
+
+library(dplyr)
+library(tidyr)
+library(readr)
+library(ggplot2)
+library(ggrepel)
+library(vegan)
+library(ComplexHeatmap)
+library(circlize)
+library(grid)
+
+source("colors_2026b.R")
+
+meta_file <- "../new_data_2026b/full_meta_full.csv.gz"   # meta.data of the full atlas object
+obj_file  <- "../new_data_2026b/Objects/full Dataset/final_Subtyping_iCNV_reclustered.qs2"  # read only to compute a missing matrix
+cache_dir <- "../GloScope_Full_Outputs_2026b"            # divergence matrices, computed once
+dir.create("figures", showWarnings = FALSE)
+dir.create("tables", showWarnings = FALSE)
+
+N_PERM <- 999
+LOC3 <- c("choroid", "iris", "ciliary body")
+CALLED <- c("BAP1", "SF3B1", "EIF1AX")
+DRIVERS <- c("GNAQ", "GNA11", "PLCB4")
+```
+
+```{r metadata}
+cells <- data.table::fread(meta_file, data.table = FALSE,
+                           select = c("cell", "Sample", "Patient_nr", "samplename", "location", "origin", "organ",
+                                      "primary_mutation", "secondary_mutation", "majority_celltype", "Malignant",
+                                      "Gender", "Age_atDiagnosisY"))
+stopifnot(nrow(cells) == 349696, n_distinct(cells$Sample) == 63)
+
+# Melanocytic cells = annotated melanocytes + melanoma cells. In tumours these are exactly the iCNV-malignant
+# cells, in non-malignant samples the healthy melanocytes, so one matrix serves both cell sets.
+cells$melanocytic <- cells$majority_celltype %in% c("Melanocytes", "Melanoma cells")
+tum <- cells$origin != "non-malignant"
+stopifnot(all(cells$melanocytic[tum] == (cells$Malignant[tum] == "Malignant")),
+          !any(cells$Malignant[!tum] == "Malignant"))
+
+age_bin <- function(x) as.character(cut(x, c(-Inf, 40, 60, Inf), c("<40", "40-60", "≥60"), right = FALSE))
+sm <- cells %>%
+  group_by(Sample) %>%
+  summarise(across(c(Patient_nr, samplename, location, origin, organ, primary_mutation, secondary_mutation, Gender), first),
+            age = as.numeric(first(Age_atDiagnosisY)), n_cells = n(), n_mel = sum(melanocytic), .groups = "drop") %>%
+  group_by(Patient_nr) %>%
+  # age is a patient attribute: non-malignant samples carry none at sample level and take their patient's age
+  mutate(age_group = age_bin(age), age_group_pt = age_bin(first(na.omit(age)))) %>%
+  ungroup() %>%
+  mutate(origin = factor(origin, levels = c("non-malignant", "primary", "metastasis"))) %>%
+  arrange(origin, organ, Sample)
+```
+
+```{r divergence}
+# GloScope on the uncorrected PCA (50 PCs): k-NN density (k = 50) per sample, symmetric KL divergence per pair.
+# Entry (i, j) depends only on the cells of samples i and j, so every test below uses a sub-matrix of one of two
+# matrices: all cells (63 samples) and melanocytic cells (62 samples with >= 50 melanocytic cells).
+divergence <- function(file, use_cell, min_cells) {
+  f <- file.path(cache_dir, file)
+  if (file.exists(f)) return(qs2::qs_read(f, nthreads = 1))
+  obj <- qs2::qs_read(obj_file, nthreads = 1)
+  keep <- colnames(obj)[colnames(obj) %in% cells$cell[use_cell]]
+  smp <- obj@meta.data[keep, "Sample"]
+  keep <- keep[smp %in% names(which(table(smp) >= min_cells))]
+  d <- GloScope::gloscope(SeuratObject::Embeddings(obj, "pca")[keep, 1:50], obj@meta.data[keep, "Sample"],
+                          dens = "KNN", dist_mat = "KL", k = 50,
+                          BPPARAM = BiocParallel::MulticoreParam(workers = 24))
+  qs2::qs_save(d, f, nthreads = 1)
+  d
+}
+D_all <- divergence("divergence_origin_full_cohort.qs2", rep(TRUE, nrow(cells)), 1)
+D_mel <- divergence("divergence_gender_melanocytic.qs2", cells$melanocytic, 50)
+stopifnot(setequal(rownames(D_all), sm$Sample), setequal(rownames(D_mel), sm$Sample[sm$n_mel >= 50]))
+```
+
+```{r anosim}
+# Sample sets of the Fig. 1h cells. Ciliochoroidal (one primary) is not a tested location, but stays a primary.
+sets <- with(sm, list(
+  all       = Sample,
+  pUM       = Sample[origin == "primary"],
+  nm        = Sample[origin == "non-malignant"],
+  nm_pUM    = Sample[origin != "metastasis"],
+  no_cc     = Sample[location != "ciliochoroidal"],
+  pUM3      = Sample[origin == "primary" & location %in% LOC3],
+  smut      = Sample[secondary_mutation %in% CALLED],
+  smut_pUM  = Sample[origin == "primary" & secondary_mutation %in% CALLED],
+  chor      = Sample[origin == "primary" & location == "choroid"],
+  chor_smut = Sample[origin == "primary" & location == "choroid" & secondary_mutation %in% CALLED],
+  chor_pmut = Sample[origin == "primary" & location == "choroid" & primary_mutation %in% DRIVERS],
+  chor_age  = Sample[origin == "primary" & location == "choroid" & !is.na(age_group)],
+  pmut      = Sample[primary_mutation %in% DRIVERS],
+  pmut_pUM  = Sample[origin == "primary" & primary_mutation %in% DRIVERS],
+  organ     = Sample[organ %in% names(which(table(organ) >= 2))],   # thyroid (one sample) left out
+  age       = Sample[!is.na(age_group)],
+  age_pUM   = Sample[origin == "primary" & !is.na(age_group)],
+  age_pt    = Sample[!is.na(age_group_pt)]
+))
+
+C_ALL <- "All Cells"; C_MAL <- "Malignant Cells"; C_MEL <- "Melanocytic Cells"
+C_PRIM <- "Primary Tumors"; C_MALP <- "Malignant Cells, pUM"; C_CHOR <- "Choroidal pUM"
+# mat: all = all-cells matrix; mal = melanocytic matrix, tumours only; mel = melanocytic matrix with >= min_mel
+# melanocytic cells per sample (50 for organ and gender, as in the original analysis).
+spec <- tibble::tribble(
+  ~key,              ~grouping,                            ~cell_set, ~mat,   ~set,        ~group,               ~min_mel,
+  "origin_all",      "Origin",                             C_ALL,     "all",  "all",       "origin",             100,
+  "origin_mal",      "Origin",                             C_MAL,     "mal",  "all",       "origin",             100,
+  "origin_mel",      "Origin",                             C_MEL,     "mel",  "all",       "origin",             100,
+  "hs_prim",         "Non-malignant vs primary",           C_ALL,     "all",  "nm_pUM",    "origin",             100,
+  "hs_prim_mel",     "Non-malignant vs primary",           C_MEL,     "mel",  "nm_pUM",    "origin",             100,
+  "smut_pUM_called", "Secondary mutation (pUM)",           C_PRIM,    "all",  "smut_pUM",  "secondary_mutation", 100,
+  "smut_mal",        "Secondary mutation (pUM)",           C_MAL,     "mal",  "smut_pUM",  "secondary_mutation", 100,
+  "smut_mel",        "Secondary mutation (pUM)",           C_MEL,     "mel",  "smut_pUM",  "secondary_mutation", 100,
+  "smut_malp",       "Secondary mutation (pUM)",           C_MALP,    "mal",  "smut_pUM",  "secondary_mutation", 100,
+  "chor",            "Secondary mutation (choroidal pUM)", C_PRIM,    "all",  "chor_smut", "secondary_mutation", 100,
+  "chor_mal",        "Secondary mutation (choroidal pUM)", C_MAL,     "mal",  "chor_smut", "secondary_mutation", 100,
+  "chor_malp",       "Secondary mutation (choroidal pUM)", C_MALP,    "mal",  "chor_smut", "secondary_mutation", 100,
+  "smut_all",        "Secondary mutation",                 C_ALL,     "all",  "smut",      "secondary_mutation", 100,
+  "smut_all_mal",    "Secondary mutation",                 C_MAL,     "mal",  "smut",      "secondary_mutation", 100,
+  "smut_chor",       "Secondary mutation",                 C_CHOR,    "all",  "chor_smut", "secondary_mutation", 100,
+  "loc_all",         "Location",                           C_ALL,     "all",  "no_cc",     "location",           100,
+  "loc_all_mal",     "Location",                           C_MAL,     "mal",  "no_cc",     "location",           100,
+  "loc_all_mel",     "Location",                           C_MEL,     "mel",  "no_cc",     "location",           100,
+  "loc_all_prim",    "Location",                           C_PRIM,    "all",  "pUM3",      "location",           100,
+  "loc_all_malp",    "Location",                           C_MALP,    "mal",  "pUM3",      "location",           100,
+  "loc_pUM",         "Location (pUM)",                     C_PRIM,    "all",  "pUM3",      "location",           100,
+  "loc_mal",         "Location (pUM)",                     C_MAL,     "mal",  "pUM3",      "location",           100,
+  "loc_malp",        "Location (pUM)",                     C_MALP,    "mal",  "pUM3",      "location",           100,
+  "hsites",          "Location (non-malignant)",           C_ALL,     "all",  "nm",        "location",           100,
+  "hs_mel",          "Location (non-malignant)",           C_MEL,     "mel",  "nm",        "location",           100,
+  "pmut_all",        "Primary mutation",                   C_ALL,     "all",  "pmut",      "primary_mutation",   100,
+  "pmut_mal",        "Primary mutation",                   C_MAL,     "mal",  "pmut",      "primary_mutation",   100,
+  "pmut_mel",        "Primary mutation",                   C_MEL,     "mel",  "pmut",      "primary_mutation",   100,
+  "pmut_pUM",        "Primary mutation",                   C_PRIM,    "all",  "pmut_pUM",  "primary_mutation",   100,
+  "pmut_malp",       "Primary mutation",                   C_MALP,    "mal",  "pmut_pUM",  "primary_mutation",   100,
+  "pmut_chor",       "Primary mutation",                   C_CHOR,    "all",  "chor_pmut", "primary_mutation",   100,
+  "organ_all",       "Organ",                              C_ALL,     "all",  "organ",     "organ",              100,
+  "organ_mal",       "Organ",                              C_MAL,     "mal",  "organ",     "organ",              100,
+  "organ_mel",       "Organ",                              C_MEL,     "mel",  "organ",     "organ",              50,
+  "gender_all",      "Gender",                             C_ALL,     "all",  "all",       "Gender",             100,
+  "gender_mal",      "Gender",                             C_MAL,     "mal",  "all",       "Gender",             100,
+  "gender_mel",      "Gender",                             C_MEL,     "mel",  "all",       "Gender",             50,
+  "gender_pUM",      "Gender",                             C_PRIM,    "all",  "pUM",       "Gender",             100,
+  "gender_malp",     "Gender",                             C_MALP,    "mal",  "pUM",       "Gender",             100,
+  "gender_chor",     "Gender",                             C_CHOR,    "all",  "chor",      "Gender",             100,
+  "age_all",         "Age",                                C_ALL,     "all",  "age",       "age_group",          100,
+  "age_mal",         "Age",                                C_MAL,     "mal",  "age",       "age_group",          100,
+  "age_mel",         "Age",                                C_MEL,     "mel",  "age_pt",    "age_group_pt",       100,
+  "age_pUM",         "Age",                                C_PRIM,    "all",  "age_pUM",   "age_group",          100,
+  "age_malp",        "Age",                                C_MALP,    "mal",  "age_pUM",   "age_group",          100,
+  "age_chor",        "Age",                                C_CHOR,    "all",  "chor_age",  "age_group",          100
+)
+
+# ANOSIM, seeded per call so each p is reproducible on its own.
+anosim_Rp <- function(d, g) {
+  set.seed(42)
+  a <- vegan::anosim(as.dist(d), g, permutations = N_PERM)
+  c(R = unname(a$statistic), p = a$signif)
+}
+# Each test also once with one sample per patient per group (1/pt, the library with most cells kept).
+run_test <- function(key, grouping, cell_set, mat, set, group, min_mel) {
+  D <- if (mat == "all") D_all else D_mel
+  ok <- sm$Sample[sm$Sample %in% sets[[set]] &
+                    (mat != "mel" | sm$n_mel >= min_mel) & (mat != "mal" | sm$origin != "non-malignant")]
+  s <- rownames(D)[rownames(D) %in% ok]   # matrix order: the permutation p depends on it
+  g <- sm[[group]][match(s, sm$Sample)]
+  stopifnot(!anyNA(g), length(unique(g)) >= 2)
+  a <- anosim_Rp(D[s, s], g)
+  b <- tibble(Sample = s, g = g, n = sm$n_cells[match(s, sm$Sample)], pt = sm$Patient_nr[match(s, sm$Sample)]) %>%
+    group_by(pt, g) %>% slice_max(n, n = 1, with_ties = FALSE) %>% ungroup()
+  b_res <- anosim_Rp(D[b$Sample, b$Sample], b$g)
+  tab <- table(as.character(g))
+  tibble(key = key, grouping = grouping, cell_set = cell_set,
+         groups = paste(sprintf("%s %d", names(tab), tab), collapse = ", "),
+         n_samples = length(s), n_patients = n_distinct(b$pt), R = a[["R"]], p = a[["p"]],
+         n_samples_1pt = nrow(b), R_1pt = b_res[["R"]], p_1pt = b_res[["p"]])
+}
+res <- purrr::pmap_dfr(spec, run_test)
+
+panel_of <- c(origin_all = "Fig1h; Fig1i; SFig3b", smut_pUM_called = "Fig1h; Fig1j", loc_pUM = "Fig1h; Fig1k",
+              organ_all = "Fig1h; SFig3c", pmut_all = "Fig1h; SFig3d")
+res$panel <- dplyr::coalesce(panel_of[res$key], "Fig1h")
+write_csv(res, "tables/Fig1h_anosim_tests.csv")
+R_ <- function(k) res[res$key == k, ]
+```
+
+```{r helpers}
+stars <- function(p) as.character(cut(p, c(-Inf, 0.001, 0.01, 0.05, Inf), c("***", "**", "*", "ns")))
+fmt_p <- function(p) sprintf("p = %.3g", p)
+wrap <- function(x, w = 100) paste(unlist(lapply(x, function(l) strwrap(l, w))), collapse = "\n")
+anosim_lines <- function(k, what = "") {
+  r <- R_(k)
+  c(sprintf("ANOSIM%s: R = %.2f, %s", what, r$R, fmt_p(r$p)),
+    if (r$n_samples_1pt < r$n_samples)
+      sprintf("One sample per patient per group (n = %d): R = %.2f, %s", r$n_samples_1pt, r$R_1pt, fmt_p(r$p_1pt)))
+}
+pal_of <- list(origin = origin_colors[c("non-malignant", "primary", "metastasis")],
+               secondary_mutation = second_mutations_col, location = primary_location_colors[LOC3],
+               primary_mutation = primary_mutations_col, organ = organ_colors)
+count_line <- function(s, col) {
+  v <- as.character(sm[[col]][match(s, sm$Sample)])
+  tab <- table(factor(v, levels = unique(c(names(pal_of[[col]]), v))))
+  tab <- tab[tab > 0]
+  sprintf("n = %d samples, %d patients (%s)", length(s), n_distinct(sm$Patient_nr[match(s, sm$Sample)]),
+          paste(sprintf("%s %d", names(tab), tab), collapse = ", "))
+}
+save_fig <- function(p, name, w, h) {
+  ggsave(file.path("figures", paste0(name, ".pdf")), p, device = cairo_pdf, width = w, height = h)
+  ggsave(file.path("figures", paste0(name, ".png")), p, width = w, height = h, dpi = 300, bg = "white")
+  p
+}
+# Classical MDS (cmdscale) of the all-cells divergences of the plotted samples.
+mds_plot <- function(s, colour, title, subtitle, legend_title, shape = NULL, label = FALSE) {
+  xy <- cmdscale(as.dist(D_all[s, s]), k = 2)
+  pal <- pal_of[[colour]]
+  df <- tibble(Sample = s, MDS1 = xy[, 1], MDS2 = xy[, 2]) %>% left_join(sm, by = "Sample") %>%
+    mutate(colour = factor(as.character(.data[[colour]]), levels = intersect(names(pal), as.character(.data[[colour]]))))
+  stopifnot("level without a colour" = !anyNA(df$colour))
+  p <- ggplot(df, aes(MDS1, MDS2, colour = colour)) +
+    scale_colour_manual(values = pal, name = legend_title) +
+    coord_fixed() +
+    labs(title = title, subtitle = subtitle) +
+    theme_classic(base_size = 14) +
+    theme(legend.position = "right", plot.title = element_text(face = "bold", size = 16),
+          plot.subtitle = element_text(size = 11.5, lineheight = 1.05),
+          axis.title = element_text(size = 14), axis.text = element_text(size = 12),
+          legend.title = element_text(size = 12), legend.text = element_text(size = 11))
+  if (is.null(shape)) return(p + geom_point(size = 6))
+  p <- p + geom_point(aes(shape = .data[[shape]]), size = 6) +
+    scale_shape_manual(values = c("non-malignant" = 16, "primary" = 17, "metastasis" = 18), name = "Origin") +
+    guides(colour = guide_legend(override.aes = list(shape = 15, size = 5), order = 2), shape = guide_legend(order = 1))
+  if (label) p <- p + geom_text_repel(aes(label = samplename), size = 3, max.overlaps = Inf, point.size = 6,
+                                      box.padding = 0.3, min.segment.length = 0.2, seed = 1, show.legend = FALSE)
+  p
+}
+prim <- sm$Sample[sm$origin == "primary"]
+```
+
+<style>
+.main-container img { max-width: min(100%, 1400px) !important; height: auto !important; display: block; margin: 0 auto; }
+</style>
+
+# {.tabset}
 
 ## Overview
 
-**GloScope Sample-Level Analysis - Full Cohort (No Downsampling)**
+**Purpose**: Quantify how different the samples of the atlas are from each other and test whether that difference
+follows disease category, location, mutation status, organ, gender or age.
 
-Started on `r format(Sys.time(), "%Y-%m-%d %H:%M:%S")`
+**Input**: the full atlas (`r nrow(sm)` samples, `r n_distinct(sm$Patient_nr)` patients,
+`r format(nrow(cells), big.mark = ",")` cells), first 50 PCs of the non-integrated PCA.
 
-### Key Differences from Downsampled Version
+**Method**: GloScope (k-NN density, k = 50, symmetric KL divergence between every pair of samples). Two divergence
+matrices: all cells, and melanocytic cells (iCNV-malignant cells in tumours, melanocytes in non-malignant samples;
+samples with fewer than 100 such cells are left out, 50 for the organ and gender rows). The malignant-cell tests use
+the tumours of the melanocytic matrix. MDS = classical scaling (`cmdscale`) of the all-cells matrix.
 
-- **All cells included:** ~298,640 cells (no downsampling)
-- **Parallel processing:** 24 cores via BiocParallel
-- **Intermediate caching:** Divergence matrices saved and reused if present
-- **Higher memory:** Optimized for large-scale computation
+**Test**: ANOSIM, 999 permutations, unit = sample. Each test is repeated with one sample per patient per group
+(1/pt). p-values are not adjusted; 0.001 is the smallest possible p. Ciliochoroidal (one primary) is not a tested
+location and is not drawn.
 
-### Dataset Overview
+**Tables**: `tables/Fig1h_anosim_tests.csv` (one row per test, `panel` names the figure).
 
-```{r setup, message=FALSE, warning=FALSE}
-knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 10, fig.height = 8)
+## Fig. 1h
 
-# Load libraries
-library(Seurat)
-library(qs)
-library(qs2)
-library(tidyverse)
-library(dplyr)
-library(ggplot2)
-library(patchwork)
-library(GloScope)
-library(ComplexHeatmap)
-library(circlize)
-library(vegan)
-library(pals)
-library(BiocParallel)
-library(DT)
+ANOSIM R and significance for every grouping (rows) and cell set (columns).
 
-# Load Victoria's official color palettes
-source("colors.R")
-
-# Set up parallel processing with 24 cores
-bpparam <- MulticoreParam(workers = 24, progressbar = TRUE)
-register(bpparam)
-
-# Create output directory
-output_dir <- "../GloScope_Full_Outputs/"
-dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
-
-# Safe ANOSIM wrapper: drops samples with NA grouping before calling vegan::anosim
-safe_anosim <- function(dist_mat, grouping, permutations = 999) {
-  d <- as.matrix(dist_mat)
-  n <- nrow(d)
-  # Handle dimension mismatch: if grouping shorter than matrix, pad with NAs
-  if (length(grouping) < n) {
-    grouping <- c(grouping, rep(NA, n - length(grouping)))
-  } else if (length(grouping) > n) {
-    grouping <- grouping[seq_len(n)]
-  }
-  keep <- !is.na(grouping)
-  if (sum(keep) < 3) {
-    warning("Fewer than 3 non-NA samples for ANOSIM; skipping.")
-    return(list(statistic = NA, signif = NA))
-  }
-  d <- d[keep, keep]
-  vegan::anosim(as.dist(d), grouping[keep], permutations = permutations)
-}
-
-# Set random seed
-set.seed(42)
-
-cat("Parallel processing configured: 24 cores\n")
-cat("Output directory:", output_dir, "\n")
+```{r fig1h, fig.width=13, fig.height=13}
+row_order <- c("Origin", "Non-malignant vs primary", "Secondary mutation (pUM)", "Secondary mutation (choroidal pUM)",
+               "Secondary mutation", "Location", "Location (pUM)", "Location (non-malignant)",
+               "Primary mutation", "Organ", "Gender", "Age")
+col_order <- c(C_ALL, C_MAL, C_MEL, C_PRIM, C_MALP, C_CHOR)
+hm <- res %>% mutate(label = paste0(sprintf("R=%.2f\n%s", R, stars(p)),
+                                    ifelse(n_samples_1pt < n_samples, sprintf("\n1/pt: R=%.2f %s", R_1pt, stars(p_1pt)), "")))
+grid_all <- expand_grid(grouping = row_order, cell_set = col_order) %>%
+  left_join(hm, by = c("grouping", "cell_set")) %>%
+  mutate(grouping = factor(grouping, levels = rev(row_order)), cell_set = factor(cell_set, levels = col_order))
+cap_h <- wrap(c(
+  "R = ANOSIM R on GloScope KL divergence between samples. *** p <= 0.001 (the floor with 999 permutations), ** p < 0.01, * p < 0.05, ns otherwise; unadjusted.",
+  "1/pt = same test with one sample per patient per group (largest library kept), shown where it changes n.",
+  "Melanocytic cells = healthy melanocytes in non-malignant samples; for tumours the melanocytic cells are the malignant cells.",
+  "Primary Tumors = all cells of the 30 primaries; Malignant Cells, pUM = malignant cells of the primaries only; Choroidal pUM = all cells of the 18 choroidal primaries.",
+  "The pUM rows of Malignant Cells are already primaries-only, so they equal the Malignant Cells, pUM column.",
+  "Secondary mutation rows: BAP1 / SF3B1 / EIF1AX only. Secondary mutation and Location without a qualifier: every sample of that cell set.",
+  "Location = sample location (eye sub-site, non-malignant eye sub-site, or metastatic site); the ciliochoroidal tumour is left out; thyroid (one sample) is kept.",
+  "Age, Melanocytic Cells: non-malignant samples take their patient's age (in the other columns they have none and are left out).",
+  "Grey = not applicable to that cell set, or not run."), 112)
+p_h <- ggplot(grid_all, aes(cell_set, grouping)) +
+  geom_tile(data = dplyr::filter(grid_all, !is.na(R)), aes(fill = R), colour = "white", linewidth = 0.6) +
+  geom_tile(data = dplyr::filter(grid_all, is.na(R)), fill = "grey92", colour = "white", linewidth = 0.6) +
+  geom_text(data = dplyr::filter(grid_all, !is.na(R)), aes(label = label), size = 3.2, lineheight = 0.9) +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0.2, limits = c(-0.1, 0.6),
+                       oob = scales::squish, name = "ANOSIM R") +
+  labs(title = "GloScope ANOSIM Summary",
+       subtitle = sprintf("R statistic and significance across cell subsets (%d samples, %d patients)",
+                          nrow(sm), n_distinct(sm$Patient_nr)),
+       caption = cap_h, x = NULL, y = NULL) +
+  theme_minimal(base_size = 13) +
+  theme(axis.text.x = element_text(face = "bold", angle = 30, hjust = 1), axis.text.y = element_text(face = "bold"),
+        panel.grid = element_blank(), plot.title = element_text(face = "bold", hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5, size = 10),
+        plot.caption = element_text(hjust = 0, size = 8.5, colour = "grey25"), plot.caption.position = "plot",
+        plot.margin = margin(5.5, 5.5, 5.5, 20))
+save_fig(p_h, "Fig1h_gloscope_anosim_summary", 13, 13)
 ```
 
----
+## Fig. 1i-k
 
-## Data Loading & Preparation {.tabset}
+MDS of the all-cells divergence: all samples by disease category (1i), primary tumors by secondary mutation (1j) and
+by uveal location (1k).
 
-### Load UM Atlas
-
-```{r load_data}
-cat("Loading Victoria's updated UM Atlas (Jan 2025)...\n")
-um_atlas <- qs::qread('../13_final_Dataset_reclustered_28012025.qs',
-                      nthreads = 24)
-
-cat("Loaded Seurat object:\n")
-cat("  - Cells:", ncol(um_atlas), "\n")
-cat("  - Features:", nrow(um_atlas), "\n")
-cat("  - Samples:", length(unique(um_atlas$Sample)), "\n")
-cat("  - Patients:", length(unique(um_atlas$Patient_nr)), "\n")
+```{r fig1i, fig.width=10, fig.height=8}
+save_fig(mds_plot(sm$Sample, "origin", "GloScope MDS: Disease Origin (All Cells)",
+                  wrap(c(count_line(sm$Sample, "origin"), anosim_lines("origin_all"))), "Origin"),
+         "Fig1i_mds_origin", 10, 8)
 ```
 
-### Extract Embeddings
-
-```{r extract_embeddings}
-# Check available reductions
-cat("Available dimensionality reductions:\n")
-print(names(um_atlas@reductions))
-
-# Extract PCA embeddings (using first 50 PCs)
-if ("pca" %in% names(um_atlas@reductions)) {
-  cat("\nUsing existing PCA reduction...\n")
-  embedding_matrix <- Embeddings(um_atlas, reduction = "pca")[, 1:50]
-} else {
-  cat("\nComputing PCA reduction...\n")
-  um_atlas <- FindVariableFeatures(um_atlas, nfeatures = 3000)
-  um_atlas <- ScaleData(um_atlas)
-  um_atlas <- RunPCA(um_atlas, npcs = 50, verbose = FALSE)
-  embedding_matrix <- Embeddings(um_atlas, reduction = "pca")[, 1:50]
-}
-
-cat("Embedding matrix dimensions:", dim(embedding_matrix), "\n")
-cat("Number of PCs used:", ncol(embedding_matrix), "\n")
-cat("FULL COHORT - No downsampling applied\n")
+```{r fig1j, fig.width=10, fig.height=8}
+sc <- R_("smut_pUM_called")
+save_fig(mds_plot(prim, "secondary_mutation", "GloScope MDS: Secondary Mutations in Primary UM (All Cells)",
+                  wrap(c(count_line(prim, "secondary_mutation"),
+                         anosim_lines("smut_pUM_called", sprintf(" BAP1 vs SF3B1 vs EIF1AX (n = %d)", sc$n_samples)),
+                         "none (no mutation detected) and unknown (not assessed) are plotted, not tested.")),
+                  "Secondary Mutation"),
+         "Fig1j_mds_pUM_secondary_mutation", 10, 8)
 ```
 
-**Why non-integrated data?**
-
-GloScope is designed to capture **all sources of sample-to-sample variation**:
-
-- **Compositional differences**: Cell type proportions
-- **Transcriptional differences**: Gene expression states
-- **Biological variation**: Including batch effects that may correlate with biology
-
-Integration methods (Harmony, Seurat integration, scVI) specifically **remove** technical and batch variation. For GloScope, we use the **original PCA embeddings** from non-integrated data to preserve the full spectrum of natural sample differences. This allows GloScope to detect both expected biological variation and potential technical artifacts.
-
-### Prepare Metadata
-
-```{r prepare_metadata}
-# Extract cell-level metadata
-cell_metadata <- um_atlas@meta.data %>%
-  tibble::rownames_to_column("cell_id") %>%
-  dplyr::select(cell_id, Sample, Patient_nr, origin, organ,
-                primary_mutation, secondary_mutation, LocationPrimaryTumor,
-                majority_celltype, Malignant, Gender, Age_atDiagnosisY) %>%
-  dplyr::mutate(
-    # Clean up mutation labels
-    primary_mutation = ifelse(primary_mutation == "GANQ", "GNAQ", primary_mutation),
-    # Create simplified groups
-    origin_clean = factor(origin, levels = c("healthy", "primary", "metastasis")),
-    secondary_mut_clean = case_when(
-      secondary_mutation %in% c("BAP1", "SF3B1", "EIF1AX") ~ secondary_mutation,
-      TRUE ~ "none/unknown"
-    ),
-    location_clean = case_when(
-      LocationPrimaryTumor %in% c("choroid", "ciliary body", "iris") ~ LocationPrimaryTumor,
-      TRUE ~ "other/NA"
-    )
-  )
-
-# Create sample-level metadata
-sample_metadata <- cell_metadata %>%
-  group_by(Sample) %>%
-  summarise(
-    Patient_nr = first(Patient_nr),
-    origin = first(origin_clean),
-    organ = first(organ),
-    primary_mutation = first(primary_mutation),
-    secondary_mutation = first(secondary_mut_clean),
-    LocationPrimaryTumor = first(location_clean),
-    Gender = first(Gender),
-    Age_numeric = as.numeric(first(Age_atDiagnosisY)),  # Numeric age for calculations
-    n_cells = n(),
-    pct_malignant = 100 * mean(Malignant == "Malignant", na.rm = TRUE),
-    .groups = "drop"
-  ) %>%
-  mutate(
-    # Bin age into categories for visualization (matching ageGroup_col from config)
-    Age_group = case_when(
-      is.na(Age_numeric) ~ "Unknown",
-      Age_numeric < 40 ~ "Young",
-      Age_numeric >= 40 & Age_numeric < 60 ~ "Middle",
-      Age_numeric >= 60 ~ "Old",
-      TRUE ~ "Unknown"
-    )
-  ) %>%
-  arrange(origin, organ, Sample)
-
-cat("\nSample-level summary:\n")
-print(sample_metadata %>% count(origin, name = "n_samples"))
-
-# Save sample metadata
-write_csv(sample_metadata, file.path(output_dir, "sample_metadata.csv"))
-
-# Use Victoria's official color palettes (loaded from colors.R)
-# Add compatibility aliases for GloScope-specific naming
-organ_colors_all <- organ_colors
-pmut_colors <- c(primary_mutations_col, "NA" = "#CCCCCC")
-smut_colors <- c(second_mutations_col, "none/unknown" = "#CCCCCC", "NA" = "#CCCCCC")
-gender_colors <- gender_col
-
-# Location colors for simplified primary tumor location analysis
-location_colors_simplified <- c(
-  "choroid" = location_colors["choroid"],
-  "iris" = location_colors["iris"],
-  "ciliary body" = location_colors["ciliary body"],
-  "other/NA" = "#CCCCCC"
-)
-
-# Age group colors - use ageGroup_col from config, add Unknown
-age_colors <- c(ageGroup_col, "Unknown" = "#E1E1E1FF")
+```{r fig1k, fig.width=10, fig.height=8}
+prim3 <- intersect(prim, sets$pUM3)
+lp <- R_("loc_pUM")
+save_fig(mds_plot(prim3, "location", "GloScope MDS: Anatomical Location in Primary UM (All Cells)",
+                  wrap(c(count_line(prim3, "location"),
+                         anosim_lines("loc_pUM", sprintf(" choroid vs iris vs ciliary body (n = %d)", lp$n_samples)),
+                         "Ciliochoroidal (n = 1) not shown, not tested.")),
+                  "Location"),
+         "Fig1k_mds_pUM_location", 10, 8)
 ```
 
----
+## Suppl. Fig. 3b-d
 
-## Helper Function: Cached GloScope
+KL divergence between all samples (3b, clustered), MDS by organ with sample names (3c), MDS by primary driver
+mutation (3d).
 
-**Intelligent caching:** Checks if divergence matrix exists; if yes, loads it; if no, computes and saves it.
-
-```{r gloscope_cached_function}
-run_gloscope_cached <- function(embedding_subset, sample_labels, cache_file, analysis_name) {
-
-  # Prefer .qs2 cache, fall back to legacy .rds
-  cache_qs2 <- file.path(output_dir, sub("\\.rds$", ".qs2", cache_file))
-  cache_rds <- file.path(output_dir, cache_file)
-
-  if (file.exists(cache_qs2)) {
-    cat("  [CACHED] Loading existing divergence matrix:", basename(cache_qs2), "\n")
-    knn_div <- qs2::qs_read(cache_qs2, nthreads = parallel::detectCores())
-  } else if (file.exists(cache_rds)) {
-    cat("  [CACHED] Loading legacy .rds divergence matrix:", cache_file, "\n")
-    knn_div <- readRDS(cache_rds)
-  } else {
-    cat("  [COMPUTING] Running GloScope for:", analysis_name, "\n")
-    cat("    - Cells:", nrow(embedding_subset), "\n")
-    cat("    - Samples:", length(unique(sample_labels)), "\n")
-
-    start_time <- Sys.time()
-
-    knn_div <- gloscope(
-      embedding_matrix = embedding_subset,
-      cell_sample_ids = sample_labels,
-      dens = "KNN",
-      dist_mat = "KL",
-      k = 50,
-      BPPARAM = bpparam  # Use 24 cores
-    )
-
-    end_time <- Sys.time()
-    cat("    - Computation time:", round(difftime(end_time, start_time, units = "mins"), 2), "minutes\n")
-
-    # Save as qs2
-    qs2::qs_save(knn_div, cache_qs2, nthreads = parallel::detectCores())
-    cat("    - Saved to:", cache_qs2, "\n")
-  }
-
-  return(knn_div)
-}
+```{r sfig3b, fig.width=14, fig.height=12}
+a <- sm[match(rownames(D_all), sm$Sample), ]
+fac <- function(x, lev) factor(x, levels = intersect(lev, x))
+age_cols <- setNames(c(unname(ageGroup_col[c("Young", "Middle", "Old")]), "#E1E1E1FF"),
+                     c("<40", "40-60", "≥60", "unknown"))
+anno <- list(Patient = fac(a$Patient_nr, names(patient_cols)),
+             Origin = fac(as.character(a$origin), c("non-malignant", "primary", "metastasis")),
+             Organ = fac(a$organ, names(organ_colors)), Location = fac(a$location, names(location_colors)),
+             Gender = fac(a$Gender, names(gender_col)),
+             `Age group` = fac(coalesce(a$age_group_pt, "unknown"), names(age_cols)),
+             `Primary mutation` = fac(a$primary_mutation, names(primary_mutations_col)),
+             `Secondary mutation` = fac(a$secondary_mutation, names(second_mutations_col)))
+cols <- list(Patient = patient_cols, Origin = origin_colors, Organ = organ_colors, Location = location_colors,
+             Gender = gender_col, `Age group` = age_cols, `Primary mutation` = primary_mutations_col,
+             `Secondary mutation` = second_mutations_col)
+cols <- Map(function(x, cl) cl[levels(x)], anno, cols[names(anno)])
+stopifnot("annotation value without a colour" = !any(vapply(anno, anyNA, logical(1))))
+oa <- R_("origin_all")
+make_ht <- function() Heatmap(
+  D_all, name = "KL divergence",
+  col = colorRamp2(c(0, median(D_all), max(D_all)), c("white", "orange", "red")),
+  top_annotation = do.call(HeatmapAnnotation, c(anno, list(col = cols, annotation_name_gp = gpar(fontsize = 11),
+                                                          show_legend = c(FALSE, rep(TRUE, length(anno) - 1))))),
+  show_row_names = FALSE, show_column_names = FALSE,
+  column_title = sprintf("GloScope Divergence (All Cells, %d samples, %d patients)\nOrigin ANOSIM: R = %.2f, %s; one sample per patient per group: R = %.2f, %s",
+                         nrow(D_all), n_distinct(a$Patient_nr), oa$R, fmt_p(oa$p), oa$R_1pt, fmt_p(oa$p_1pt)),
+  column_title_gp = gpar(fontsize = 13, fontface = "bold"),
+  heatmap_legend_param = list(title = "KL divergence", legend_height = unit(4, "cm")))
+png("figures/SFig3b_kl_heatmap.png", width = 14, height = 12, units = "in", res = 300)
+draw(make_ht(), padding = unit(c(5, 5, 5, 15), "mm")); invisible(dev.off())
+cairo_pdf("figures/SFig3b_kl_heatmap.pdf", width = 14, height = 12)
+draw(make_ht(), padding = unit(c(5, 5, 5, 15), "mm")); invisible(dev.off())
+draw(make_ht(), padding = unit(c(5, 5, 5, 15), "mm"))
 ```
 
----
-
-## Helper Function: MDS Feature Contributions
-
-**Extract genes driving MDS coordinates:** For each MDS plot, we identify which genes (PCA features) contribute most to the MDS1 and MDS2 axes.
-
-```{r mds_feature_contributions_function}
-compute_mds_feature_contributions <- function(mds_coords, embedding_matrix,
-                                              sample_labels, seurat_obj,
-                                              n_top_genes = 30) {
-  # Get sample-averaged embeddings in PCA space
-  samples <- unique(sample_labels)
-  avg_pca <- matrix(0, nrow = length(samples), ncol = ncol(embedding_matrix),
-                    dimnames = list(samples, colnames(embedding_matrix)))
-
-  for (samp in samples) {
-    cells_in_sample <- which(sample_labels == samp)
-    avg_pca[samp, ] <- colMeans(embedding_matrix[cells_in_sample, , drop = FALSE])
-  }
-
-  # Align sample order (intersect to handle samples missing from either)
-  common_samples <- intersect(rownames(avg_pca), rownames(mds_coords))
-  avg_pca <- avg_pca[common_samples, ]
-  mds_coords <- mds_coords[common_samples, ]
-
-  # Correlate each PC with MDS1 and MDS2
-  cor_mds1 <- cor(avg_pca, mds_coords[, 1])
-  cor_mds2 <- cor(avg_pca, mds_coords[, 2])
-
-  # Get PCA loadings (genes × PCs)
-  pca_loadings <- seurat_obj@reductions$pca@feature.loadings
-
-  # Compute gene contributions to MDS axes
-  gene_contrib_mds1 <- abs(pca_loadings %*% cor_mds1)
-  gene_contrib_mds2 <- abs(pca_loadings %*% cor_mds2)
-
-  # Get top genes for each axis
-  top_genes_mds1 <- names(sort(gene_contrib_mds1[, 1], decreasing = TRUE)[1:n_top_genes])
-  top_genes_mds2 <- names(sort(gene_contrib_mds2[, 1], decreasing = TRUE)[1:n_top_genes])
-
-  # Combine and remove duplicates
-  top_genes <- unique(c(top_genes_mds1, top_genes_mds2))
-
-  # Get expression data and filter to genes that exist (Seurat v5 syntax)
-  expr_data <- GetAssayData(seurat_obj, assay = "RNA", layer = "data")
-  available_genes <- rownames(expr_data)
-  top_genes <- intersect(top_genes, available_genes)
-
-  if (length(top_genes) == 0) {
-    stop("No top genes found in expression matrix")
-  }
-
-  cat("  - Found", length(top_genes), "genes in expression matrix\n")
-
-  # Create heatmap matrix: samples × genes
-  # Get cell barcodes from embedding_matrix rownames
-  cell_barcodes <- rownames(embedding_matrix)
-
-  expr_matrix <- matrix(0, nrow = length(samples), ncol = length(top_genes),
-                       dimnames = list(samples, top_genes))
-
-  for (samp in samples) {
-    cells_in_sample_idx <- which(sample_labels == samp)
-    cells_in_sample_barcodes <- cell_barcodes[cells_in_sample_idx]
-
-    # Filter to cells that exist in the Seurat object
-    cells_in_sample_barcodes <- intersect(cells_in_sample_barcodes, colnames(expr_data))
-
-    if (length(cells_in_sample_barcodes) > 0) {
-      expr_matrix[samp, ] <- colMeans(expr_data[top_genes, cells_in_sample_barcodes, drop = FALSE])
-    } else {
-      warning("No cells found for sample: ", samp)
-    }
-  }
-
-  # Align with MDS sample order (intersect to handle missing samples)
-  common_expr <- intersect(rownames(expr_matrix), rownames(mds_coords))
-  expr_matrix <- expr_matrix[common_expr, ]
-
-  return(list(
-    expr_matrix = expr_matrix,
-    top_genes_mds1 = top_genes_mds1,
-    top_genes_mds2 = top_genes_mds2,
-    gene_contrib_mds1 = gene_contrib_mds1,
-    gene_contrib_mds2 = gene_contrib_mds2
-  ))
-}
-
-plot_mds_feature_heatmap <- function(feature_data, sample_metadata_subset,
-                                    title = "MDS Feature Contributions",
-                                    output_file = NULL) {
-
-  # Scale expression matrix for visualization
-  expr_scaled <- t(scale(t(feature_data$expr_matrix)))
-
-  # Mark which genes drive which MDS axis
-  gene_anno <- data.frame(
-    Gene = colnames(expr_scaled),
-    MDS_Axis = ifelse(colnames(expr_scaled) %in% feature_data$top_genes_mds1[1:15], "MDS1",
-                     ifelse(colnames(expr_scaled) %in% feature_data$top_genes_mds2[1:15], "MDS2", "Both"))
-  )
-  rownames(gene_anno) <- gene_anno$Gene
-
-  axis_colors <- c("MDS1" = "#E15759", "MDS2" = "#4E79A7", "Both" = "#59A14F")
-
-  col_anno <- HeatmapAnnotation(
-    `MDS Axis` = gene_anno$MDS_Axis,
-    col = list(`MDS Axis` = axis_colors),
-    annotation_name_gp = gpar(fontsize = 9),
-    show_legend = TRUE
-  )
-
-  # Row annotation with metadata (safe intersection)
-  common_row <- intersect(rownames(expr_scaled), rownames(sample_metadata_subset))
-  expr_scaled <- expr_scaled[common_row, , drop = FALSE]
-  row_anno_data <- sample_metadata_subset[common_row, ]
-
-  # Replace NA values with "Unknown" for annotations
-  row_anno_data_clean <- row_anno_data %>%
-    dplyr::mutate(
-      Gender = replace(as.character(Gender), is.na(Gender) | Gender == "NA", "Unknown"),
-      Age_group = replace(as.character(Age_group), is.na(Age_group) | Age_group == "NA", "Unknown")
-    )
-
-  # Add colors for Unknown categories
-  gender_colors_full <- c(gender_colors, "Unknown" = "#E1E1E1FF")
-  age_colors_full <- c(age_colors, "Unknown" = "#E1E1E1FF")
-
-  row_anno <- rowAnnotation(
-    Origin = row_anno_data_clean$origin,
-    Gender = row_anno_data_clean$Gender,
-    Age_group = row_anno_data_clean$Age_group,
-    col = list(
-      Origin = origin_colors,
-      Gender = gender_colors_full,
-      Age_group = age_colors_full
-    ),
-    annotation_name_gp = gpar(fontsize = 9),
-    show_legend = c(Origin = TRUE, Gender = TRUE, Age_group = TRUE)
-  )
-
-  # Create heatmap
-  ht <- Heatmap(
-    expr_scaled,
-    name = "Scaled\nExpression",
-    col = colorRamp2(c(-2, 0, 2), c("#2E91E5", "white", "#E15759")),
-    top_annotation = col_anno,
-    left_annotation = row_anno,
-    show_row_names = FALSE,
-    show_column_names = TRUE,
-    column_names_gp = gpar(fontsize = 7),
-    column_title = title,
-    column_title_gp = gpar(fontsize = 12, fontface = "bold"),
-    cluster_rows = TRUE,
-    cluster_columns = TRUE,
-    heatmap_legend_param = list(
-      title = "Scaled\nExpression",
-      legend_height = unit(3, "cm")
-    )
-  )
-
-  if (!is.null(output_file)) {
-    png(output_file, width = 4000, height = 2400, res = 300)
-    draw(ht)
-    dev.off()
-  }
-
-  return(ht)
-}
+```{r sfig3c, fig.width=12, fig.height=9.5}
+og <- R_("organ_all")
+save_fig(mds_plot(sm$Sample, "organ", "GloScope MDS: Organ/Metastasis Site (All Cells)",
+                  wrap(c(count_line(sm$Sample, "organ"),
+                         anosim_lines("organ_all", sprintf(" organ (n = %d, thyroid n = 1 excluded)", og$n_samples))), 110),
+                  "Organ", shape = "origin", label = TRUE),
+         "SFig3c_mds_samples_labelled", 12, 9.5)
 ```
 
----
-
-## All Cells Analysis {.tabset}
-
-**How GloScope differs from classical MDS:**
-
-Classical MDS workflows typically represent each sample as a **single point** (e.g., centroid in PCA space) and compute Euclidean distances between centroids. This approach loses information about within-sample variation and heterogeneity.
-
-**GloScope's innovation**:
-
-1. **Samples as distributions**: Each sample is represented as a probability distribution in PCA space using KNN density estimation (k=50)
-2. **Divergence, not distance**: Computes KL (Kullback-Leibler) divergence between sample distributions instead of simple Euclidean distances
-3. **Captures heterogeneity**: Two samples with the same cell type proportions but different transcriptional heterogeneity will show different divergences
-4. **MDS for visualization**: The divergence matrix is then visualized using standard MDS (same as classical approach)
-
-**Example**: Sample A with tightly clustered cells vs. Sample B with diffuse cells (both having same proportions) will appear similar in classical MDS but different in GloScope.
-
-**What we're computing**: `gloscope()` creates the sample-to-sample divergence matrix → `plotMDS()` visualizes it in 2D
-
-### Disease Progression (Origin)
-
-**Comparison:** healthy vs. primary vs. metastasis
-
-```{r gloscope_origin}
-cat("Running GloScope analysis for disease origin (ALL CELLS)...\n")
-
-# Prepare sample labels
-sample_labels <- cell_metadata$Sample
-
-# Calculate or load divergence
-knn_div_origin <- run_gloscope_cached(
-  embedding_subset = embedding_matrix,
-  sample_labels = sample_labels,
-  cache_file = "divergence_origin_full_cohort.rds",
-  analysis_name = "Disease Origin (All Cells)"
-)
-
-cat("Divergence matrix:", dim(knn_div_origin), "\n")
-
-# MDS visualization
-samples_in_div <- rownames(knn_div_origin)
-sample_metadata_for_plot <- data.frame(Sample = samples_in_div) %>%
-  left_join(sample_metadata, by = "Sample")
-
-mds_origin <- plotMDS(
-  dist_mat = knn_div_origin,
-  metadata_df = sample_metadata_for_plot,
-  sample_id = "Sample",
-  group_id = "origin",
-  k = 2
-)
-
-# Run ANOSIM test first to get p-value for plot
-anosim_origin <- safe_anosim(
-  as.dist(knn_div_origin),
-  grouping = sample_metadata_for_plot$origin,
-  permutations = 999
-)
-
-cat("\nANOSIM test for disease origin:\n")
-cat("  R statistic:", round(anosim_origin$statistic, 4), "\n")
-cat("  p-value:", anosim_origin$signif, "\n")
-
-# Format p-value for display
-p_display <- ifelse(anosim_origin$signif < 0.001, "p < 0.001",
-                    paste0("p = ", format(anosim_origin$signif, digits = 3)))
-
-# Enhance plot with ANOSIM p-value in subtitle
-p_origin_mds <- mds_origin$plot +
-  geom_point(size = 4) +
-  scale_color_manual(values = origin_colors) +
-  coord_fixed() +
-  labs(
-    title = "GloScope MDS: Disease Progression (Full Cohort)",
-    subtitle = paste0("n = ", nrow(sample_metadata_for_plot), " samples | ANOSIM: R = ",
-                     round(anosim_origin$statistic, 3), ", ", p_display),
-    color = "Origin"
-  ) +
-  theme_minimal(base_size = 14) +
-  theme(
-    legend.position = "right",
-    plot.title = element_text(face = "bold", size = 16),
-    plot.subtitle = element_text(size = 12),
-    axis.title = element_text(size = 14),
-    axis.text = element_text(size = 12),
-    legend.title = element_text(size = 12),
-    legend.text = element_text(size = 11)
-  )
-
-print(p_origin_mds)
-
-ggsave(
-  file.path(output_dir, "MDS_origin_full_cohort.png"),
-  p_origin_mds,
-  width = 10, height = 8, dpi = 300, bg = "white"
-)
-
-write_csv(
-  data.frame(
-    comparison = "disease_origin_full",
-    statistic = anosim_origin$statistic,
-    p_value = anosim_origin$signif,
-    permutations = 999
-  ),
-  file.path(output_dir, "anosim_origin_full.csv")
-)
+```{r sfig3d, fig.width=10, fig.height=8}
+pm <- R_("pmut_all")
+save_fig(mds_plot(sm$Sample, "primary_mutation", "GloScope MDS: Primary Mutations (All Cells)",
+                  wrap(c(count_line(sm$Sample, "primary_mutation"),
+                         anosim_lines("pmut_all", sprintf(" GNAQ vs GNA11 vs PLCB4 (n = %d)", pm$n_samples)),
+                         sprintf("none = the %d non-malignant samples; none and unknown are plotted, not tested.",
+                                 sum(sm$origin == "non-malignant")))),
+                  "Primary Mutation"),
+         "SFig3d_mds_primary_mutation", 10, 8)
 ```
 
-### Divergence Heatmap - Origin
-
-```{r heatmap_origin}
-# Prepare annotation
-sample_order <- sample_metadata %>% arrange(origin, organ) %>% pull(Sample)
-knn_div_ordered <- knn_div_origin[sample_order, sample_order]
-
-# Get annotation data
-anno_data <- sample_metadata[match(sample_order, sample_metadata$Sample), ]
-
-# Replace NA values with "Unknown" for annotations
-anno_data_clean <- anno_data %>%
-  dplyr::mutate(
-    Gender = replace(as.character(Gender), is.na(Gender) | Gender == "NA", "Unknown"),
-    Age_group = replace(as.character(Age_group), is.na(Age_group) | Age_group == "NA", "Unknown")
-  )
-
-# Add colors for Unknown categories
-gender_colors_full <- c(gender_colors, "Unknown" = "#E1E1E1FF")
-age_colors_full <- c(age_colors, "Unknown" = "#E1E1E1FF")
-
-# Column annotation - using Victoria's patient colors to fix blank rectangles
-# Generate patient colors for any patients not in the predefined palette
-all_patients <- unique(anno_data_clean$Patient_nr)
-patient_colors_full <- patientID_col[all_patients]
-missing_patients <- all_patients[is.na(patient_colors_full)]
-if (length(missing_patients) > 0) {
-  extra_colors <- setNames(
-    scales::hue_pal()(length(missing_patients)),
-    missing_patients
-  )
-  patient_colors_full <- c(patientID_col, extra_colors)
-}
-patient_colors_full <- patient_colors_full[!is.na(names(patient_colors_full))]
-
-col_anno <- HeatmapAnnotation(
-  Patient = anno_data_clean$Patient_nr,
-  Origin = anno_data_clean$origin,
-  Organ = anno_data_clean$organ,
-  Gender = anno_data_clean$Gender,
-  Age_group = anno_data_clean$Age_group,
-  `Primary Mutation` = anno_data_clean$primary_mutation,
-  `Secondary Mutation` = anno_data_clean$secondary_mutation,
-  col = list(
-    Patient = patient_colors_full,
-    Origin = origin_colors,
-    Organ = organ_colors_all,
-    Gender = gender_colors_full,
-    Age_group = age_colors_full,
-    `Primary Mutation` = pmut_colors,
-    `Secondary Mutation` = smut_colors
-  ),
-  annotation_name_gp = gpar(fontsize = 11),
-  show_legend = c(Patient = FALSE, Origin = TRUE, Organ = TRUE,
-                  Gender = TRUE, Age_group = TRUE,
-                  `Primary Mutation` = TRUE, `Secondary Mutation` = TRUE)
-)
-
-# Create heatmap
-ht_origin <- Heatmap(
-  knn_div_ordered,
-  name = "KL Divergence",
-  col = colorRamp2(c(0, median(knn_div_origin), max(knn_div_origin)),
-                   c("white", "orange", "red")),
-  top_annotation = col_anno,
-  show_row_names = FALSE,
-  show_column_names = FALSE,
-  column_title = "GloScope Divergence: Disease Origin (Full Cohort - All Cells)",
-  column_title_gp = gpar(fontsize = 14, fontface = "bold"),
-  heatmap_legend_param = list(
-    title = "KL Divergence",
-    legend_height = unit(4, "cm")
-  )
-)
-
-# Plot
-png(file.path(output_dir, "heatmap_origin_full_cohort.png"),
-    width = 3000, height = 2800, res = 300)
-draw(ht_origin)
-dev.off()
-
-draw(ht_origin)
-
-# Save heatmap object and data for recreation
-qs2::qs_save(list(ht = ht_origin, div_matrix = knn_div_ordered, anno_data = anno_data_clean),
-             file.path(output_dir, "gloscope_heatmap_all_cells_objects.qs2"), nthreads = parallel::detectCores())
-```
-
-### MDS Feature Contributions - Origin
-
-**NOTE:** MDS feature contribution analysis is temporarily disabled due to gene naming compatibility issues. This will be addressed in a future update.
-
-<!--
-**Genes driving MDS1/MDS2 separation:** Identify which genes contribute most to sample positioning in the MDS plot.
-
-```{r mds_features_origin, eval=FALSE}
-cat("Computing MDS feature contributions for disease origin...\n")
-
-# Get MDS coordinates
-mds_coords_origin <- mds_origin$df[, c("dim1", "dim2")]
-rownames(mds_coords_origin) <- mds_origin$df$Sample
-
-# Compute feature contributions
-feature_data_origin <- compute_mds_feature_contributions(
-  mds_coords = mds_coords_origin,
-  embedding_matrix = embedding_matrix,
-  sample_labels = sample_labels,
-  seurat_obj = um_atlas,
-  n_top_genes = 30
-)
-
-cat("Top genes driving MDS1:\n")
-print(head(feature_data_origin$top_genes_mds1, 15))
-
-cat("\nTop genes driving MDS2:\n")
-print(head(feature_data_origin$top_genes_mds2, 15))
-
-# Plot heatmap
-ht_features_origin <- plot_mds_feature_heatmap(
-  feature_data = feature_data_origin,
-  sample_metadata_subset = sample_metadata_for_plot,
-  title = "MDS Feature Contributions: Disease Origin (Full Cohort)",
-  output_file = file.path(output_dir, "heatmap_mds_features_origin_full.png")
-)
-
-draw(ht_features_origin)
-
-# Save top genes list
-write_csv(
-  data.frame(
-    Gene = feature_data_origin$top_genes_mds1[1:30],
-    Contribution_MDS1 = feature_data_origin$gene_contrib_mds1[feature_data_origin$top_genes_mds1[1:30], 1]
-  ),
-  file.path(output_dir, "top_genes_MDS1_origin_full.csv")
-)
-
-write_csv(
-  data.frame(
-    Gene = feature_data_origin$top_genes_mds2[1:30],
-    Contribution_MDS2 = feature_data_origin$gene_contrib_mds2[feature_data_origin$top_genes_mds2[1:30], 1]
-  ),
-  file.path(output_dir, "top_genes_MDS2_origin_full.csv")
-)
-```
--->
-
-### Primary Mutations
-
-**Comparison:** GNAQ vs. GNA11 vs. PLCB4
-
-```{r gloscope_primary_mutation}
-cat("Running GloScope analysis for primary mutations...\n")
-
-# Filter to samples with defined primary mutations
-samples_with_pmut <- sample_metadata %>%
-  dplyr::filter(primary_mutation %in% c("GNAQ", "GNA11", "PLCB4")) %>%
-  pull(Sample)
-
-cells_pmut <- cell_metadata %>% dplyr::filter(Sample %in% samples_with_pmut) %>% pull(cell_id)
-embedding_pmut <- embedding_matrix[cells_pmut, ]
-sample_labels_pmut <- cell_metadata %>% dplyr::filter(Sample %in% samples_with_pmut) %>% pull(Sample)
-
-# Calculate or load divergence
-knn_div_pmut <- run_gloscope_cached(
-  embedding_subset = embedding_pmut,
-  sample_labels = sample_labels_pmut,
-  cache_file = "divergence_primary_mutation_full.rds",
-  analysis_name = "Primary Mutations"
-)
-
-# MDS visualization
-samples_in_div_pmut <- rownames(knn_div_pmut)
-sample_metadata_pmut <- data.frame(Sample = samples_in_div_pmut) %>%
-  left_join(sample_metadata %>% dplyr::filter(Sample %in% samples_with_pmut), by = "Sample")
-
-mds_pmut <- plotMDS(
-  dist_mat = knn_div_pmut,
-  metadata_df = sample_metadata_pmut,
-  sample_id = "Sample",
-  group_id = "primary_mutation",
-  k = 2
-)
-
-# ANOSIM test first to get p-value for plot
-anosim_pmut <- safe_anosim(
-  as.dist(knn_div_pmut),
-  grouping = sample_metadata_pmut$primary_mutation,
-  permutations = 999
-)
-
-cat("\nANOSIM test for primary mutations:\n")
-cat("  R statistic:", round(anosim_pmut$statistic, 4), "\n")
-cat("  p-value:", anosim_pmut$signif, "\n")
-
-p_display_pmut <- ifelse(anosim_pmut$signif < 0.001, "p < 0.001",
-                         paste0("p = ", format(anosim_pmut$signif, digits = 3)))
-
-p_pmut_mds <- mds_pmut$plot +
-  geom_point(size = 4) +
-  scale_color_manual(values = pmut_colors) +
-  coord_fixed() +
-  labs(
-    title = "GloScope MDS: Primary Mutations (Full Cohort)",
-    subtitle = paste0("n = ", nrow(sample_metadata_pmut), " samples | ANOSIM: R = ",
-                     round(anosim_pmut$statistic, 3), ", ", p_display_pmut),
-    color = "Primary Mutation"
-  ) +
-  theme_minimal(base_size = 12)
-
-print(p_pmut_mds)
-
-ggsave(
-  file.path(output_dir, "MDS_primary_mutation_full.png"),
-  p_pmut_mds,
-  width = 10, height = 8, dpi = 300, bg = "white"
-)
-
-write_csv(
-  tibble(
-    comparison = "primary_mutation_full",
-    statistic = anosim_pmut$statistic,
-    p_value = anosim_pmut$signif
-  ),
-  file.path(output_dir, "anosim_primary_mutation_full.csv")
-)
-```
-
-### Primary Mutation - Malignant Cells Only
-
-```{r gloscope_primary_mutation_malignant}
-cat("Running GloScope analysis for Primary Mutation (Malignant Cells Only)...\n")
-
-# Filter to malignant cells from samples with primary mutation data
-cells_pmut_malignant <- cell_metadata %>%
-  dplyr::filter(Sample %in% samples_with_pmut, Malignant == "Malignant") %>%
-  pull(cell_id)
-
-sample_labels_pmut_malignant <- cell_metadata %>%
-  dplyr::filter(Sample %in% samples_with_pmut, Malignant == "Malignant") %>%
-  pull(Sample)
-
-sample_cell_counts_pmut_mal <- table(sample_labels_pmut_malignant)
-valid_samples_pmut_mal <- names(sample_cell_counts_pmut_mal)[sample_cell_counts_pmut_mal >= 50]
-
-cat("  - Total malignant cells:", length(cells_pmut_malignant), "\n")
-cat("  - Samples with >=50 malignant cells:", length(valid_samples_pmut_mal), "\n")
-
-if (length(valid_samples_pmut_mal) >= 4) {
-  cells_pmut_mal_filtered <- cell_metadata %>%
-    dplyr::filter(Malignant == "Malignant", Sample %in% valid_samples_pmut_mal) %>%
-    pull(cell_id)
-
-  embedding_pmut_mal <- embedding_matrix[cells_pmut_mal_filtered, ]
-  sample_labels_pmut_mal_filtered <- cell_metadata %>%
-    dplyr::filter(Malignant == "Malignant", Sample %in% valid_samples_pmut_mal) %>%
-    pull(Sample)
-
-  div_matrix_pmut_mal <- run_gloscope_cached(
-    embedding_subset = embedding_pmut_mal,
-    sample_labels = sample_labels_pmut_mal_filtered,
-    cache_file = "divergence_primary_mutation_malignant.rds",
-    analysis_name = "Primary Mutation (Malignant Cells)"
-  )
-
-  # ANOSIM test
-  pmut_vec_mal <- sample_metadata$primary_mutation[match(rownames(div_matrix_pmut_mal), sample_metadata$Sample)]
-
-  anosim_pmut_mal <- safe_anosim(div_matrix_pmut_mal, pmut_vec_mal, permutations = 999)
-
-  cat("\nANOSIM test for Primary Mutation (malignant cells):\n")
-  cat("  R statistic:", round(anosim_pmut_mal$statistic, 4), "\n")
-  cat("  p-value:", anosim_pmut_mal$signif, "\n")
-
-  write_csv(
-    tibble(
-      comparison = "primary_mutation_malignant_full",
-      statistic = anosim_pmut_mal$statistic,
-      p_value = anosim_pmut_mal$signif
-    ),
-    file.path(output_dir, "anosim_primary_mutation_malignant_full.csv")
-  )
-} else {
-  cat("Insufficient samples with adequate malignant cell representation\n")
-}
-```
-
-### Primary Mutation - Primary Tumors Only
-
-```{r gloscope_primary_mutation_pUM}
-cat("Running GloScope analysis for Primary Mutation (Primary Tumors Only)...\n")
-
-# Filter to primary tumor samples with mutation data
-samples_pUM_pmut <- sample_metadata %>%
-  dplyr::filter(origin == "primary", primary_mutation %in% c("GNAQ", "GNA11", "PLCB4")) %>%
-  pull(Sample)
-
-cells_pmut_pUM <- cell_metadata %>%
-  dplyr::filter(Sample %in% samples_pUM_pmut) %>%
-  pull(cell_id)
-
-sample_labels_pmut_pUM <- cell_metadata %>%
-  dplyr::filter(Sample %in% samples_pUM_pmut) %>%
-  pull(Sample)
-
-cat("  - Total cells from pUM:", length(cells_pmut_pUM), "\n")
-cat("  - pUM samples with mutation:", length(unique(sample_labels_pmut_pUM)), "\n")
-
-if (length(unique(sample_labels_pmut_pUM)) >= 4) {
-  embedding_pmut_pUM <- embedding_matrix[cells_pmut_pUM, ]
-
-  div_matrix_pmut_pUM <- run_gloscope_cached(
-    embedding_subset = embedding_pmut_pUM,
-    sample_labels = sample_labels_pmut_pUM,
-    cache_file = "divergence_primary_mutation_pUM.rds",
-    analysis_name = "Primary Mutation (Primary Tumors)"
-  )
-
-  # ANOSIM test
-  pmut_vec_pUM <- sample_metadata$primary_mutation[match(rownames(div_matrix_pmut_pUM), sample_metadata$Sample)]
-
-  anosim_pmut_pUM <- safe_anosim(div_matrix_pmut_pUM, pmut_vec_pUM, permutations = 999)
-
-  cat("\nANOSIM test for Primary Mutation (primary tumors):\n")
-  cat("  R statistic:", round(anosim_pmut_pUM$statistic, 4), "\n")
-  cat("  p-value:", anosim_pmut_pUM$signif, "\n")
-
-  write_csv(
-    tibble(
-      comparison = "primary_mutation_pUM_full",
-      statistic = anosim_pmut_pUM$statistic,
-      p_value = anosim_pmut_pUM$signif
-    ),
-    file.path(output_dir, "anosim_primary_mutation_pUM_full.csv")
-  )
-} else {
-  cat("Insufficient pUM samples with mutation data\n")
-}
-```
-
-### Gender
-
-**Comparison:** Male vs Female
-
-```{r gloscope_gender}
-cat("Running GloScope analysis for Gender...\n")
-
-# Filter to samples with defined gender
-samples_with_gender <- sample_metadata %>%
-  dplyr::filter(!is.na(Gender) & Gender %in% c("M", "F")) %>%
-  pull(Sample)
-
-cells_gender <- cell_metadata %>% dplyr::filter(Sample %in% samples_with_gender) %>% pull(cell_id)
-embedding_gender <- embedding_matrix[cells_gender, ]
-sample_labels_gender <- cell_metadata %>% dplyr::filter(Sample %in% samples_with_gender) %>% pull(Sample)
-
-# Run GloScope
-cat(sprintf("  - Cells: %d\n  - Samples: %d\n", nrow(embedding_gender), length(unique(sample_labels_gender))))
-
-div_matrix_gender <- run_gloscope_cached(
-  embedding_subset = embedding_gender,
-  sample_labels = sample_labels_gender,
-  cache_file = "divergence_gender_full_cohort.rds",
-  analysis_name = "Gender (All Cells)"
-)
-
-cat("Divergence matrix:", nrow(div_matrix_gender), ncol(div_matrix_gender), "\n")
-```
-
-```{r mds_gender, fig.width=10, fig.height=8}
-# MDS visualization
-mds_gender <- limma::plotMDS(div_matrix_gender, plot = FALSE)
-mds_coords_gender <- data.frame(
-  Sample = rownames(div_matrix_gender),
-  MDS1 = mds_gender$x,
-  MDS2 = mds_gender$y
-) %>%
-  left_join(sample_metadata %>% dplyr::select(Sample, Gender), by = "Sample")
-
-p_gender <- ggplot(mds_coords_gender, aes(x = MDS1, y = MDS2, color = Gender, label = Sample)) +
-  geom_point(size = 4.5, alpha = 0.7) +
-  ggrepel::geom_text_repel(size = 3, max.overlaps = 15) +
-  scale_color_manual(values = c("M" = "#3498db", "F" = "#e74c3c")) +
-  coord_fixed() +
-  theme_minimal(base_size = 14) +
-  labs(title = "MDS - Gender (All Cells)", x = "MDS1", y = "MDS2")
-
-print(p_gender)
-ggsave(file.path(output_dir, "mds_gender_full.png"), p_gender, width = 10, height = 8, dpi = 300, bg = "white")
-
-# ANOSIM test
-library(vegan)
-gender_vec <- sample_metadata$Gender[match(rownames(div_matrix_gender), sample_metadata$Sample)]
-
-anosim_gender <- safe_anosim(div_matrix_gender, gender_vec, permutations = 999)
-
-cat("\nANOSIM test for Gender:\n")
-cat("  R statistic:", round(anosim_gender$statistic, 4), "\n")
-cat("  p-value:", anosim_gender$signif, "\n")
-
-write_csv(
-  tibble(
-    comparison = "gender_full",
-    statistic = anosim_gender$statistic,
-    p_value = anosim_gender$signif
-  ),
-  file.path(output_dir, "anosim_gender_full.csv")
-)
-```
-
-### Divergence Heatmap - Gender
-
-```{r heatmap_gender, fig.width=12, fig.height=11}
-library(ComplexHeatmap)
-library(circlize)
-
-# Prepare annotation — align by matrix rownames (not filter, to preserve dimension)
-anno_data_clean <- data.frame(
-  Sample = rownames(div_matrix_gender),
-  stringsAsFactors = FALSE
-) %>%
-  left_join(sample_metadata, by = "Sample") %>%
-  dplyr::mutate(
-    Gender = replace(as.character(Gender), is.na(Gender) | Gender == "NA", "Unknown")
-  )
-
-# Define color palettes
-gender_colors <- c(gender_col, "Unknown" = "#E1E1E1FF")
-
-# Create column annotation
-col_anno <- HeatmapAnnotation(
-  Gender = anno_data_clean$Gender,
-  col = list(Gender = gender_colors),
-  show_legend = c(Gender = TRUE),
-  annotation_name_gp = gpar(fontsize = 10),
-  simple_anno_size = unit(0.4, "cm")
-)
-
-# Create heatmap
-ht_gender <- Heatmap(
-  div_matrix_gender,
-  name = "KL Divergence",
-  col = colorRamp2(
-    c(min(div_matrix_gender), median(div_matrix_gender), max(div_matrix_gender)),
-    c("blue", "white", "red")
-  ),
-  top_annotation = col_anno,
-  show_row_names = TRUE,
-  show_column_names = TRUE,
-  row_names_gp = gpar(fontsize = 8),
-  column_names_gp = gpar(fontsize = 8),
-  clustering_distance_rows = "euclidean",
-  clustering_distance_columns = "euclidean",
-  heatmap_legend_param = list(
-    title = "KL Divergence",
-    legend_height = unit(4, "cm")
-  )
-)
-
-png(file.path(output_dir, "heatmap_gender_full.png"),
-    width = 2400, height = 2200, res = 300)
-draw(ht_gender)
-dev.off()
-
-draw(ht_gender)
-```
-
-### MDS Feature Contributions - Gender
-
-```{r mds_top_genes_gender}
-cat("Identifying top genes driving MDS coordinates for Gender...\n")
-
-# Get MDS coordinates
-mds_coords_gender_mat <- data.frame(
-  dim1 = mds_coords_gender$MDS1,
-  dim2 = mds_coords_gender$MDS2,
-  row.names = mds_coords_gender$Sample
-)
-
-# Get sample-averaged embeddings
-samples_gender <- unique(sample_labels_gender)
-avg_pca_gender <- matrix(0, nrow = length(samples_gender), ncol = ncol(embedding_gender),
-                         dimnames = list(samples_gender, colnames(embedding_gender)))
-
-for (samp in samples_gender) {
-  cells_in_sample <- which(sample_labels_gender == samp)
-  avg_pca_gender[samp, ] <- colMeans(embedding_gender[cells_in_sample, , drop = FALSE])
-}
-
-# Align sample order (intersect to handle missing samples)
-common_gender <- intersect(rownames(avg_pca_gender), rownames(mds_coords_gender_mat))
-avg_pca_gender <- avg_pca_gender[common_gender, ]
-mds_coords_gender_mat <- mds_coords_gender_mat[common_gender, ]
-
-# Correlate each PC with MDS1 and MDS2
-cor_mds1_gender <- cor(avg_pca_gender, mds_coords_gender_mat[, 1])
-cor_mds2_gender <- cor(avg_pca_gender, mds_coords_gender_mat[, 2])
-
-# Get PCA loadings
-pca_loadings <- um_atlas@reductions$pca@feature.loadings
-
-# Compute gene contributions
-gene_contrib_mds1_gender <- abs(pca_loadings %*% cor_mds1_gender)
-gene_contrib_mds2_gender <- abs(pca_loadings %*% cor_mds2_gender)
-
-# Get top 30 genes for each axis
-# Gene names are already in the rownames of gene_contrib matrices
-contrib_vec_mds1_gender <- as.vector(gene_contrib_mds1_gender)
-names(contrib_vec_mds1_gender) <- rownames(gene_contrib_mds1_gender)
-top_genes_mds1_gender <- names(sort(contrib_vec_mds1_gender, decreasing = TRUE)[1:30])
-
-contrib_vec_mds2_gender <- as.vector(gene_contrib_mds2_gender)
-names(contrib_vec_mds2_gender) <- rownames(gene_contrib_mds2_gender)
-top_genes_mds2_gender <- names(sort(contrib_vec_mds2_gender, decreasing = TRUE)[1:30])
-
-cat("\nTop 30 genes driving MDS1 (Gender):\n")
-print(top_genes_mds1_gender)
-
-cat("\nTop 30 genes driving MDS2 (Gender):\n")
-print(top_genes_mds2_gender)
-
-# Save to CSV
-write_csv(
-  data.frame(
-    Gene = top_genes_mds1_gender,
-    Contribution = contrib_vec_mds1_gender[top_genes_mds1_gender]
-  ),
-  file.path(output_dir, "top_genes_MDS1_gender.csv")
-)
-
-write_csv(
-  data.frame(
-    Gene = top_genes_mds2_gender,
-    Contribution = contrib_vec_mds2_gender[top_genes_mds2_gender]
-  ),
-  file.path(output_dir, "top_genes_MDS2_gender.csv")
-)
-```
-
-### Organ (Metastasis Sites)
-
-**Comparison:** Metastasis sites (liver, brain, skin, thyroid) vs primary eye tumors
-
-```{r gloscope_organ}
-cat("Running GloScope analysis for Organ/Metastasis Sites...\n")
-
-# Check organ distribution first
-cat("\nOrgan distribution:\n")
-organ_counts <- sample_metadata %>% count(organ)
-print(organ_counts)
-
-# Use all samples - compare different organs (need at least 2 per group)
-samples_by_organ <- sample_metadata %>%
-  group_by(organ) %>%
-  filter(n() >= 2) %>%  # Need at least 2 samples per group
-  ungroup() %>%
-  pull(Sample)
-
-cat(sprintf("\nSamples with >=2 per organ group: %d\n", length(samples_by_organ)))
-
-cells_organ <- cell_metadata %>%
-  dplyr::filter(Sample %in% samples_by_organ) %>%
-  pull(cell_id)
-
-embedding_organ <- embedding_matrix[cells_organ, ]
-sample_labels_organ <- cell_metadata %>%
-  dplyr::filter(Sample %in% samples_by_organ) %>%
-  pull(Sample)
-
-cat(sprintf("  - Cells: %d\n  - Samples: %d\n", nrow(embedding_organ), length(unique(sample_labels_organ))))
-
-# Run GloScope with error handling
-div_matrix_organ <- tryCatch({
-  run_gloscope_cached(
-    embedding_subset = embedding_organ,
-    sample_labels = sample_labels_organ,
-    cache_file = "divergence_organ_full_cohort.rds",
-    analysis_name = "Organ (All Cells)"
-  )
-}, error = function(e) {
-  cat("GloScope error:", conditionMessage(e), "\n")
-  cat("Trying with sequential processing...\n")
-
-  # Try without parallel processing — check qs2 first, then legacy rds
-  cache_qs2 <- file.path(output_dir, "divergence_organ_full_cohort.qs2")
-  cache_rds <- file.path(output_dir, "divergence_organ_full_cohort.rds")
-  if (file.exists(cache_qs2)) {
-    return(qs2::qs_read(cache_qs2, nthreads = parallel::detectCores()))
-  } else if (file.exists(cache_rds)) {
-    return(readRDS(cache_rds))
-  }
-
-  # Run with BPPARAM = SerialParam()
-  GloScope::gloscope(
-    embedding_organ,
-    sample_labels_organ,
-    dens = "GMM",
-    dist_mat = "KL",
-    BPPARAM = BiocParallel::SerialParam()
-  )
-})
-
-cat("Divergence matrix:", nrow(div_matrix_organ), "x", ncol(div_matrix_organ), "\n")
-```
-
-```{r mds_organ, fig.width=12, fig.height=9}
-# MDS plot with dual encoding: Color = Secondary Mutation, Shape = Disease Progression
-mds_organ <- limma::plotMDS(div_matrix_organ, plot = FALSE)
-mds_coords_organ <- data.frame(
-  Sample = rownames(div_matrix_organ),
-  MDS1 = mds_organ$x,
-  MDS2 = mds_organ$y
-) %>%
-  left_join(sample_metadata %>% dplyr::select(Sample, organ, origin, secondary_mutation), by = "Sample")
-
-# Define shape mapping for disease progression
-progression_shapes <- c("healthy" = 16, "primary" = 17, "metastasis" = 18)
-
-# ANOSIM test first to get statistics for annotation
-organ_vec <- sample_metadata$organ[match(rownames(div_matrix_organ), sample_metadata$Sample)]
-
-anosim_organ <- NULL
-if (length(unique(organ_vec)) >= 2) {
-  anosim_organ <- safe_anosim(div_matrix_organ, organ_vec, permutations = 999)
-
-  cat("\nANOSIM test for Organ:\n")
-  cat("  R statistic:", round(anosim_organ$statistic, 4), "\n")
-  cat("  p-value:", anosim_organ$signif, "\n")
-
-  write_csv(
-    data.frame(
-      comparison = "organ_full",
-      statistic = anosim_organ$statistic,
-      p_value = anosim_organ$signif,
-      permutations = 999
-    ),
-    file.path(output_dir, "anosim_organ_full.csv")
-  )
-}
-
-# Format ANOSIM annotation text
-anosim_text <- if (!is.null(anosim_organ)) {
-  p_disp <- ifelse(anosim_organ$signif < 0.001, "p < 0.001",
-                    paste0("p = ", format(anosim_organ$signif, digits = 3)))
-  paste0("ANOSIM R = ", round(anosim_organ$statistic, 3), ", ", p_disp)
-} else {
-  ""
-}
-
-p_organ <- ggplot(mds_coords_organ, aes(x = MDS1, y = MDS2,
-                                         color = secondary_mutation,
-                                         shape = origin,
-                                         label = Sample)) +
-  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.3) +
-  geom_vline(xintercept = 0, linetype = "dashed", alpha = 0.3) +
-  geom_point(size = 4, alpha = 0.8) +
-  ggrepel::geom_text_repel(size = 3, max.overlaps = 20, show.legend = FALSE) +
-  scale_color_manual(values = smut_colors, name = "Secondary Mutation") +
-  scale_shape_manual(values = progression_shapes, name = "Disease Progression") +
-  guides(
-    color = guide_legend(override.aes = list(shape = 15, size = 4)),
-    shape = guide_legend(override.aes = list(size = 4))
-  ) +
-  annotate("text", x = Inf, y = -Inf, label = anosim_text,
-           hjust = 1.1, vjust = -0.5, size = 4, fontface = "italic") +
-  theme_classic(base_size = 14) +
-  coord_fixed() +
-  labs(title = "MDS - Organ/Metastasis Site (All Cells)",
-       subtitle = "Color = Secondary Mutation, Shape = Disease Progression",
-       x = "MDS1", y = "MDS2") +
-  theme(
-    plot.title = element_text(face = "bold", size = 16),
-    axis.title = element_text(size = 14),
-    legend.title = element_text(size = 12),
-    legend.text = element_text(size = 11)
-  )
-
-print(p_organ)
-ggsave(file.path(output_dir, "mds_organ_full.png"), p_organ, width = 12, height = 9, dpi = 300, bg = "white")
-```
-
-### Divergence Heatmap - Organ
-
-```{r heatmap_organ, fig.width=12, fig.height=11}
-# Order samples by organ
-sample_order_organ <- sample_metadata %>%
-  dplyr::filter(Sample %in% rownames(div_matrix_organ)) %>%
-  arrange(organ, origin) %>%
-  pull(Sample)
-
-div_matrix_organ_ordered <- div_matrix_organ[sample_order_organ, sample_order_organ]
-
-anno_data_organ <- sample_metadata[match(sample_order_organ, sample_metadata$Sample), ]
-
-col_anno_organ <- HeatmapAnnotation(
-  Organ = anno_data_organ$organ,
-  Origin = anno_data_organ$origin,
-  col = list(Organ = organ_colors_all,
-             Origin = origin_colors),
-  show_legend = c(Organ = TRUE, Origin = TRUE),
-  annotation_name_side = "left"
-)
-
-ht_organ <- Heatmap(
-  div_matrix_organ_ordered,
-  name = "KL Divergence",
-  col = colorRamp2(c(0, median(div_matrix_organ), max(div_matrix_organ)),
-                   c("white", "#FFC0CB", "#8B0000")),
-  top_annotation = col_anno_organ,
-  show_row_names = TRUE,
-  show_column_names = FALSE,
-  column_title = "Organ/Metastasis Site Comparison",
-  row_names_gp = gpar(fontsize = 8),
-  row_title = "Samples",
-  cluster_rows = FALSE,
-  cluster_columns = FALSE
-)
-
-png(file.path(output_dir, "heatmap_organ_full.png"),
-    width = 12, height = 11, units = "in", res = 300)
-draw(ht_organ)
-dev.off()
-
-draw(ht_organ)
-```
-
-### Organ - Malignant Cells Only
-
-```{r gloscope_organ_malignant}
-cat("Running GloScope analysis for Organ (Malignant Cells Only)...\n")
-
-# Filter to malignant cells from samples with organ data
-cells_organ_malignant <- cell_metadata %>%
-  dplyr::filter(Sample %in% samples_by_organ, Malignant == "Malignant") %>%
-  pull(cell_id)
-
-sample_labels_organ_malignant <- cell_metadata %>%
-  dplyr::filter(Sample %in% samples_by_organ, Malignant == "Malignant") %>%
-  pull(Sample)
-
-# Check sample representation
-sample_cell_counts_organ_mal <- table(sample_labels_organ_malignant)
-valid_samples_organ_mal <- names(sample_cell_counts_organ_mal)[sample_cell_counts_organ_mal >= 50]
-
-cat("  - Total malignant cells:", length(cells_organ_malignant), "\n")
-cat("  - Samples with >=50 malignant cells:", length(valid_samples_organ_mal), "\n")
-
-if (length(valid_samples_organ_mal) >= 4) {
-  # Filter to valid samples
-  cells_organ_mal_filtered <- cell_metadata %>%
-    dplyr::filter(Malignant == "Malignant", Sample %in% valid_samples_organ_mal) %>%
-    pull(cell_id)
-
-  embedding_organ_mal <- embedding_matrix[cells_organ_mal_filtered, ]
-  sample_labels_organ_mal_filtered <- cell_metadata %>%
-    dplyr::filter(Malignant == "Malignant", Sample %in% valid_samples_organ_mal) %>%
-    pull(Sample)
-
-  # Run GloScope
-  div_matrix_organ_mal <- run_gloscope_cached(
-    embedding_subset = embedding_organ_mal,
-    sample_labels = sample_labels_organ_mal_filtered,
-    cache_file = "divergence_organ_malignant.rds",
-    analysis_name = "Organ (Malignant Cells)"
-  )
-
-  # ANOSIM test
-  organ_vec_mal <- sample_metadata$organ[match(rownames(div_matrix_organ_mal), sample_metadata$Sample)]
-
-  anosim_organ_mal <- safe_anosim(div_matrix_organ_mal, organ_vec_mal, permutations = 999)
-
-  cat("\nANOSIM test for Organ (malignant cells):\n")
-  cat("  R statistic:", round(anosim_organ_mal$statistic, 4), "\n")
-  cat("  p-value:", anosim_organ_mal$signif, "\n")
-
-  write_csv(
-    tibble(
-      comparison = "organ_malignant_full",
-      statistic = anosim_organ_mal$statistic,
-      p_value = anosim_organ_mal$signif
-    ),
-    file.path(output_dir, "anosim_organ_malignant_full.csv")
-  )
-} else {
-  cat("Insufficient samples with adequate malignant cell representation\n")
-}
-```
-
-### Organ - Melanocytic Cells Only
-
-```{r gloscope_organ_melanocytic}
-cat("Running GloScope analysis for Organ (Melanocytic Cells Only)...\n")
-
-# Filter to melanocytic cells (malignant + healthy melanocytes)
-cells_organ_melanocytic <- cell_metadata %>%
-  dplyr::filter(Sample %in% samples_by_organ,
-                (Malignant == "Malignant" | majority_celltype == "Melanocytes")) %>%
-  pull(cell_id)
-
-sample_labels_organ_melanocytic <- cell_metadata %>%
-  dplyr::filter(Sample %in% samples_by_organ,
-                (Malignant == "Malignant" | majority_celltype == "Melanocytes")) %>%
-  pull(Sample)
-
-# Check sample representation
-sample_cell_counts_organ_mel <- table(sample_labels_organ_melanocytic)
-valid_samples_organ_mel <- names(sample_cell_counts_organ_mel)[sample_cell_counts_organ_mel >= 50]
-
-cat("  - Total melanocytic cells:", length(cells_organ_melanocytic), "\n")
-cat("  - Samples with >=50 melanocytic cells:", length(valid_samples_organ_mel), "\n")
-
-if (length(valid_samples_organ_mel) >= 4) {
-  cells_organ_mel_filtered <- cell_metadata %>%
-    dplyr::filter((Malignant == "Malignant" | majority_celltype == "Melanocytes"),
-                  Sample %in% valid_samples_organ_mel) %>%
-    pull(cell_id)
-
-  embedding_organ_mel <- embedding_matrix[cells_organ_mel_filtered, ]
-  sample_labels_organ_mel_filtered <- cell_metadata %>%
-    dplyr::filter((Malignant == "Malignant" | majority_celltype == "Melanocytes"),
-                  Sample %in% valid_samples_organ_mel) %>%
-    pull(Sample)
-
-  div_matrix_organ_mel <- run_gloscope_cached(
-    embedding_subset = embedding_organ_mel,
-    sample_labels = sample_labels_organ_mel_filtered,
-    cache_file = "divergence_organ_melanocytic.rds",
-    analysis_name = "Organ (Melanocytic Cells)"
-  )
-
-  # ANOSIM test
-  organ_vec_mel <- sample_metadata$organ[match(rownames(div_matrix_organ_mel), sample_metadata$Sample)]
-
-  anosim_organ_mel <- safe_anosim(div_matrix_organ_mel, organ_vec_mel, permutations = 999)
-
-  cat("\nANOSIM test for Organ (melanocytic cells):\n")
-  cat("  R statistic:", round(anosim_organ_mel$statistic, 4), "\n")
-  cat("  p-value:", anosim_organ_mel$signif, "\n")
-
-  write_csv(
-    tibble(
-      comparison = "organ_melanocytic_full",
-      statistic = anosim_organ_mel$statistic,
-      p_value = anosim_organ_mel$signif
-    ),
-    file.path(output_dir, "anosim_organ_melanocytic_full.csv")
-  )
-} else {
-  cat("Insufficient samples with adequate melanocytic cell representation\n")
-}
-```
-
-### Age
-
-**Comparison:** Age groups
-
-```{r gloscope_age}
-cat("Running GloScope analysis for Age...\n")
-
-# Filter to samples with defined age groups
-samples_with_age <- sample_metadata %>%
-  dplyr::filter(!is.na(Age_group) & Age_group != "Unknown") %>%
-  pull(Sample)
-
-cells_age <- cell_metadata %>% dplyr::filter(Sample %in% samples_with_age) %>% pull(cell_id)
-embedding_age <- embedding_matrix[cells_age, ]
-sample_labels_age <- cell_metadata %>% dplyr::filter(Sample %in% samples_with_age) %>% pull(Sample)
-
-# Run GloScope
-cat(sprintf("  - Cells: %d\n  - Samples: %d\n", nrow(embedding_age), length(unique(sample_labels_age))))
-
-div_matrix_age <- run_gloscope_cached(
-  embedding_subset = embedding_age,
-  sample_labels = sample_labels_age,
-  cache_file = "divergence_age_full_cohort.rds",
-  analysis_name = "Age (All Cells)"
-)
-
-cat("Divergence matrix:", nrow(div_matrix_age), ncol(div_matrix_age), "\n")
-```
-
-```{r mds_age, fig.width=10, fig.height=8}
-# MDS visualization
-mds_age <- limma::plotMDS(div_matrix_age, plot = FALSE)
-mds_coords_age <- data.frame(
-  Sample = rownames(div_matrix_age),
-  MDS1 = mds_age$x,
-  MDS2 = mds_age$y
-) %>%
-  left_join(sample_metadata %>% dplyr::select(Sample, Age_group), by = "Sample")
-
-# Age colors - use ageGroup_col from config (already defined in setup)
-
-p_age <- ggplot(mds_coords_age, aes(x = MDS1, y = MDS2, color = Age_group, label = Sample)) +
-  geom_point(size = 4.5, alpha = 0.7) +
-  ggrepel::geom_text_repel(size = 3, max.overlaps = 15) +
-  scale_color_manual(values = age_colors) +
-  coord_fixed() +
-  theme_minimal(base_size = 14) +
-  labs(title = "MDS - Age Group (All Cells)", x = "MDS1", y = "MDS2", color = "Age Group")
-
-print(p_age)
-ggsave(file.path(output_dir, "mds_age_full.png"), p_age, width = 10, height = 8, dpi = 300, bg = "white")
-
-# ANOSIM test
-age_vec <- sample_metadata$Age_group[match(rownames(div_matrix_age), sample_metadata$Sample)]
-
-anosim_age <- safe_anosim(div_matrix_age, age_vec, permutations = 999)
-
-cat("\nANOSIM test for Age:\n")
-cat("  R statistic:", round(anosim_age$statistic, 4), "\n")
-cat("  p-value:", anosim_age$signif, "\n")
-
-write_csv(
-  tibble(
-    comparison = "age_full",
-    statistic = anosim_age$statistic,
-    p_value = anosim_age$signif
-  ),
-  file.path(output_dir, "anosim_age_full.csv")
-)
-```
-
-### Divergence Heatmap - Age
-
-```{r heatmap_age, fig.width=12, fig.height=11}
-# Prepare annotation — align by matrix rownames (not filter, to preserve dimension)
-anno_data <- data.frame(Sample = rownames(div_matrix_age), stringsAsFactors = FALSE) %>%
-  left_join(sample_metadata, by = "Sample") %>%
-  dplyr::mutate(
-    Age_group = replace(as.character(Age_group), is.na(Age_group) | Age_group == "NA", "Unknown")
-  )
-
-# Create column annotation
-col_anno <- HeatmapAnnotation(
-  Age_group = anno_data$Age_group,
-  col = list(Age_group = age_colors),
-  show_legend = c(Age_group = TRUE),
-  annotation_name_gp = gpar(fontsize = 10),
-  simple_anno_size = unit(0.4, "cm")
-)
-
-# Create heatmap
-ht_age <- Heatmap(
-  div_matrix_age,
-  name = "KL Divergence",
-  col = colorRamp2(
-    c(min(div_matrix_age), median(div_matrix_age), max(div_matrix_age)),
-    c("blue", "white", "red")
-  ),
-  top_annotation = col_anno,
-  show_row_names = TRUE,
-  show_column_names = TRUE,
-  row_names_gp = gpar(fontsize = 8),
-  column_names_gp = gpar(fontsize = 8),
-  clustering_distance_rows = "euclidean",
-  clustering_distance_columns = "euclidean",
-  heatmap_legend_param = list(
-    title = "KL Divergence",
-    legend_height = unit(4, "cm")
-  )
-)
-
-png(file.path(output_dir, "heatmap_age_full.png"),
-    width = 2400, height = 2200, res = 300)
-draw(ht_age)
-dev.off()
-
-draw(ht_age)
-```
-
-### MDS Feature Contributions - Age
-
-```{r mds_top_genes_age}
-cat("Identifying top genes driving MDS coordinates for Age...\n")
-
-# Get MDS coordinates
-mds_coords_age_mat <- data.frame(
-  dim1 = mds_coords_age$MDS1,
-  dim2 = mds_coords_age$MDS2,
-  row.names = mds_coords_age$Sample
-)
-
-# Get sample-averaged embeddings
-samples_age <- unique(sample_labels_age)
-avg_pca_age <- matrix(0, nrow = length(samples_age), ncol = ncol(embedding_age),
-                      dimnames = list(samples_age, colnames(embedding_age)))
-
-for (samp in samples_age) {
-  cells_in_sample <- which(sample_labels_age == samp)
-  avg_pca_age[samp, ] <- colMeans(embedding_age[cells_in_sample, , drop = FALSE])
-}
-
-# Align sample order (intersect to handle missing samples)
-common_age <- intersect(rownames(avg_pca_age), rownames(mds_coords_age_mat))
-avg_pca_age <- avg_pca_age[common_age, ]
-mds_coords_age_mat <- mds_coords_age_mat[common_age, ]
-
-# Correlate each PC with MDS1 and MDS2
-cor_mds1_age <- cor(avg_pca_age, mds_coords_age_mat[, 1])
-cor_mds2_age <- cor(avg_pca_age, mds_coords_age_mat[, 2])
-
-# Get PCA loadings
-pca_loadings <- um_atlas@reductions$pca@feature.loadings
-
-# Compute gene contributions
-gene_contrib_mds1_age <- abs(pca_loadings %*% cor_mds1_age)
-gene_contrib_mds2_age <- abs(pca_loadings %*% cor_mds2_age)
-
-# Get top 30 genes for each axis
-# Gene names are already in the rownames of gene_contrib matrices
-contrib_vec_mds1_age <- as.vector(gene_contrib_mds1_age)
-names(contrib_vec_mds1_age) <- rownames(gene_contrib_mds1_age)
-top_genes_mds1_age <- names(sort(contrib_vec_mds1_age, decreasing = TRUE)[1:30])
-
-contrib_vec_mds2_age <- as.vector(gene_contrib_mds2_age)
-names(contrib_vec_mds2_age) <- rownames(gene_contrib_mds2_age)
-top_genes_mds2_age <- names(sort(contrib_vec_mds2_age, decreasing = TRUE)[1:30])
-
-cat("\nTop 30 genes driving MDS1 (Age):\n")
-print(top_genes_mds1_age)
-
-cat("\nTop 30 genes driving MDS2 (Age):\n")
-print(top_genes_mds2_age)
-
-# Save to CSV
-write_csv(
-  data.frame(
-    Gene = top_genes_mds1_age,
-    Contribution = contrib_vec_mds1_age[top_genes_mds1_age]
-  ),
-  file.path(output_dir, "top_genes_MDS1_age.csv")
-)
-
-write_csv(
-  data.frame(
-    Gene = top_genes_mds2_age,
-    Contribution = contrib_vec_mds2_age[top_genes_mds2_age]
-  ),
-  file.path(output_dir, "top_genes_MDS2_age.csv")
-)
-```
-
----
-
-## Secondary Mutation Analysis {.tabset}
-
-### Secondary Mutation - All Cells
-
-**All cells from samples with known secondary mutations (BAP1, SF3B1, EIF1AX)**
-
-```{r gloscope_secondary_mutation_all}
-cat("Running GloScope analysis for secondary mutations (All Cells)...\n")
-
-# Filter to samples with defined secondary mutations (excluding 'none' and 'unknown')
-samples_with_smut <- sample_metadata %>%
-  dplyr::filter(secondary_mutation %in% c("BAP1", "SF3B1", "EIF1AX")) %>%
-  pull(Sample)
-
-cat("Found", length(samples_with_smut), "samples with known secondary mutations\n")
-
-cells_smut <- cell_metadata %>% dplyr::filter(Sample %in% samples_with_smut) %>% pull(cell_id)
-embedding_smut <- embedding_matrix[cells_smut, ]
-sample_labels_smut <- cell_metadata %>% dplyr::filter(Sample %in% samples_with_smut) %>% pull(Sample)
-
-# Calculate or load divergence
-knn_div_smut <- run_gloscope_cached(
-  embedding_subset = embedding_smut,
-  sample_labels = sample_labels_smut,
-  cache_file = "divergence_secondary_mutation_full.rds",
-  analysis_name = "Secondary Mutations (All Cells)"
-)
-
-# MDS visualization
-samples_in_div_smut <- rownames(knn_div_smut)
-sample_metadata_smut <- data.frame(Sample = samples_in_div_smut) %>%
-  left_join(sample_metadata %>% dplyr::filter(Sample %in% samples_with_smut), by = "Sample")
-
-mds_smut <- plotMDS(
-  dist_mat = knn_div_smut,
-  metadata_df = sample_metadata_smut,
-  sample_id = "Sample",
-  group_id = "secondary_mutation",
-  k = 2
-)
-
-# ANOSIM test first to get p-value for plot
-anosim_smut <- safe_anosim(
-  as.dist(knn_div_smut),
-  grouping = sample_metadata_smut$secondary_mutation,
-  permutations = 999
-)
-
-cat("\nANOSIM test for secondary mutations (All Cells):\n")
-cat("  R statistic:", round(anosim_smut$statistic, 4), "\n")
-cat("  p-value:", anosim_smut$signif, "\n")
-
-p_display_smut <- ifelse(anosim_smut$signif < 0.001, "p < 0.001",
-                         paste0("p = ", format(anosim_smut$signif, digits = 3)))
-
-p_smut_mds <- mds_smut$plot +
-  scale_color_manual(values = smut_colors) +
-  coord_fixed() +
-  labs(
-    title = "GloScope MDS: Secondary Mutations (All Cells)",
-    subtitle = paste0("n = ", nrow(sample_metadata_smut), " samples | ANOSIM: R = ",
-                     round(anosim_smut$statistic, 3), ", ", p_display_smut),
-    color = "Secondary Mutation"
-  ) +
-  theme_minimal(base_size = 14) +
-  theme(
-    plot.title = element_text(face = "bold", size = 16),
-    plot.subtitle = element_text(size = 12),
-    axis.title = element_text(size = 14),
-    axis.text = element_text(size = 12),
-    legend.title = element_text(size = 12),
-    legend.text = element_text(size = 11)
-  )
-
-print(p_smut_mds)
-
-ggsave(
-  file.path(output_dir, "MDS_secondary_mutation_full.png"),
-  p_smut_mds,
-  width = 10, height = 8, dpi = 300, bg = "white"
-)
-
-write_csv(
-  tibble(
-    comparison = "secondary_mutation_full",
-    statistic = anosim_smut$statistic,
-    p_value = anosim_smut$signif
-  ),
-  file.path(output_dir, "anosim_secondary_mutation_full.csv")
-)
-```
-
----
-
-## Primary Tumor Focus {.tabset}
-
-### Secondary Mutations (BAP1/SF3B1/EIF1AX)
-
-**Primary uveal melanoma stratified by secondary driver mutations**
-
-```{r gloscope_secondary_mutation}
-cat("Running GloScope analysis for secondary mutations in pUM...\n")
-
-# Include ALL primary samples (do not filter out "other"/"unknown" secondary mutations)
-samples_pum <- sample_metadata %>%
-  dplyr::filter(origin == "primary") %>%
-  pull(Sample)
-
-if (length(samples_pum) >= 6) {
-  cells_pum <- cell_metadata %>% dplyr::filter(Sample %in% samples_pum) %>% pull(cell_id)
-  embedding_pum <- embedding_matrix[cells_pum, ]
-  sample_labels_pum <- cell_metadata %>% dplyr::filter(Sample %in% samples_pum) %>% pull(Sample)
-
-  # Calculate or load divergence
-  knn_div_pum <- run_gloscope_cached(
-    embedding_subset = embedding_pum,
-    sample_labels = sample_labels_pum,
-    cache_file = "divergence_secondary_mutation_pUM_full.rds",
-    analysis_name = "Secondary Mutations (pUM)"
-  )
-
-  # MDS visualization
-  samples_in_div_pum <- rownames(knn_div_pum)
-  sample_metadata_pum <- data.frame(Sample = samples_in_div_pum) %>%
-    left_join(sample_metadata %>% dplyr::filter(Sample %in% samples_pum), by = "Sample")
-
-  mds_pum <- plotMDS(
-    dist_mat = knn_div_pum,
-    metadata_df = sample_metadata_pum,
-    sample_id = "Sample",
-    group_id = "secondary_mutation",
-    k = 2
-  )
-
-  # ANOSIM test first to get p-value for plot
-  anosim_pum <- safe_anosim(
-    as.dist(knn_div_pum),
-    grouping = sample_metadata_pum$secondary_mutation,
-    permutations = 999
-  )
-
-  cat("\nANOSIM test for secondary mutations:\n")
-  cat("  R statistic:", round(anosim_pum$statistic, 4), "\n")
-  cat("  p-value:", anosim_pum$signif, "\n")
-
-  p_display_pum <- ifelse(anosim_pum$signif < 0.001, "p < 0.001",
-                          paste0("p = ", format(anosim_pum$signif, digits = 3)))
-
-  p_pum_mds <- mds_pum$plot +
-    geom_point(size = 4) +
-    scale_color_manual(values = smut_colors) +
-    coord_fixed() +
-    labs(
-      title = "GloScope MDS: Secondary Mutations in Primary UM (Full Cohort)",
-      subtitle = paste0("n = ", nrow(sample_metadata_pum), " samples | ANOSIM: R = ",
-                       round(anosim_pum$statistic, 3), ", ", p_display_pum),
-      color = "Secondary Mutation"
-    ) +
-    theme_minimal(base_size = 12)
-
-  print(p_pum_mds)
-
-  ggsave(
-    file.path(output_dir, "MDS_secondary_mutation_pUM_full.png"),
-    p_pum_mds,
-    width = 10, height = 8, dpi = 300, bg = "white"
-  )
-
-  write_csv(
-    data.frame(
-      comparison = "secondary_mutation_pUM_full",
-      statistic = anosim_pum$statistic,
-      p_value = anosim_pum$signif,
-      permutations = 999
-    ),
-    file.path(output_dir, "anosim_secondary_mutation_pUM_full.csv")
-  )
-
-  # Divergence Heatmap
-  sample_order_pum <- sample_metadata_pum %>% arrange(secondary_mutation) %>% pull(Sample)
-  knn_div_ordered_pum <- knn_div_pum[sample_order_pum, sample_order_pum]
-
-  anno_data_pum <- sample_metadata_pum[match(sample_order_pum, sample_metadata_pum$Sample), ]
-
-  # Replace NA values with "Unknown" for annotations
-  anno_data_pum_clean <- anno_data_pum %>%
-    dplyr::mutate(
-      Gender = replace(as.character(Gender), is.na(Gender) | Gender == "NA", "Unknown"),
-      Age_group = replace(as.character(Age_group), is.na(Age_group) | Age_group == "NA", "Unknown")
-    )
-
-  # Add colors for Unknown categories
-  gender_colors_full <- c(gender_colors, "Unknown" = "#E1E1E1FF")
-  age_colors_full <- c(age_colors, "Unknown" = "#E1E1E1FF")
-
-  col_anno_pum <- HeatmapAnnotation(
-    Patient = anno_data_pum_clean$Patient_nr,
-    Gender = anno_data_pum_clean$Gender,
-    Age_group = anno_data_pum_clean$Age_group,
-    `Primary Mutation` = anno_data_pum_clean$primary_mutation,
-    `Secondary Mutation` = anno_data_pum_clean$secondary_mutation,
-    col = list(
-      Gender = gender_colors_full,
-      Age_group = age_colors_full,
-      `Primary Mutation` = pmut_colors,
-      `Secondary Mutation` = smut_colors
-    ),
-    annotation_name_gp = gpar(fontsize = 9),
-    show_legend = c(Patient = FALSE, Gender = TRUE, Age_group = TRUE,
-                    `Primary Mutation` = TRUE, `Secondary Mutation` = TRUE)
-  )
-
-  ht_pum <- Heatmap(
-    knn_div_ordered_pum,
-    name = "KL Divergence",
-    col = colorRamp2(c(0, median(knn_div_pum), max(knn_div_pum)),
-                     c("white", "orange", "red")),
-    top_annotation = col_anno_pum,
-    show_row_names = FALSE,
-    show_column_names = FALSE,
-    column_title = "GloScope Divergence: Secondary Mutations in Primary UM (Full Cohort)",
-    column_title_gp = gpar(fontsize = 14, fontface = "bold"),
-    heatmap_legend_param = list(
-      title = "KL Divergence",
-      legend_height = unit(4, "cm")
-    )
-  )
-
-  png(file.path(output_dir, "heatmap_secondary_mutation_pUM_full.png"),
-      width = 2400, height = 2200, res = 300)
-  draw(ht_pum)
-  dev.off()
-
-  draw(ht_pum)
-
-  # Save heatmap object and data for recreation
-  qs2::qs_save(list(ht = ht_pum, div_matrix = knn_div_ordered_pum, anno_data = anno_data_pum_clean),
-               file.path(output_dir, "gloscope_heatmap_primary_tumors_objects.qs2"), nthreads = parallel::detectCores())
-}
-```
-
-### Anatomical Location (Choroid/Iris/Ciliary Body)
-
-**Primary uveal melanoma stratified by tumor location**
-
-```{r gloscope_location}
-cat("Running GloScope analysis for pUM anatomical location...\n")
-
-samples_location <- sample_metadata %>%
-  dplyr::filter(
-    origin == "primary",
-    LocationPrimaryTumor %in% c("choroid", "iris", "ciliary body")
-  ) %>%
-  pull(Sample)
-
-if (length(samples_location) >= 6) {
-  cells_location <- cell_metadata %>% dplyr::filter(Sample %in% samples_location) %>% pull(cell_id)
-  embedding_location <- embedding_matrix[cells_location, ]
-  sample_labels_location <- cell_metadata %>% dplyr::filter(Sample %in% samples_location) %>% pull(Sample)
-
-  # Calculate or load divergence
-  knn_div_location <- run_gloscope_cached(
-    embedding_subset = embedding_location,
-    sample_labels = sample_labels_location,
-    cache_file = "divergence_location_pUM_full.rds",
-    analysis_name = "Anatomical Location (pUM)"
-  )
-
-  # MDS visualization
-  samples_in_div_location <- rownames(knn_div_location)
-  sample_metadata_location <- data.frame(Sample = samples_in_div_location) %>%
-    left_join(sample_metadata %>% dplyr::filter(Sample %in% samples_location), by = "Sample")
-
-  mds_location <- plotMDS(
-    dist_mat = knn_div_location,
-    metadata_df = sample_metadata_location,
-    sample_id = "Sample",
-    group_id = "LocationPrimaryTumor",
-    k = 2
-  )
-
-  # ANOSIM test first to get p-value for plot
-  anosim_location <- safe_anosim(
-    as.dist(knn_div_location),
-    grouping = sample_metadata_location$LocationPrimaryTumor,
-    permutations = 999
-  )
-
-  cat("\nANOSIM test for anatomical location:\n")
-  cat("  R statistic:", round(anosim_location$statistic, 4), "\n")
-  cat("  p-value:", anosim_location$signif, "\n")
-
-  p_display_loc <- ifelse(anosim_location$signif < 0.001, "p < 0.001",
-                          paste0("p = ", format(anosim_location$signif, digits = 3)))
-
-  p_location_mds <- mds_location$plot +
-    geom_point(size = 4) +
-    scale_color_manual(values = primary_location_colors) +
-    coord_fixed() +
-    labs(
-      title = "GloScope MDS: Anatomical Location in Primary UM (Full Cohort)",
-      subtitle = paste0("n = ", nrow(sample_metadata_location), " samples | ANOSIM: R = ",
-                       round(anosim_location$statistic, 3), ", ", p_display_loc),
-      color = "Location"
-    ) +
-    theme_minimal(base_size = 12)
-
-  print(p_location_mds)
-
-  ggsave(
-    file.path(output_dir, "MDS_location_pUM_full.png"),
-    p_location_mds,
-    width = 10, height = 8, dpi = 300, bg = "white"
-  )
-
-  write_csv(
-    data.frame(
-      comparison = "anatomical_location_pUM_full",
-      statistic = anosim_location$statistic,
-      p_value = anosim_location$signif,
-      permutations = 999
-    ),
-    file.path(output_dir, "anosim_location_pUM_full.csv")
-  )
-
-  # Divergence Heatmap
-  sample_order_location <- sample_metadata_location %>% arrange(LocationPrimaryTumor) %>% pull(Sample)
-  knn_div_ordered_location <- knn_div_location[sample_order_location, sample_order_location]
-
-  anno_data_location <- sample_metadata_location[match(sample_order_location, sample_metadata_location$Sample), ]
-
-  # Replace NA values with "Unknown" for annotations - explicit factor handling
-  anno_data_location_clean <- anno_data_location %>%
-    dplyr::mutate(
-      Gender = replace(as.character(Gender), is.na(Gender) | Gender == "NA", "Unknown"),
-      Age_group = replace(as.character(Age_group), is.na(Age_group) | Age_group == "NA", "Unknown")
-    )
-
-  # Add colors for Unknown categories
-  gender_colors_full <- c(gender_colors, "Unknown" = "#E1E1E1FF")
-  age_colors_full <- c(age_colors, "Unknown" = "#E1E1E1FF")
-
-  col_anno_location <- HeatmapAnnotation(
-    Patient = anno_data_location_clean$Patient_nr,
-    Gender = anno_data_location_clean$Gender,
-    Age_group = anno_data_location_clean$Age_group,
-    Location = anno_data_location_clean$LocationPrimaryTumor,
-    `Primary Mutation` = anno_data_location_clean$primary_mutation,
-    `Secondary Mutation` = anno_data_location_clean$secondary_mutation,
-    col = list(
-      Gender = gender_colors_full,
-      Age_group = age_colors_full,
-      Location = location_colors,
-      `Primary Mutation` = pmut_colors,
-      `Secondary Mutation` = smut_colors
-    ),
-    annotation_name_gp = gpar(fontsize = 9),
-    show_legend = c(Patient = FALSE, Gender = TRUE, Age_group = TRUE,
-                    Location = TRUE, `Primary Mutation` = TRUE, `Secondary Mutation` = TRUE)
-  )
-
-  ht_location <- Heatmap(
-    knn_div_ordered_location,
-    name = "KL Divergence",
-    col = colorRamp2(c(0, median(knn_div_location), max(knn_div_location)),
-                     c("white", "orange", "red")),
-    top_annotation = col_anno_location,
-    show_row_names = FALSE,
-    show_column_names = FALSE,
-    column_title = "GloScope Divergence: Anatomical Location in Primary UM (Full Cohort)",
-    column_title_gp = gpar(fontsize = 14, fontface = "bold"),
-    heatmap_legend_param = list(
-      title = "KL Divergence",
-      legend_height = unit(4, "cm")
-    )
-  )
-
-  png(file.path(output_dir, "heatmap_location_pUM_full.png"),
-      width = 2400, height = 2200, res = 300)
-  draw(ht_location)
-  dev.off()
-
-  draw(ht_location)
-}
-```
-
-### Anatomical Location - Malignant Cells Only
-
-```{r gloscope_location_malignant}
-cat("Running GloScope analysis for Anatomical Location (Malignant Cells Only)...\n")
-
-# Filter to malignant cells from primary tumors with location data
-cells_location_mal <- cell_metadata %>%
-  dplyr::filter(Sample %in% samples_location, Malignant == "Malignant") %>%
-  pull(cell_id)
-
-sample_labels_location_mal <- cell_metadata %>%
-  dplyr::filter(Sample %in% samples_location, Malignant == "Malignant") %>%
-  pull(Sample)
-
-# Check sample representation
-sample_cell_counts_loc_mal <- table(sample_labels_location_mal)
-valid_samples_loc_mal <- names(sample_cell_counts_loc_mal)[sample_cell_counts_loc_mal >= 50]
-
-cat("  - Total malignant cells from pUM:", length(cells_location_mal), "\n")
-cat("  - Samples with >=50 malignant cells:", length(valid_samples_loc_mal), "\n")
-
-if (length(valid_samples_loc_mal) >= 4) {
-  cells_loc_mal_filtered <- cell_metadata %>%
-    dplyr::filter(Malignant == "Malignant", Sample %in% valid_samples_loc_mal) %>%
-    pull(cell_id)
-
-  embedding_loc_mal <- embedding_matrix[cells_loc_mal_filtered, ]
-  sample_labels_loc_mal_filtered <- cell_metadata %>%
-    dplyr::filter(Malignant == "Malignant", Sample %in% valid_samples_loc_mal) %>%
-    pull(Sample)
-
-  div_matrix_loc_mal <- run_gloscope_cached(
-    embedding_subset = embedding_loc_mal,
-    sample_labels = sample_labels_loc_mal_filtered,
-    cache_file = "divergence_location_malignant.rds",
-    analysis_name = "Anatomical Location (Malignant Cells)"
-  )
-
-  # ANOSIM test
-  loc_vec_mal <- sample_metadata$LocationPrimaryTumor[match(rownames(div_matrix_loc_mal), sample_metadata$Sample)]
-
-  anosim_loc_mal <- safe_anosim(div_matrix_loc_mal, loc_vec_mal, permutations = 999)
-
-  cat("\nANOSIM test for Location (malignant cells):\n")
-  cat("  R statistic:", round(anosim_loc_mal$statistic, 4), "\n")
-  cat("  p-value:", anosim_loc_mal$signif, "\n")
-
-  write_csv(
-    tibble(
-      comparison = "location_malignant_full",
-      statistic = anosim_loc_mal$statistic,
-      p_value = anosim_loc_mal$signif
-    ),
-    file.path(output_dir, "anosim_location_malignant_full.csv")
-  )
-} else {
-  cat("Insufficient samples with adequate malignant cell representation\n")
-}
-```
-
-### Anatomical Location - Melanocytic Cells Only
-
-```{r gloscope_location_melanocytic}
-cat("Running GloScope analysis for Anatomical Location (Melanocytic Cells Only)...\n")
-
-# Filter to melanocytic cells from primary tumors
-cells_location_mel <- cell_metadata %>%
-  dplyr::filter(Sample %in% samples_location,
-                (Malignant == "Malignant" | majority_celltype == "Melanocytes")) %>%
-  pull(cell_id)
-
-sample_labels_location_mel <- cell_metadata %>%
-  dplyr::filter(Sample %in% samples_location,
-                (Malignant == "Malignant" | majority_celltype == "Melanocytes")) %>%
-  pull(Sample)
-
-# Check sample representation
-sample_cell_counts_loc_mel <- table(sample_labels_location_mel)
-valid_samples_loc_mel <- names(sample_cell_counts_loc_mel)[sample_cell_counts_loc_mel >= 50]
-
-cat("  - Total melanocytic cells from pUM:", length(cells_location_mel), "\n")
-cat("  - Samples with >=50 melanocytic cells:", length(valid_samples_loc_mel), "\n")
-
-if (length(valid_samples_loc_mel) >= 4) {
-  cells_loc_mel_filtered <- cell_metadata %>%
-    dplyr::filter((Malignant == "Malignant" | majority_celltype == "Melanocytes"),
-                  Sample %in% valid_samples_loc_mel) %>%
-    pull(cell_id)
-
-  embedding_loc_mel <- embedding_matrix[cells_loc_mel_filtered, ]
-  sample_labels_loc_mel_filtered <- cell_metadata %>%
-    dplyr::filter((Malignant == "Malignant" | majority_celltype == "Melanocytes"),
-                  Sample %in% valid_samples_loc_mel) %>%
-    pull(Sample)
-
-  div_matrix_loc_mel <- run_gloscope_cached(
-    embedding_subset = embedding_loc_mel,
-    sample_labels = sample_labels_loc_mel_filtered,
-    cache_file = "divergence_location_melanocytic.rds",
-    analysis_name = "Anatomical Location (Melanocytic Cells)"
-  )
-
-  # ANOSIM test
-  loc_vec_mel <- sample_metadata$LocationPrimaryTumor[match(rownames(div_matrix_loc_mel), sample_metadata$Sample)]
-
-  anosim_loc_mel <- safe_anosim(div_matrix_loc_mel, loc_vec_mel, permutations = 999)
-
-  cat("\nANOSIM test for Location (melanocytic cells):\n")
-  cat("  R statistic:", round(anosim_loc_mel$statistic, 4), "\n")
-  cat("  p-value:", anosim_loc_mel$signif, "\n")
-
-  write_csv(
-    tibble(
-      comparison = "location_melanocytic_full",
-      statistic = anosim_loc_mel$statistic,
-      p_value = anosim_loc_mel$signif
-    ),
-    file.path(output_dir, "anosim_location_melanocytic_full.csv")
-  )
-} else {
-  cat("Insufficient samples with adequate melanocytic cell representation\n")
-}
-```
-
-```
-## Malignant Cells Only {.tabset}
-
-### Disease Stage (Malignant)
-
-**Focus on tumor-intrinsic heterogeneity by analyzing malignant cells only**
-
-```{r gloscope_malignant_origin}
-cat("Running GloScope analysis for malignant cells by disease origin (FULL COHORT)...\n")
-
-# Filter to malignant cells
-cells_malignant <- cell_metadata %>%
-  dplyr::filter(Malignant == "Malignant") %>%
-  pull(cell_id)
-
-embedding_malignant <- embedding_matrix[cells_malignant, ]
-sample_labels_malignant <- cell_metadata %>%
-  dplyr::filter(Malignant == "Malignant") %>%
-  pull(Sample)
-
-# Check sample representation (need at least 100 cells per sample for robust estimation)
-sample_cell_counts <- table(sample_labels_malignant)
-valid_samples <- names(sample_cell_counts)[sample_cell_counts >= 100]
-
-cat("  - Total malignant cells:", length(cells_malignant), "\n")
-cat("  - Samples with >=100 malignant cells:", length(valid_samples), "\n")
-
-if (length(valid_samples) >= 6) {
-  # Filter to valid samples
-  cells_malignant_filtered <- cell_metadata %>%
-    dplyr::filter(Malignant == "Malignant", Sample %in% valid_samples) %>%
-    pull(cell_id)
-
-  embedding_malignant_filtered <- embedding_matrix[cells_malignant_filtered, ]
-  sample_labels_malignant_filtered <- cell_metadata %>%
-    dplyr::filter(Malignant == "Malignant", Sample %in% valid_samples) %>%
-    pull(Sample)
-
-  # Calculate or load divergence
-  knn_div_malignant <- run_gloscope_cached(
-    embedding_subset = embedding_malignant_filtered,
-    sample_labels = sample_labels_malignant_filtered,
-    cache_file = "divergence_origin_malignant_full.rds",
-    analysis_name = "Disease Origin (Malignant Cells)"
-  )
-
-  # MDS visualization
-  samples_in_div_malignant <- rownames(knn_div_malignant)
-  sample_metadata_malignant <- data.frame(Sample = samples_in_div_malignant) %>%
-    left_join(sample_metadata %>% dplyr::filter(Sample %in% valid_samples), by = "Sample")
-
-  mds_malignant <- plotMDS(
-    dist_mat = knn_div_malignant,
-    metadata_df = sample_metadata_malignant,
-    sample_id = "Sample",
-    group_id = "origin",
-    k = 2
-  )
-
-  # ANOSIM test first to get p-value for plot
-  anosim_malignant <- safe_anosim(
-    as.dist(knn_div_malignant),
-    grouping = sample_metadata_malignant$origin,
-    permutations = 999
-  )
-
-  cat("\nANOSIM test for disease origin (malignant cells):\n")
-  cat("  R statistic:", round(anosim_malignant$statistic, 4), "\n")
-  cat("  p-value:", anosim_malignant$signif, "\n")
-
-  # Format p-value for display
-  p_display_mal <- ifelse(anosim_malignant$signif < 0.001, "p < 0.001",
-                          paste0("p = ", format(anosim_malignant$signif, digits = 3)))
-
-  p_malignant_mds <- mds_malignant$plot +
-    scale_color_manual(values = origin_colors) +
-    coord_fixed() +
-    labs(
-      title = "GloScope MDS: Disease Progression (Malignant Cells Only - Full Cohort)",
-      subtitle = paste0("n = ", nrow(sample_metadata_malignant), " samples | ANOSIM: R = ",
-                       round(anosim_malignant$statistic, 3), ", ", p_display_mal),
-      color = "Origin"
-    ) +
-    theme_minimal(base_size = 12) +
-    theme(legend.position = "right", plot.title = element_text(face = "bold", size = 14))
-
-  print(p_malignant_mds)
-
-  ggsave(
-    file.path(output_dir, "MDS_origin_malignant_full.png"),
-    p_malignant_mds,
-    width = 10, height = 8, dpi = 300, bg = "white"
-  )
-
-  write_csv(
-    data.frame(
-      comparison = "disease_origin_malignant_full",
-      statistic = anosim_malignant$statistic,
-      p_value = anosim_malignant$signif,
-      permutations = 999
-    ),
-    file.path(output_dir, "anosim_origin_malignant_full.csv")
-  )
-
-  # Divergence Heatmap
-  sample_order_malignant <- sample_metadata_malignant %>% arrange(origin) %>% pull(Sample)
-  knn_div_ordered_malignant <- knn_div_malignant[sample_order_malignant, sample_order_malignant]
-
-  anno_data_malignant <- sample_metadata_malignant[match(sample_order_malignant, sample_metadata_malignant$Sample), ]
-
-  # Replace NA values with "Unknown" for annotations
-  anno_data_malignant_clean <- anno_data_malignant %>%
-    dplyr::mutate(
-      Gender = replace(as.character(Gender), is.na(Gender) | Gender == "NA", "Unknown"),
-      Age_group = replace(as.character(Age_group), is.na(Age_group) | Age_group == "NA", "Unknown")
-    )
-
-  # Add colors for Unknown categories
-  gender_colors_full <- c(gender_colors, "Unknown" = "#E1E1E1FF")
-  age_colors_full <- c(age_colors, "Unknown" = "#E1E1E1FF")
-
-  col_anno_malignant <- HeatmapAnnotation(
-    Patient = anno_data_malignant_clean$Patient_nr,
-    Origin = anno_data_malignant_clean$origin,
-    Gender = anno_data_malignant_clean$Gender,
-    Age_group = anno_data_malignant_clean$Age_group,
-    `Primary Mutation` = anno_data_malignant_clean$primary_mutation,
-    `Secondary Mutation` = anno_data_malignant_clean$secondary_mutation,
-    col = list(
-      Origin = origin_colors,
-      Gender = gender_colors_full,
-      Age_group = age_colors_full,
-      `Primary Mutation` = pmut_colors,
-      `Secondary Mutation` = smut_colors
-    ),
-    annotation_name_gp = gpar(fontsize = 9),
-    show_legend = c(Patient = FALSE, Origin = TRUE, Gender = TRUE, Age_group = TRUE,
-                    `Primary Mutation` = TRUE, `Secondary Mutation` = TRUE)
-  )
-
-  ht_malignant <- Heatmap(
-    knn_div_ordered_malignant,
-    name = "KL Divergence",
-    col = colorRamp2(c(0, median(knn_div_malignant), max(knn_div_malignant)),
-                     c("white", "orange", "red")),
-    top_annotation = col_anno_malignant,
-    show_row_names = FALSE,
-    show_column_names = FALSE,
-    column_title = "GloScope Divergence: Disease Origin (Malignant Cells Only - Full Cohort)",
-    column_title_gp = gpar(fontsize = 14, fontface = "bold"),
-    heatmap_legend_param = list(
-      title = "KL Divergence",
-      legend_height = unit(4, "cm")
-    )
-  )
-
-  png(file.path(output_dir, "heatmap_origin_malignant_full.png"),
-      width = 2800, height = 2600, res = 300)
-  draw(ht_malignant)
-  dev.off()
-
-  draw(ht_malignant)
-
-  # Save heatmap object and data for recreation
-  qs2::qs_save(list(ht = ht_malignant, div_matrix = knn_div_ordered_malignant, anno_data = anno_data_malignant_clean),
-               file.path(output_dir, "gloscope_heatmap_malignant_cells_objects.qs2"), nthreads = parallel::detectCores())
-} else {
-  cat("Insufficient samples with adequate malignant cell representation\n")
-}
-```
-
-### Gender (Malignant)
-
-**Comparison:** Male vs Female (Malignant cells only)
-
-```{r gloscope_malignant_gender}
-cat("Running GloScope analysis for Gender (malignant cells only)...\n")
-
-# Filter to malignant cells with defined gender
-samples_with_gender <- sample_metadata %>%
-  dplyr::filter(!is.na(Gender) & Gender %in% c("M", "F")) %>%
-  pull(Sample)
-
-cells_malignant_gender <- cell_metadata %>%
-  dplyr::filter(Malignant == "Malignant", Sample %in% samples_with_gender) %>%
-  pull(cell_id)
-
-embedding_malignant_gender <- embedding_matrix[cells_malignant_gender, ]
-sample_labels_malignant_gender <- cell_metadata %>%
-  dplyr::filter(Malignant == "Malignant", Sample %in% samples_with_gender) %>%
-  pull(Sample)
-
-# Check sample representation
-sample_cell_counts <- table(sample_labels_malignant_gender)
-valid_samples <- names(sample_cell_counts)[sample_cell_counts >= 100]
-
-cat("  - Total malignant cells:", length(cells_malignant_gender), "\n")
-cat("  - Samples with >=100 malignant cells:", length(valid_samples), "\n")
-
-if (length(valid_samples) >= 6) {
-  # Filter to valid samples
-  cells_malignant_gender_filtered <- cell_metadata %>%
-    dplyr::filter(Malignant == "Malignant", Sample %in% valid_samples) %>%
-    pull(cell_id)
-
-  embedding_malignant_gender_filtered <- embedding_matrix[cells_malignant_gender_filtered, ]
-  sample_labels_malignant_gender_filtered <- cell_metadata %>%
-    dplyr::filter(Malignant == "Malignant", Sample %in% valid_samples) %>%
-    pull(Sample)
-
-  # Calculate or load divergence
-  knn_div_malignant_gender <- run_gloscope_cached(
-    embedding_subset = embedding_malignant_gender_filtered,
-    sample_labels = sample_labels_malignant_gender_filtered,
-    cache_file = "divergence_gender_malignant.rds",
-    analysis_name = "Gender (Malignant Cells)"
-  )
-
-  # MDS visualization
-  samples_in_div_malignant_gender <- rownames(knn_div_malignant_gender)
-  sample_metadata_malignant_gender <- data.frame(Sample = samples_in_div_malignant_gender) %>%
-    left_join(sample_metadata %>% dplyr::filter(Sample %in% valid_samples), by = "Sample")
-
-  mds_malignant_gender <- plotMDS(
-    dist_mat = knn_div_malignant_gender,
-    metadata_df = sample_metadata_malignant_gender,
-    sample_id = "Sample",
-    group_id = "Gender",
-    k = 2
-  )
-
-  # ANOSIM test first to get p-value for plot
-  anosim_malignant_gender <- safe_anosim(
-    as.dist(knn_div_malignant_gender),
-    grouping = sample_metadata_malignant_gender$Gender,
-    permutations = 999
-  )
-
-  cat("\nANOSIM test for Gender (malignant cells):\n")
-  cat("  R statistic:", round(anosim_malignant_gender$statistic, 4), "\n")
-  cat("  p-value:", anosim_malignant_gender$signif, "\n")
-
-  p_display_gender <- ifelse(anosim_malignant_gender$signif < 0.001, "p < 0.001",
-                             paste0("p = ", format(anosim_malignant_gender$signif, digits = 3)))
-
-  p_malignant_gender_mds <- mds_malignant_gender$plot +
-    scale_color_manual(values = gender_colors) +
-    coord_fixed() +
-    labs(
-      title = "GloScope MDS: Gender (Malignant Cells Only)",
-      subtitle = paste0("n = ", nrow(sample_metadata_malignant_gender), " samples | ANOSIM: R = ",
-                       round(anosim_malignant_gender$statistic, 3), ", ", p_display_gender),
-      color = "Gender"
-    ) +
-    theme_minimal(base_size = 12)
-
-  print(p_malignant_gender_mds)
-
-  ggsave(
-    file.path(output_dir, "mds_gender_malignant.png"),
-    p_malignant_gender_mds, width = 8, height = 6, dpi = 300, bg = "white"
-  )
-
-  write_csv(
-    data.frame(
-      comparison = "gender_malignant",
-      statistic = anosim_malignant_gender$statistic,
-      p_value = anosim_malignant_gender$signif,
-      permutations = 999
-    ),
-    file.path(output_dir, "anosim_gender_malignant_full.csv")
-  )
-} else {
-  cat("Insufficient samples with adequate malignant cell representation\n")
-}
-```
-
-```{r heatmap_malignant_gender, eval=length(valid_samples) >= 6}
-cat("Creating divergence heatmap for Gender (malignant cells)...\n")
-
-# Prepare data for heatmap
-sample_order_malignant_gender <- sample_metadata_malignant_gender %>% arrange(Gender) %>% pull(Sample)
-knn_div_ordered_malignant_gender <- knn_div_malignant_gender[sample_order_malignant_gender, sample_order_malignant_gender]
-
-anno_data_malignant_gender <- sample_metadata_malignant_gender[match(sample_order_malignant_gender, sample_metadata_malignant_gender$Sample), ]
-
-# Replace NA values with "Unknown" for annotations
-anno_data_malignant_gender_clean <- anno_data_malignant_gender %>%
-  dplyr::mutate(
-    Gender = replace(as.character(Gender), is.na(Gender) | Gender == "NA", "Unknown"),
-    Age_group = replace(as.character(Age_group), is.na(Age_group) | Age_group == "NA", "Unknown")
-  )
-
-# Add colors for Unknown categories
-gender_colors_full <- c(gender_colors, "Unknown" = "#E1E1E1FF")
-age_colors_full <- c(age_colors, "Unknown" = "#E1E1E1FF")
-
-col_anno_malignant_gender <- HeatmapAnnotation(
-  Patient = anno_data_malignant_gender_clean$Patient_nr,
-  Gender = anno_data_malignant_gender_clean$Gender,
-  Age_group = anno_data_malignant_gender_clean$Age_group,
-  Origin = anno_data_malignant_gender_clean$origin,
-  col = list(
-    Gender = gender_colors_full,
-    Age_group = age_colors_full,
-    Origin = origin_colors
-  ),
-  annotation_name_gp = gpar(fontsize = 9),
-  show_legend = c(Patient = FALSE, Gender = TRUE, Age_group = TRUE, Origin = TRUE)
-)
-
-ht_malignant_gender <- Heatmap(
-  knn_div_ordered_malignant_gender,
-  name = "KL Divergence",
-  col = colorRamp2(c(0, median(knn_div_malignant_gender), max(knn_div_malignant_gender)),
-                   c("white", "orange", "red")),
-  top_annotation = col_anno_malignant_gender,
-  show_row_names = FALSE,
-  show_column_names = FALSE,
-  column_title = "Gender Comparison (Malignant Cells Only)",
-  column_title_gp = gpar(fontsize = 12, fontface = "bold"),
-  heatmap_legend_param = list(
-    title = "KL Divergence",
-    legend_height = unit(3, "cm")
-  )
-)
-
-png(file.path(output_dir, "heatmap_gender_malignant.png"),
-    width = 2800, height = 2600, res = 300)
-draw(ht_malignant_gender)
-dev.off()
-
-draw(ht_malignant_gender)
-```
-
-```{r mds_top_genes_malignant_gender, eval=length(valid_samples) >= 6}
-cat("Identifying top genes driving MDS coordinates for Gender (malignant cells)...\n")
-
-# Get MDS coordinates
-mds_coords_malignant_gender <- mds_malignant_gender$df[, c("dim1", "dim2")]
-rownames(mds_coords_malignant_gender) <- mds_malignant_gender$df$Sample
-
-# Get sample-averaged embeddings
-samples_malignant_gender <- unique(sample_labels_malignant_gender_filtered)
-avg_pca_malignant_gender <- matrix(0, nrow = length(samples_malignant_gender), ncol = ncol(embedding_malignant_gender_filtered),
-                  dimnames = list(samples_malignant_gender, colnames(embedding_malignant_gender_filtered)))
-
-for (samp in samples_malignant_gender) {
-  cells_in_sample <- which(sample_labels_malignant_gender_filtered == samp)
-  avg_pca_malignant_gender[samp, ] <- colMeans(embedding_malignant_gender_filtered[cells_in_sample, , drop = FALSE])
-}
-
-# Align sample order (intersect to handle missing samples)
-common_mal_gender <- intersect(rownames(avg_pca_malignant_gender), rownames(mds_coords_malignant_gender))
-avg_pca_malignant_gender <- avg_pca_malignant_gender[common_mal_gender, ]
-mds_coords_malignant_gender <- mds_coords_malignant_gender[common_mal_gender, ]
-
-# Correlate each PC with MDS1 and MDS2
-cor_mds1_malignant_gender <- cor(avg_pca_malignant_gender, mds_coords_malignant_gender[, 1])
-cor_mds2_malignant_gender <- cor(avg_pca_malignant_gender, mds_coords_malignant_gender[, 2])
-
-# Get PCA loadings
-pca_loadings <- um_atlas@reductions$pca@feature.loadings
-
-# Compute gene contributions
-gene_contrib_mds1_malignant_gender <- abs(pca_loadings %*% cor_mds1_malignant_gender)
-gene_contrib_mds2_malignant_gender <- abs(pca_loadings %*% cor_mds2_malignant_gender)
-
-# Get top 30 genes for each axis
-# Gene names are already in the rownames of gene_contrib matrices
-contrib_vec_mds1_malignant_gender <- as.vector(gene_contrib_mds1_malignant_gender)
-names(contrib_vec_mds1_malignant_gender) <- rownames(gene_contrib_mds1_malignant_gender)
-top_genes_mds1_malignant_gender <- names(sort(contrib_vec_mds1_malignant_gender, decreasing = TRUE)[1:30])
-
-contrib_vec_mds2_malignant_gender <- as.vector(gene_contrib_mds2_malignant_gender)
-names(contrib_vec_mds2_malignant_gender) <- rownames(gene_contrib_mds2_malignant_gender)
-top_genes_mds2_malignant_gender <- names(sort(contrib_vec_mds2_malignant_gender, decreasing = TRUE)[1:30])
-
-cat("\nTop 30 genes driving MDS1 (Gender - Malignant):\n")
-print(top_genes_mds1_malignant_gender)
-
-cat("\nTop 30 genes driving MDS2 (Gender - Malignant):\n")
-print(top_genes_mds2_malignant_gender)
-
-# Save to CSV
-write_csv(
-  data.frame(
-    Gene = top_genes_mds1_malignant_gender,
-    Contribution = contrib_vec_mds1_malignant_gender[top_genes_mds1_malignant_gender]
-  ),
-  file.path(output_dir, "top_genes_MDS1_gender_malignant.csv")
-)
-
-write_csv(
-  data.frame(
-    Gene = top_genes_mds2_malignant_gender,
-    Contribution = contrib_vec_mds2_malignant_gender[top_genes_mds2_malignant_gender]
-  ),
-  file.path(output_dir, "top_genes_MDS2_gender_malignant.csv")
-)
-```
-
-### Gender - Melanocytic Cells Only
-
-```{r gloscope_gender_melanocytic}
-cat("Running GloScope analysis for Gender (Melanocytic Cells Only)...\n")
-
-# Filter to melanocytic cells with gender data
-cells_gender_melanocytic <- cell_metadata %>%
-  dplyr::filter(Sample %in% samples_with_gender,
-                (Malignant == "Malignant" | majority_celltype == "Melanocytes")) %>%
-  pull(cell_id)
-
-sample_labels_gender_melanocytic <- cell_metadata %>%
-  dplyr::filter(Sample %in% samples_with_gender,
-                (Malignant == "Malignant" | majority_celltype == "Melanocytes")) %>%
-  pull(Sample)
-
-sample_cell_counts_gender_mel <- table(sample_labels_gender_melanocytic)
-valid_samples_gender_mel <- names(sample_cell_counts_gender_mel)[sample_cell_counts_gender_mel >= 50]
-
-cat("  - Total melanocytic cells:", length(cells_gender_melanocytic), "\n")
-cat("  - Samples with >=50 melanocytic cells:", length(valid_samples_gender_mel), "\n")
-
-if (length(valid_samples_gender_mel) >= 4) {
-  cells_gender_mel_filtered <- cell_metadata %>%
-    dplyr::filter((Malignant == "Malignant" | majority_celltype == "Melanocytes"),
-                  Sample %in% valid_samples_gender_mel) %>%
-    pull(cell_id)
-
-  embedding_gender_mel <- embedding_matrix[cells_gender_mel_filtered, ]
-  sample_labels_gender_mel_filtered <- cell_metadata %>%
-    dplyr::filter((Malignant == "Malignant" | majority_celltype == "Melanocytes"),
-                  Sample %in% valid_samples_gender_mel) %>%
-    pull(Sample)
-
-  div_matrix_gender_mel <- run_gloscope_cached(
-    embedding_subset = embedding_gender_mel,
-    sample_labels = sample_labels_gender_mel_filtered,
-    cache_file = "divergence_gender_melanocytic.rds",
-    analysis_name = "Gender (Melanocytic Cells)"
-  )
-
-  # ANOSIM test
-  gender_vec_mel <- sample_metadata$Gender[match(rownames(div_matrix_gender_mel), sample_metadata$Sample)]
-
-  anosim_gender_mel <- safe_anosim(div_matrix_gender_mel, gender_vec_mel, permutations = 999)
-
-  cat("\nANOSIM test for Gender (melanocytic cells):\n")
-  cat("  R statistic:", round(anosim_gender_mel$statistic, 4), "\n")
-  cat("  p-value:", anosim_gender_mel$signif, "\n")
-
-  write_csv(
-    tibble(
-      comparison = "gender_melanocytic_full",
-      statistic = anosim_gender_mel$statistic,
-      p_value = anosim_gender_mel$signif
-    ),
-    file.path(output_dir, "anosim_gender_melanocytic_full.csv")
-  )
-} else {
-  cat("Insufficient samples with adequate melanocytic cell representation\n")
-}
-```
-
-### Gender - Primary Tumors Only
-
-```{r gloscope_gender_pUM}
-cat("Running GloScope analysis for Gender (Primary Tumors Only)...\n")
-
-# Filter to primary tumor samples with gender data
-samples_pUM_gender <- sample_metadata %>%
-  dplyr::filter(origin == "primary", !is.na(Gender), Gender %in% c("M", "F")) %>%
-  pull(Sample)
-
-cells_gender_pUM <- cell_metadata %>%
-  dplyr::filter(Sample %in% samples_pUM_gender) %>%
-  pull(cell_id)
-
-sample_labels_gender_pUM <- cell_metadata %>%
-  dplyr::filter(Sample %in% samples_pUM_gender) %>%
-  pull(Sample)
-
-cat("  - Total cells from pUM:", length(cells_gender_pUM), "\n")
-cat("  - pUM samples with gender:", length(unique(sample_labels_gender_pUM)), "\n")
-
-if (length(unique(sample_labels_gender_pUM)) >= 4) {
-  embedding_gender_pUM <- embedding_matrix[cells_gender_pUM, ]
-
-  div_matrix_gender_pUM <- run_gloscope_cached(
-    embedding_subset = embedding_gender_pUM,
-    sample_labels = sample_labels_gender_pUM,
-    cache_file = "divergence_gender_pUM.rds",
-    analysis_name = "Gender (Primary Tumors)"
-  )
-
-  # ANOSIM test
-  gender_vec_pUM <- sample_metadata$Gender[match(rownames(div_matrix_gender_pUM), sample_metadata$Sample)]
-
-  anosim_gender_pUM <- safe_anosim(div_matrix_gender_pUM, gender_vec_pUM, permutations = 999)
-
-  cat("\nANOSIM test for Gender (primary tumors):\n")
-  cat("  R statistic:", round(anosim_gender_pUM$statistic, 4), "\n")
-  cat("  p-value:", anosim_gender_pUM$signif, "\n")
-
-  write_csv(
-    tibble(
-      comparison = "gender_pUM_full",
-      statistic = anosim_gender_pUM$statistic,
-      p_value = anosim_gender_pUM$signif
-    ),
-    file.path(output_dir, "anosim_gender_pUM_full.csv")
-  )
-} else {
-  cat("Insufficient pUM samples with gender data\n")
-}
-```
-
----
-
-### Age (Malignant)
-
-**Comparison:** Age groups (Young <40, Middle 40-60, Old 60+) (Malignant cells only)
-
-```{r gloscope_malignant_age}
-cat("Running GloScope analysis for Age (malignant cells only)...\n")
-
-# Filter to malignant cells with defined age
-samples_with_age <- sample_metadata %>%
-  dplyr::filter(Age_group != "Unknown") %>%
-  pull(Sample)
-
-cells_malignant_age <- cell_metadata %>%
-  dplyr::filter(Malignant == "Malignant", Sample %in% samples_with_age) %>%
-  pull(cell_id)
-
-embedding_malignant_age <- embedding_matrix[cells_malignant_age, ]
-sample_labels_malignant_age <- cell_metadata %>%
-  dplyr::filter(Malignant == "Malignant", Sample %in% samples_with_age) %>%
-  pull(Sample)
-
-# Check sample representation
-sample_cell_counts <- table(sample_labels_malignant_age)
-valid_samples_age <- names(sample_cell_counts)[sample_cell_counts >= 100]
-
-cat("  - Total malignant cells:", length(cells_malignant_age), "\n")
-cat("  - Samples with >=100 malignant cells:", length(valid_samples_age), "\n")
-
-if (length(valid_samples_age) >= 6) {
-  # Filter to valid samples
-  cells_malignant_age_filtered <- cell_metadata %>%
-    dplyr::filter(Malignant == "Malignant", Sample %in% valid_samples_age) %>%
-    pull(cell_id)
-
-  embedding_malignant_age_filtered <- embedding_matrix[cells_malignant_age_filtered, ]
-  sample_labels_malignant_age_filtered <- cell_metadata %>%
-    dplyr::filter(Malignant == "Malignant", Sample %in% valid_samples_age) %>%
-    pull(Sample)
-
-  # Calculate or load divergence
-  knn_div_malignant_age <- run_gloscope_cached(
-    embedding_subset = embedding_malignant_age_filtered,
-    sample_labels = sample_labels_malignant_age_filtered,
-    cache_file = "divergence_age_malignant.rds",
-    analysis_name = "Age (Malignant Cells)"
-  )
-
-  # MDS visualization
-  samples_in_div_malignant_age <- rownames(knn_div_malignant_age)
-  sample_metadata_malignant_age <- data.frame(Sample = samples_in_div_malignant_age) %>%
-    left_join(sample_metadata %>% dplyr::filter(Sample %in% valid_samples_age), by = "Sample")
-
-  mds_malignant_age <- plotMDS(
-    dist_mat = knn_div_malignant_age,
-    metadata_df = sample_metadata_malignant_age,
-    sample_id = "Sample",
-    group_id = "Age_group",
-    k = 2
-  )
-
-  # ANOSIM test first to get p-value for plot
-  anosim_malignant_age <- safe_anosim(
-    as.dist(knn_div_malignant_age),
-    grouping = sample_metadata_malignant_age$Age_group,
-    permutations = 999
-  )
-
-  cat("\nANOSIM test for Age (malignant cells):\n")
-  cat("  R statistic:", round(anosim_malignant_age$statistic, 4), "\n")
-  cat("  p-value:", anosim_malignant_age$signif, "\n")
-
-  p_display_age <- ifelse(anosim_malignant_age$signif < 0.001, "p < 0.001",
-                          paste0("p = ", format(anosim_malignant_age$signif, digits = 3)))
-
-  p_malignant_age_mds <- mds_malignant_age$plot +
-    scale_color_manual(values = age_colors) +
-    coord_fixed() +
-    labs(
-      title = "GloScope MDS: Age Groups (Malignant Cells Only)",
-      subtitle = paste0("n = ", nrow(sample_metadata_malignant_age), " samples | ANOSIM: R = ",
-                       round(anosim_malignant_age$statistic, 3), ", ", p_display_age),
-      color = "Age Group"
-    ) +
-    theme_minimal(base_size = 12)
-
-  print(p_malignant_age_mds)
-
-  ggsave(
-    file.path(output_dir, "mds_age_malignant.png"),
-    p_malignant_age_mds, width = 8, height = 6, dpi = 300, bg = "white"
-  )
-
-  write_csv(
-    data.frame(
-      comparison = "age_malignant",
-      statistic = anosim_malignant_age$statistic,
-      p_value = anosim_malignant_age$signif,
-      permutations = 999
-    ),
-    file.path(output_dir, "anosim_age_malignant_full.csv")
-  )
-} else {
-  cat("Insufficient samples with adequate malignant cell representation\n")
-}
-```
-
-```{r heatmap_malignant_age, eval=length(valid_samples_age) >= 6}
-cat("Creating divergence heatmap for Age (malignant cells)...\n")
-
-# Prepare data for heatmap
-sample_order_malignant_age <- sample_metadata_malignant_age %>% arrange(Age_group) %>% pull(Sample)
-knn_div_ordered_malignant_age <- knn_div_malignant_age[sample_order_malignant_age, sample_order_malignant_age]
-
-anno_data_malignant_age <- sample_metadata_malignant_age[match(sample_order_malignant_age, sample_metadata_malignant_age$Sample), ]
-
-# Replace NA values with "Unknown" for annotations
-anno_data_malignant_age_clean <- anno_data_malignant_age %>%
-  dplyr::mutate(
-    Gender = replace(as.character(Gender), is.na(Gender) | Gender == "NA", "Unknown"),
-    Age_group = replace(as.character(Age_group), is.na(Age_group) | Age_group == "NA", "Unknown")
-  )
-
-# Add colors for Unknown categories
-gender_colors_full <- c(gender_colors, "Unknown" = "#E1E1E1FF")
-age_colors_full <- c(age_colors, "Unknown" = "#E1E1E1FF")
-
-col_anno_malignant_age <- HeatmapAnnotation(
-  Patient = anno_data_malignant_age_clean$Patient_nr,
-  Gender = anno_data_malignant_age_clean$Gender,
-  Age_group = anno_data_malignant_age_clean$Age_group,
-  Origin = anno_data_malignant_age_clean$origin,
-  col = list(
-    Gender = gender_colors_full,
-    Age_group = age_colors_full,
-    Origin = origin_colors
-  ),
-  annotation_name_gp = gpar(fontsize = 9),
-  show_legend = c(Patient = FALSE, Gender = TRUE, Age_group = TRUE, Origin = TRUE)
-)
-
-ht_malignant_age <- Heatmap(
-  knn_div_ordered_malignant_age,
-  name = "KL Divergence",
-  col = colorRamp2(c(0, median(knn_div_malignant_age), max(knn_div_malignant_age)),
-                   c("white", "orange", "red")),
-  top_annotation = col_anno_malignant_age,
-  show_row_names = FALSE,
-  show_column_names = FALSE,
-  column_title = "Age Group Comparison (Malignant Cells Only)",
-  column_title_gp = gpar(fontsize = 12, fontface = "bold"),
-  heatmap_legend_param = list(
-    title = "KL Divergence",
-    legend_height = unit(3, "cm")
-  )
-)
-
-png(file.path(output_dir, "heatmap_age_malignant.png"),
-    width = 2800, height = 2600, res = 300)
-draw(ht_malignant_age)
-dev.off()
-
-draw(ht_malignant_age)
-```
-
-```{r mds_top_genes_malignant_age, eval=length(valid_samples_age) >= 6}
-cat("Identifying top genes driving MDS coordinates for Age (malignant cells)...\n")
-
-# Get MDS coordinates
-mds_coords_malignant_age <- mds_malignant_age$df[, c("dim1", "dim2")]
-rownames(mds_coords_malignant_age) <- mds_malignant_age$df$Sample
-
-# Get sample-averaged embeddings
-samples_malignant_age <- unique(sample_labels_malignant_age_filtered)
-avg_pca_malignant_age <- matrix(0, nrow = length(samples_malignant_age), ncol = ncol(embedding_malignant_age_filtered),
-                  dimnames = list(samples_malignant_age, colnames(embedding_malignant_age_filtered)))
-
-for (samp in samples_malignant_age) {
-  cells_in_sample <- which(sample_labels_malignant_age_filtered == samp)
-  avg_pca_malignant_age[samp, ] <- colMeans(embedding_malignant_age_filtered[cells_in_sample, , drop = FALSE])
-}
-
-# Align sample order (intersect to handle missing samples)
-common_mal_age <- intersect(rownames(avg_pca_malignant_age), rownames(mds_coords_malignant_age))
-avg_pca_malignant_age <- avg_pca_malignant_age[common_mal_age, ]
-mds_coords_malignant_age <- mds_coords_malignant_age[common_mal_age, ]
-
-# Correlate each PC with MDS1 and MDS2
-cor_mds1_malignant_age <- cor(avg_pca_malignant_age, mds_coords_malignant_age[, 1])
-cor_mds2_malignant_age <- cor(avg_pca_malignant_age, mds_coords_malignant_age[, 2])
-
-# Get PCA loadings
-pca_loadings <- um_atlas@reductions$pca@feature.loadings
-
-# Compute gene contributions
-gene_contrib_mds1_malignant_age <- abs(pca_loadings %*% cor_mds1_malignant_age)
-gene_contrib_mds2_malignant_age <- abs(pca_loadings %*% cor_mds2_malignant_age)
-
-# Get top 30 genes for each axis
-# Gene names are already in the rownames of gene_contrib matrices
-contrib_vec_mds1_malignant_age <- as.vector(gene_contrib_mds1_malignant_age)
-names(contrib_vec_mds1_malignant_age) <- rownames(gene_contrib_mds1_malignant_age)
-top_genes_mds1_malignant_age <- names(sort(contrib_vec_mds1_malignant_age, decreasing = TRUE)[1:30])
-
-contrib_vec_mds2_malignant_age <- as.vector(gene_contrib_mds2_malignant_age)
-names(contrib_vec_mds2_malignant_age) <- rownames(gene_contrib_mds2_malignant_age)
-top_genes_mds2_malignant_age <- names(sort(contrib_vec_mds2_malignant_age, decreasing = TRUE)[1:30])
-
-cat("\nTop 30 genes driving MDS1 (Age - Malignant):\n")
-print(top_genes_mds1_malignant_age)
-
-cat("\nTop 30 genes driving MDS2 (Age - Malignant):\n")
-print(top_genes_mds2_malignant_age)
-
-# Save to CSV
-write_csv(
-  data.frame(
-    Gene = top_genes_mds1_malignant_age,
-    Contribution = contrib_vec_mds1_malignant_age[top_genes_mds1_malignant_age]
-  ),
-  file.path(output_dir, "top_genes_MDS1_age_malignant.csv")
-)
-
-write_csv(
-  data.frame(
-    Gene = top_genes_mds2_malignant_age,
-    Contribution = contrib_vec_mds2_malignant_age[top_genes_mds2_malignant_age]
-  ),
-  file.path(output_dir, "top_genes_MDS2_age_malignant.csv")
-)
-```
-
-### Age - Melanocytic Cells Only
-
-```{r gloscope_age_melanocytic}
-cat("Running GloScope analysis for Age (Melanocytic Cells Only)...\n")
-
-# Filter to melanocytic cells with age data
-cells_age_melanocytic <- cell_metadata %>%
-  dplyr::filter(Sample %in% samples_with_age,
-                (Malignant == "Malignant" | majority_celltype == "Melanocytes")) %>%
-  pull(cell_id)
-
-sample_labels_age_melanocytic <- cell_metadata %>%
-  dplyr::filter(Sample %in% samples_with_age,
-                (Malignant == "Malignant" | majority_celltype == "Melanocytes")) %>%
-  pull(Sample)
-
-sample_cell_counts_age_mel <- table(sample_labels_age_melanocytic)
-valid_samples_age_mel <- names(sample_cell_counts_age_mel)[sample_cell_counts_age_mel >= 50]
-
-cat("  - Total melanocytic cells:", length(cells_age_melanocytic), "\n")
-cat("  - Samples with >=50 melanocytic cells:", length(valid_samples_age_mel), "\n")
-
-if (length(valid_samples_age_mel) >= 4) {
-  cells_age_mel_filtered <- cell_metadata %>%
-    dplyr::filter((Malignant == "Malignant" | majority_celltype == "Melanocytes"),
-                  Sample %in% valid_samples_age_mel) %>%
-    pull(cell_id)
-
-  embedding_age_mel <- embedding_matrix[cells_age_mel_filtered, ]
-  sample_labels_age_mel_filtered <- cell_metadata %>%
-    dplyr::filter((Malignant == "Malignant" | majority_celltype == "Melanocytes"),
-                  Sample %in% valid_samples_age_mel) %>%
-    pull(Sample)
-
-  div_matrix_age_mel <- run_gloscope_cached(
-    embedding_subset = embedding_age_mel,
-    sample_labels = sample_labels_age_mel_filtered,
-    cache_file = "divergence_age_melanocytic.rds",
-    analysis_name = "Age (Melanocytic Cells)"
-  )
-
-  # ANOSIM test
-  age_vec_mel <- sample_metadata$Age_group[match(rownames(div_matrix_age_mel), sample_metadata$Sample)]
-
-  anosim_age_mel <- safe_anosim(div_matrix_age_mel, age_vec_mel, permutations = 999)
-
-  cat("\nANOSIM test for Age (melanocytic cells):\n")
-  cat("  R statistic:", round(anosim_age_mel$statistic, 4), "\n")
-  cat("  p-value:", anosim_age_mel$signif, "\n")
-
-  write_csv(
-    tibble(
-      comparison = "age_melanocytic_full",
-      statistic = anosim_age_mel$statistic,
-      p_value = anosim_age_mel$signif
-    ),
-    file.path(output_dir, "anosim_age_melanocytic_full.csv")
-  )
-} else {
-  cat("Insufficient samples with adequate melanocytic cell representation\n")
-}
-```
-
-### Age - Primary Tumors Only
-
-```{r gloscope_age_pUM}
-cat("Running GloScope analysis for Age (Primary Tumors Only)...\n")
-
-# Filter to primary tumor samples with age data
-samples_pUM_age <- sample_metadata %>%
-  dplyr::filter(origin == "primary", Age_group != "Unknown") %>%
-  pull(Sample)
-
-cells_age_pUM <- cell_metadata %>%
-  dplyr::filter(Sample %in% samples_pUM_age) %>%
-  pull(cell_id)
-
-sample_labels_age_pUM <- cell_metadata %>%
-  dplyr::filter(Sample %in% samples_pUM_age) %>%
-  pull(Sample)
-
-cat("  - Total cells from pUM:", length(cells_age_pUM), "\n")
-cat("  - pUM samples with age:", length(unique(sample_labels_age_pUM)), "\n")
-
-if (length(unique(sample_labels_age_pUM)) >= 4) {
-  embedding_age_pUM <- embedding_matrix[cells_age_pUM, ]
-
-  div_matrix_age_pUM <- run_gloscope_cached(
-    embedding_subset = embedding_age_pUM,
-    sample_labels = sample_labels_age_pUM,
-    cache_file = "divergence_age_pUM.rds",
-    analysis_name = "Age (Primary Tumors)"
-  )
-
-  # ANOSIM test
-  age_vec_pUM <- sample_metadata$Age_group[match(rownames(div_matrix_age_pUM), sample_metadata$Sample)]
-
-  anosim_age_pUM <- safe_anosim(div_matrix_age_pUM, age_vec_pUM, permutations = 999)
-
-  cat("\nANOSIM test for Age (primary tumors):\n")
-  cat("  R statistic:", round(anosim_age_pUM$statistic, 4), "\n")
-  cat("  p-value:", anosim_age_pUM$signif, "\n")
-
-  write_csv(
-    tibble(
-      comparison = "age_pUM_full",
-      statistic = anosim_age_pUM$statistic,
-      p_value = anosim_age_pUM$signif
-    ),
-    file.path(output_dir, "anosim_age_pUM_full.csv")
-  )
-} else {
-  cat("Insufficient pUM samples with age data\n")
-}
-```
-
-### Melanocytic Cells (Healthy + Malignant)
-
-**Include healthy melanocytes as negative control for comparison with malignant melanoma cells**
-
-```{r gloscope_melanocytic_origin}
-cat("Running GloScope analysis for melanocytic cells (healthy + malignant) by disease origin...\n")
-
-# Filter to melanocytic cells: Melanocytes (healthy) + Melanoma cells (malignant)
-cells_melanocytic <- cell_metadata %>%
-  dplyr::filter(majority_celltype %in% c("Melanocytes", "Melanoma cells")) %>%
-  pull(cell_id)
-
-embedding_melanocytic <- embedding_matrix[cells_melanocytic, ]
-sample_labels_melanocytic <- cell_metadata %>%
-  dplyr::filter(majority_celltype %in% c("Melanocytes", "Melanoma cells")) %>%
-  pull(Sample)
-
-# Check sample representation (need at least 100 cells per sample)
-sample_cell_counts_melanocytic <- table(sample_labels_melanocytic)
-valid_samples_melanocytic <- names(sample_cell_counts_melanocytic)[sample_cell_counts_melanocytic >= 100]
-
-cat("  - Total melanocytic cells:", length(cells_melanocytic), "\n")
-cat("  - Samples with >=100 melanocytic cells:", length(valid_samples_melanocytic), "\n")
-
-if (length(valid_samples_melanocytic) >= 6) {
-  # Filter to valid samples
-  cells_melanocytic_filtered <- cell_metadata %>%
-    dplyr::filter(majority_celltype %in% c("Melanocytes", "Melanoma cells"),
-                  Sample %in% valid_samples_melanocytic) %>%
-    pull(cell_id)
-
-  embedding_melanocytic_filtered <- embedding_matrix[cells_melanocytic_filtered, ]
-  sample_labels_melanocytic_filtered <- cell_metadata %>%
-    dplyr::filter(majority_celltype %in% c("Melanocytes", "Melanoma cells"),
-                  Sample %in% valid_samples_melanocytic) %>%
-    pull(Sample)
-
-  # Calculate or load divergence
-  knn_div_melanocytic <- run_gloscope_cached(
-    embedding_subset = embedding_melanocytic_filtered,
-    sample_labels = sample_labels_melanocytic_filtered,
-    cache_file = "divergence_origin_melanocytic_full.rds",
-    analysis_name = "Disease Origin (Melanocytic Cells: Healthy + Malignant)"
-  )
-
-  # MDS visualization
-  samples_in_div_melanocytic <- rownames(knn_div_melanocytic)
-  sample_metadata_melanocytic <- data.frame(Sample = samples_in_div_melanocytic) %>%
-    left_join(sample_metadata %>% dplyr::filter(Sample %in% valid_samples_melanocytic), by = "Sample")
-
-  mds_melanocytic <- plotMDS(
-    dist_mat = knn_div_melanocytic,
-    metadata_df = sample_metadata_melanocytic,
-    sample_id = "Sample",
-    group_id = "origin",
-    k = 2
-  )
-
-  # ANOSIM test first to get p-value for plot
-  anosim_melanocytic <- safe_anosim(
-    as.dist(knn_div_melanocytic),
-    grouping = sample_metadata_melanocytic$origin,
-    permutations = 999
-  )
-
-  cat("\nANOSIM test for disease origin (melanocytic cells with healthy control):\n")
-  cat("  R statistic:", round(anosim_melanocytic$statistic, 4), "\n")
-  cat("  p-value:", anosim_melanocytic$signif, "\n")
-
-  p_display_melanocytic <- ifelse(anosim_melanocytic$signif < 0.001, "p < 0.001",
-                                  paste0("p = ", format(anosim_melanocytic$signif, digits = 3)))
-
-  p_melanocytic_mds <- mds_melanocytic$plot +
-    scale_color_manual(values = origin_colors) +
-    coord_fixed() +
-    labs(
-      title = "GloScope MDS: Melanocytic Cells (Healthy + Malignant - Full Cohort)",
-      subtitle = paste0("n = ", nrow(sample_metadata_melanocytic), " samples | ANOSIM: R = ",
-                       round(anosim_melanocytic$statistic, 3), ", ", p_display_melanocytic),
-      color = "Origin"
-    ) +
-    theme_minimal(base_size = 12) +
-    theme(legend.position = "right", plot.title = element_text(face = "bold", size = 14))
-
-  print(p_melanocytic_mds)
-
-  ggsave(
-    file.path(output_dir, "MDS_origin_melanocytic_full.png"),
-    p_melanocytic_mds,
-    width = 10, height = 8, dpi = 300, bg = "white"
-  )
-
-  write_csv(
-    data.frame(
-      comparison = "disease_origin_melanocytic_full",
-      statistic = anosim_melanocytic$statistic,
-      p_value = anosim_melanocytic$signif,
-      permutations = 999
-    ),
-    file.path(output_dir, "anosim_origin_melanocytic_full.csv")
-  )
-
-  # Divergence Heatmap
-  sample_order_melanocytic <- sample_metadata_melanocytic %>% arrange(origin) %>% pull(Sample)
-  knn_div_ordered_melanocytic <- knn_div_melanocytic[sample_order_melanocytic, sample_order_melanocytic]
-
-  anno_data_melanocytic <- sample_metadata_melanocytic[match(sample_order_melanocytic, sample_metadata_melanocytic$Sample), ]
-
-  # Replace NA values with "Unknown" for annotations
-  anno_data_melanocytic_clean <- anno_data_melanocytic %>%
-    dplyr::mutate(
-      Gender = replace(as.character(Gender), is.na(Gender) | Gender == "NA", "Unknown"),
-      Age_group = replace(as.character(Age_group), is.na(Age_group) | Age_group == "NA", "Unknown")
-    )
-
-  # Add colors for Unknown categories
-  gender_colors_full <- c(gender_colors, "Unknown" = "#E1E1E1FF")
-  age_colors_full <- c(age_colors, "Unknown" = "#E1E1E1FF")
-
-  col_anno_melanocytic <- HeatmapAnnotation(
-    Patient = anno_data_melanocytic_clean$Patient_nr,
-    Origin = anno_data_melanocytic_clean$origin,
-    Gender = anno_data_melanocytic_clean$Gender,
-    Age_group = anno_data_melanocytic_clean$Age_group,
-    `Primary Mutation` = anno_data_melanocytic_clean$primary_mutation,
-    `Secondary Mutation` = anno_data_melanocytic_clean$secondary_mutation,
-    col = list(
-      Origin = origin_colors,
-      Gender = gender_colors_full,
-      Age_group = age_colors_full,
-      `Primary Mutation` = pmut_colors,
-      `Secondary Mutation` = smut_colors
-    ),
-    annotation_name_gp = gpar(fontsize = 9),
-    show_legend = c(Patient = FALSE, Origin = TRUE, Gender = TRUE, Age_group = TRUE,
-                    `Primary Mutation` = TRUE, `Secondary Mutation` = TRUE)
-  )
-
-  ht_melanocytic <- Heatmap(
-    knn_div_ordered_melanocytic,
-    name = "KL Divergence",
-    col = colorRamp2(c(0, median(knn_div_melanocytic), max(knn_div_melanocytic)),
-                     c("white", "orange", "red")),
-    top_annotation = col_anno_melanocytic,
-    show_row_names = FALSE,
-    show_column_names = FALSE,
-    column_title = "GloScope: Melanocytic Cells (Healthy + Malignant) by Origin",
-    column_title_gp = gpar(fontsize = 14, fontface = "bold"),
-    heatmap_legend_param = list(
-      title = "KL Divergence",
-      legend_height = unit(4, "cm")
-    )
-  )
-
-  png(file.path(output_dir, "heatmap_origin_melanocytic_full.png"),
-      width = 2800, height = 2600, res = 300)
-  draw(ht_melanocytic)
-  dev.off()
-
-  draw(ht_melanocytic)
-
-  # Save heatmap object and data for recreation
-  qs2::qs_save(list(ht = ht_melanocytic, div_matrix = knn_div_ordered_melanocytic, anno_data = anno_data_melanocytic_clean),
-               file.path(output_dir, "gloscope_heatmap_melanocytic_cells_objects.qs2"), nthreads = parallel::detectCores())
-
-  # Summary statistics
-  cat("\n=== COMPARISON SUMMARY ===\n")
-  cat("Healthy melanocytes provide baseline for comparison with malignant cells\n")
-  cat("  - Healthy samples:", sum(sample_metadata_melanocytic$origin == "healthy", na.rm = TRUE), "\n")
-  cat("  - Primary UM samples:", sum(sample_metadata_melanocytic$origin == "primary", na.rm = TRUE), "\n")
-  cat("  - Metastatic UM samples:", sum(sample_metadata_melanocytic$origin == "metastasis", na.rm = TRUE), "\n")
-} else {
-  cat("Insufficient samples with adequate melanocytic cell representation\n")
-}
-```
-
-### Mutation Stratification (Malignant)
-
-**Secondary mutations in malignant cells from primary tumors**
-
-```{r gloscope_malignant_secondary}
-cat("Running GloScope analysis for malignant cells by secondary mutations...\n")
-
-samples_malignant_pum <- sample_metadata %>%
-  dplyr::filter(
-    origin == "primary",
-    secondary_mutation %in% c("BAP1", "SF3B1", "EIF1AX")
-  ) %>%
-  pull(Sample)
-
-if (length(samples_malignant_pum) >= 6) {
-  cells_malignant_pum <- cell_metadata %>%
-    dplyr::filter(Malignant == "Malignant", Sample %in% samples_malignant_pum) %>%
-    pull(cell_id)
-
-  # Check sample representation
-  sample_labels_malignant_pum_check <- cell_metadata %>%
-    dplyr::filter(Malignant == "Malignant", Sample %in% samples_malignant_pum) %>%
-    pull(Sample)
-
-  sample_counts_pum <- table(sample_labels_malignant_pum_check)
-  valid_samples_pum <- names(sample_counts_pum)[sample_counts_pum >= 100]
-
-  cat("  - Samples with >=100 malignant cells:", length(valid_samples_pum), "\n")
-
-  if (length(valid_samples_pum) >= 6) {
-    cells_malignant_pum_filtered <- cell_metadata %>%
-      dplyr::filter(Malignant == "Malignant", Sample %in% valid_samples_pum) %>%
-      pull(cell_id)
-
-    embedding_malignant_pum <- embedding_matrix[cells_malignant_pum_filtered, ]
-    sample_labels_malignant_pum <- cell_metadata %>%
-      dplyr::filter(Malignant == "Malignant", Sample %in% valid_samples_pum) %>%
-      pull(Sample)
-
-    # Calculate or load divergence
-    knn_div_malignant_pum <- run_gloscope_cached(
-      embedding_subset = embedding_malignant_pum,
-      sample_labels = sample_labels_malignant_pum,
-      cache_file = "divergence_secondary_mutation_malignant_full.rds",
-      analysis_name = "Secondary Mutations (Malignant Cells)"
-    )
-
-    # MDS visualization
-    samples_in_div_malignant_pum <- rownames(knn_div_malignant_pum)
-    sample_metadata_malignant_pum <- data.frame(Sample = samples_in_div_malignant_pum) %>%
-      left_join(sample_metadata %>% dplyr::filter(Sample %in% valid_samples_pum), by = "Sample")
-
-    mds_malignant_pum <- plotMDS(
-      dist_mat = knn_div_malignant_pum,
-      metadata_df = sample_metadata_malignant_pum,
-      sample_id = "Sample",
-      group_id = "secondary_mutation",
-      k = 2
-    )
-
-    # ANOSIM test first to get p-value for plot
-    anosim_malignant_pum <- safe_anosim(
-      as.dist(knn_div_malignant_pum),
-      grouping = sample_metadata_malignant_pum$secondary_mutation,
-      permutations = 999
-    )
-
-    cat("\nANOSIM test for secondary mutations (malignant cells):\n")
-    cat("  R statistic:", round(anosim_malignant_pum$statistic, 4), "\n")
-    cat("  p-value:", anosim_malignant_pum$signif, "\n")
-
-    p_display_mal_pum <- ifelse(anosim_malignant_pum$signif < 0.001, "p < 0.001",
-                                paste0("p = ", format(anosim_malignant_pum$signif, digits = 3)))
-
-    p_malignant_pum_mds <- mds_malignant_pum$plot +
-      scale_color_manual(values = smut_colors) +
-      coord_fixed() +
-      labs(
-        title = "GloScope MDS: Secondary Mutations (Malignant Cells, Primary UM - Full Cohort)",
-        subtitle = paste0("n = ", nrow(sample_metadata_malignant_pum), " samples | ANOSIM: R = ",
-                         round(anosim_malignant_pum$statistic, 3), ", ", p_display_mal_pum),
-        color = "Secondary Mutation"
-      ) +
-      theme_minimal(base_size = 12)
-
-    print(p_malignant_pum_mds)
-
-    ggsave(
-      file.path(output_dir, "MDS_secondary_mutation_malignant_full.png"),
-      p_malignant_pum_mds,
-      width = 10, height = 8, dpi = 300, bg = "white"
-    )
-
-    write_csv(
-      data.frame(
-        comparison = "secondary_mutation_malignant_full",
-        statistic = anosim_malignant_pum$statistic,
-        p_value = anosim_malignant_pum$signif,
-        permutations = 999
-      ),
-      file.path(output_dir, "anosim_secondary_mutation_malignant_full.csv")
-    )
-
-    # Divergence Heatmap
-    sample_order_malignant_pum <- sample_metadata_malignant_pum %>% arrange(secondary_mutation) %>% pull(Sample)
-    knn_div_ordered_malignant_pum <- knn_div_malignant_pum[sample_order_malignant_pum, sample_order_malignant_pum]
-
-    anno_data_malignant_pum <- sample_metadata_malignant_pum[match(sample_order_malignant_pum, sample_metadata_malignant_pum$Sample), ]
-
-    # Replace NA values with "Unknown" for annotations
-    anno_data_malignant_pum_clean <- anno_data_malignant_pum %>%
-      dplyr::mutate(
-        Gender = replace(as.character(Gender), is.na(Gender) | Gender == "NA", "Unknown"),
-        Age_group = replace(as.character(Age_group), is.na(Age_group) | Age_group == "NA", "Unknown")
-      )
-
-    # Add colors for Unknown categories
-    gender_colors_full <- c(gender_colors, "Unknown" = "#E1E1E1FF")
-    age_colors_full <- c(age_colors, "Unknown" = "#E1E1E1FF")
-
-    col_anno_malignant_pum <- HeatmapAnnotation(
-      Patient = anno_data_malignant_pum_clean$Patient_nr,
-      Gender = anno_data_malignant_pum_clean$Gender,
-      Age_group = anno_data_malignant_pum_clean$Age_group,
-      `Primary Mutation` = anno_data_malignant_pum_clean$primary_mutation,
-      `Secondary Mutation` = anno_data_malignant_pum_clean$secondary_mutation,
-      col = list(
-        Gender = gender_colors_full,
-        Age_group = age_colors_full,
-        `Primary Mutation` = pmut_colors,
-        `Secondary Mutation` = smut_colors
-      ),
-      annotation_name_gp = gpar(fontsize = 9),
-      show_legend = c(Patient = FALSE, Gender = TRUE, Age_group = TRUE,
-                      `Primary Mutation` = TRUE, `Secondary Mutation` = TRUE)
-    )
-
-    ht_malignant_pum <- Heatmap(
-      knn_div_ordered_malignant_pum,
-      name = "KL Divergence",
-      col = colorRamp2(c(0, median(knn_div_malignant_pum), max(knn_div_malignant_pum)),
-                       c("white", "orange", "red")),
-      top_annotation = col_anno_malignant_pum,
-      show_row_names = FALSE,
-      show_column_names = FALSE,
-      column_title = "GloScope Divergence: Secondary Mutations (Malignant Cells - Full Cohort)",
-      column_title_gp = gpar(fontsize = 14, fontface = "bold"),
-      heatmap_legend_param = list(
-        title = "KL Divergence",
-        legend_height = unit(4, "cm")
-      )
-    )
-
-    png(file.path(output_dir, "heatmap_secondary_mutation_malignant_full.png"),
-        width = 2400, height = 2200, res = 300)
-    draw(ht_malignant_pum)
-    dev.off()
-
-    draw(ht_malignant_pum)
-  } else {
-    cat("Insufficient malignant cell representation per sample\n")
-  }
-} else {
-  cat("Insufficient samples with secondary mutations\n")
-}
-```
-
----
-
-## Summary Statistics {.tabset}
-
-### Overview
-
-**GloScope ANOSIM Results Summary**
-
-This section summarizes all ANOSIM (Analysis of Similarity) tests performed across different cell subsets and clinical/biological variables.
-
-**Spatial/Location Comparisons** (grouped together in heatmap):
-
-- **Disease Origin**: Compares samples by disease stage - primary uveal melanomas (pUM, from the eye) vs metastatic tumors (from liver, brain, skin, thyroid). Tests whether transcriptional divergence differs between primary and metastatic disease.
-- **Organ**: Compares metastatic samples only by their organ of origin (liver, brain, skin, thyroid). Tests whether metastases to different organs show distinct transcriptional profiles.
-- **Anatomical Location**: Compares primary tumors only by their intraocular location (choroid, iris, ciliary body). Tests whether the anatomical site within the eye influences transcriptional heterogeneity.
-
-**Clinical/Biological Comparisons:**
-
-- **Gender**: Male vs Female comparison
-- **Age**: Age group comparison (Young <40, Middle 40-60, Old 60+)
-- **Primary Mutation**: GNAQ vs GNA11 vs PLCB4
-- **Secondary Mutation**: Presence/type of secondary mutations (SF3B1, BAP1, EIF1AX)
-
-**Interpretation:**
-
-- **R statistic**: Effect size (0-1), higher values indicate greater dissimilarity between groups
-- **Significance**: *** p<0.001, ** p<0.01, * p<0.05, ns = not significant
-
-### Summary Table
-
-```{r summary_stats}
-# Collect all ANOSIM results
-anosim_files <- list.files(output_dir, pattern = "^anosim.*full\\.csv$", full.names = TRUE)
-
-cat("Found", length(anosim_files), "ANOSIM result files\n")
-
-if (length(anosim_files) > 0) {
-  anosim_summary <- anosim_files %>%
-    lapply(read_csv, show_col_types = FALSE) %>%
-    bind_rows() %>%
-    mutate(
-      R_statistic = round(statistic, 4),
-      p_value_formatted = format.pval(p_value, digits = 3),
-      Significance = case_when(
-        p_value < 0.001 ~ "***",
-        p_value < 0.01 ~ "**",
-        p_value < 0.05 ~ "*",
-        TRUE ~ "ns"
-      ),
-      # Categorize by analysis type (cell subset)
-      Analysis_Group = case_when(
-        grepl("malignant", comparison, ignore.case = TRUE) ~ "Malignant Cells",
-        grepl("melanocytic", comparison, ignore.case = TRUE) ~ "Melanocytic Cells",
-        grepl("pUM", comparison) ~ "Primary Tumors",
-        TRUE ~ "All Cells"
-      ),
-      # Extract base comparison type and map to clean names
-      Comparison_Base = comparison %>%
-        gsub("_full$", "", .) %>%
-        gsub("_malignant$", "", .) %>%
-        gsub("_melanocytic$", "", .) %>%
-        gsub("_pUM$", "", .),
-      Comparison_Clean = case_when(
-        grepl("^origin", Comparison_Base) ~ "Disease Origin",
-        grepl("^organ", Comparison_Base) ~ "Organ",
-        grepl("^location", Comparison_Base) ~ "Anatomical Location",
-        grepl("^gender", Comparison_Base) ~ "Gender",
-        grepl("^age", Comparison_Base) ~ "Age",
-        grepl("^primary_mutation", Comparison_Base) ~ "Primary Mutation",
-        grepl("^secondary_mutation", Comparison_Base) ~ "Secondary Mutation",
-        TRUE ~ tools::toTitleCase(gsub("_", " ", Comparison_Base))
-      )
-    )
-
-  # Display table
-  print(knitr::kable(anosim_summary %>%
-                       select(Analysis_Group, Comparison_Clean, R_statistic, p_value_formatted, Significance) %>%
-                       arrange(Analysis_Group, desc(R_statistic)),
-                     caption = "ANOSIM Statistical Tests - Full Cohort",
-                     col.names = c("Analysis Group", "Comparison", "R Statistic", "P-value", "Significance")))
-
-  # Also create a DT table for interactivity
-  cat("\n\n#### Interactive Summary Table\n\n")
-  DT::datatable(anosim_summary %>%
-                  select(Analysis_Group, Comparison_Clean, R_statistic, p_value_formatted, Significance),
-                options = list(pageLength = 15, dom = 'ft'),
-                caption = "ANOSIM Statistical Tests - Full Cohort")
-
-  write_csv(anosim_summary, file.path(output_dir, "anosim_summary_full_cohort.csv"))
-
-  cat("\n\n**📊 Dataframe Export for Collaborators:**\n")
-  cat("The `anosim_summary` dataframe has been exported to:\n")
-  cat("`", file.path(output_dir, "anosim_summary_full_cohort.csv"), "`\n\n")
-  cat("This file can be used for custom heatmap modifications without re-running the analysis.\n")
-} else {
-  cat("No ANOSIM results available yet.\n")
-}
-```
-
-### Summary Heatmap
-
-```{r summary_heatmap, fig.width=10, fig.height=8}
-if (length(anosim_files) > 0 && exists("anosim_summary")) {
-  library(ggplot2)
-  library(dplyr)
-
-  # Define row ordering: spatial comparisons first, then clinical
-  row_order <- c("Disease Origin", "Organ", "Anatomical Location",
-                 "Gender", "Age", "Primary Mutation", "Secondary Mutation")
-
-  # Define column ordering
-  col_order <- c("All Cells", "Malignant Cells", "Melanocytic Cells", "Primary Tumors")
-
-  # Create heatmap data
-  heatmap_data <- anosim_summary %>%
-    mutate(
-      # Create nice labels
-      Label = paste0("R=", round(R_statistic, 2), "\n", Significance),
-      # -log10(p-value) for color scale, cap at 4 (p < 0.0001)
-      neg_log10_p = pmin(-log10(p_value), 4),
-      # Apply fixed row ordering (spatial first)
-      Comparison_Clean = factor(Comparison_Clean,
-                                 levels = rev(row_order[row_order %in% unique(Comparison_Clean)])),
-      Analysis_Group = factor(Analysis_Group, levels = col_order)
-    )
-
-  # Create the heatmap
-  p_heatmap <- ggplot(heatmap_data, aes(x = Analysis_Group, y = Comparison_Clean)) +
-    geom_tile(aes(fill = R_statistic), color = "white", linewidth = 0.5) +
-    geom_text(aes(label = Label), size = 3.5, color = "white", fontface = "bold") +
-    scale_fill_gradient2(
-      low = "#2166AC",
-      mid = "#F7F7F7",
-      high = "#B2182B",
-      midpoint = 0.25,
-      limits = c(0, 0.6),
-      name = "R Statistic",
-      oob = scales::squish
-    ) +
-    labs(
-      title = "GloScope ANOSIM Results Summary",
-      subtitle = "R statistic (effect size) with significance: *** p<0.001, ** p<0.01, * p<0.05, ns = not significant",
-      x = "Analysis Subset",
-      y = "Comparison"
-    ) +
-    theme_minimal(base_size = 12) +
-    theme(
-      axis.text.x = element_text(angle = 45, hjust = 1, face = "bold"),
-      axis.text.y = element_text(face = "bold"),
-      panel.grid = element_blank(),
-      plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
-      plot.subtitle = element_text(hjust = 0.5, size = 10),
-      legend.position = "right"
-    )
-
-  print(p_heatmap)
-
-  ggsave(file.path(output_dir, "anosim_summary_heatmap.png"),
-         p_heatmap, width = 10, height = 8, dpi = 300, bg = "white")
-
-  # Also create a significance-focused heatmap
-  p_sig <- ggplot(heatmap_data, aes(x = Analysis_Group, y = Comparison_Clean)) +
-    geom_tile(aes(fill = neg_log10_p), color = "white", linewidth = 0.5) +
-    geom_text(aes(label = paste0("R=", round(R_statistic, 2))),
-              size = 3.5, color = ifelse(heatmap_data$neg_log10_p > 2, "white", "black"), fontface = "bold") +
-    scale_fill_viridis_c(
-      option = "magma",
-      name = "-log10(p-value)",
-      limits = c(0, 4),
-      breaks = c(0, 1, 2, 3, 4),
-      labels = c("1", "0.1", "0.01", "0.001", "<0.0001")
-    ) +
-    labs(
-      title = "GloScope ANOSIM - Statistical Significance",
-      subtitle = "Darker colors indicate stronger significance",
-      x = "Analysis Subset",
-      y = "Comparison"
-    ) +
-    theme_minimal(base_size = 12) +
-    theme(
-      axis.text.x = element_text(angle = 45, hjust = 1, face = "bold"),
-      axis.text.y = element_text(face = "bold"),
-      panel.grid = element_blank(),
-      plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
-      plot.subtitle = element_text(hjust = 0.5, size = 10),
-      legend.position = "right"
-    )
-
-  print(p_sig)
-
-  ggsave(file.path(output_dir, "anosim_significance_heatmap.png"),
-         p_sig, width = 10, height = 8, dpi = 300, bg = "white")
-} else {
-  cat("No ANOSIM results available for heatmap.\n")
-}
-```
-
----
-
-## Session Information
+## Session Info
 
 ```{r session_info}
 sessionInfo()
 ```
-
-**Analysis completed:** `r format(Sys.time(), "%Y-%m-%d %H:%M:%S")`
-
-**Full cohort (NO downsampling):** ~298,640 cells
-
-**Parallel processing:** 24 cores via BiocParallel
-
-**Output location:** `../GloScope_Full_Outputs/`
-
-**Cached divergence matrices:** Reusable for future analyses
