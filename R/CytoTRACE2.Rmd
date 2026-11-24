@@ -1,11 +1,8 @@
 ---
-title: "p31662 - CytoTRACE2 Analysis of Uveal Melanoma Atlas"
+title: "UM Atlas - CytoTRACE2 Developmental Potential and Stemness Signature"
 output:
   html_document:
     self_contained: true
-    includes:
-      in_header: !expr system.file("templates/fgcz_header.html", package = "ezRun", lib.loc = .libPaths())
-    css: !expr system.file("templates/fgcz.css", package = "ezRun", lib.loc = .libPaths())
     code_folding: hide
 editor_options:
   chunk_output_type: console
@@ -13,3032 +10,386 @@ editor_options:
 
 ```{r script-info, include=FALSE}
 # This script was used to create the following figures:
-# Figures 2, 3C, 5E (CytoTRACE2 cellular potency / stemness analysis on the UM atlas)
+# Figure 2c: UMAP of CytoTRACE2 potency categories
+# Figure 2d: CytoTRACE2 score by major cell type
+# Figure 2e: patient-level CytoTRACE2 by disease stage, coloured by location
+# Figure 2i: CytoTRACE2 of melanoma cells in primary UM by uveal location
+# Supplementary Figure 4a: CytoTRACE2 by age class (within disease stage; and Fig. 2e coloured by age class)
+# Supplementary Figure 4b: CytoTRACE2 by gender (within disease stage; and Fig. 2e coloured by gender)
+# Supplementary Figure 4c: CytoTRACE2 of melanoma cells by secondary mutation (all tumours; and choroidal primaries only)
+# Supplementary Table 2: stemness signature (top/bottom 50 genes correlated with CytoTRACE2)
 ```
 
-#  {.tabset}
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 7.5, fig.height = 6.5)
+suppressPackageStartupMessages({
+  library(data.table); library(ggplot2); library(ggsignif); library(ggbeeswarm); library(scattermore); library(patchwork)
+})
+source("colors_2026b.R")
+
+OBJ  <- "../new_data_2026b/Objects/full Dataset/final_Subtyping_iCNV_reclustered.qs2"
+META <- "../new_data_2026b/full_meta_full.csv.gz"
+CT   <- "../Outputs/CytoTRACE2_2026b"
+dir.create("figures", showWarnings = FALSE); dir.create("tables", showWarnings = FALSE)
+
+ORIGINS <- c("non-malignant", "primary", "metastasis")
+LOC3 <- c("choroid", "iris", "ciliary body")   # ciliochoroidal (1 patient) not shown or tested
+MUTS <- c("BAP1", "SF3B1", "EIF1AX")
+MIN_CELLS <- 10   # a tumour/tissue (orig.ident) needs >= 10 cells of the set to be drawn and to enter its patient mean
+SETS <- c(malignant = "Malignant cells", healthy_melanocyte = "Non-malignant melanocytes", all_cells = "All cells")
+potency_labels <- c("Differentiated", "Unipotent", "Oligopotent", "Multipotent", "Pluripotent", "Totipotent")
+potency_colors <- setNames(c("#9E0142", "#F46D43", "#FEE08B", "#E6F598", "#66C2A5", "#5E4FA2"), potency_labels)
+AGES <- c("<40", "40-60", "≥60", "unknown")   # 40-60 = [40, 60)
+age_colors <- setNames(c(unname(ageGroup_col[c("Young", "Middle", "Old")]), "grey30"), AGES)
+
+nfmt <- function(x) formatC(x, format = "d", big.mark = ",")
+wrap_cap <- function(x, width_in) paste(strwrap(x, floor(13 * width_in)), collapse = "\n")
+thm <- theme_classic(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5), plot.caption = element_text(hjust = 0, size = 8.5),
+        plot.caption.position = "plot", plot.title.position = "plot")
+save_gg <- function(p, id, w, h) {
+  ggsave(file.path("figures", paste0(id, ".pdf")), p, width = w, height = h, device = cairo_pdf)
+  ggsave(file.path("figures", paste0(id, ".png")), p, width = w, height = h, dpi = 300, bg = "white")
+  p
+}
+signif_label_adj <- function(padj) sprintf("%s  adj. p %s",
+  as.character(cut(padj, c(-Inf, 0.001, 0.01, 0.05, Inf), c("***", "**", "*", "ns"))),
+  ifelse(padj < 2.2e-16, "< 2.2e-16", paste("=", trimws(formatC(padj, digits = 2, format = "g")))))
+
+# x: one row per cell with orig.ident, Patient_nr, the grouping column and the value v.
+# pts = one point per tumour/tissue (drawn); pat = one mean per patient and group (tested).
+units <- function(x, grp) {
+  pts <- x[, .(score = mean(v), n_cells = .N), by = c("orig.ident", "Patient_nr", grp)]
+  stopifnot("an orig.ident sits in two groups" = !anyDuplicated(pts$orig.ident))
+  pts <- merge(pts[n_cells >= MIN_CELLS], oi, by = "orig.ident")
+  pat <- x[orig.ident %in% pts$orig.ident, .(score = mean(v), n_cells = .N), by = c("Patient_nr", grp)]
+  list(pts = pts, pat = pat)
+}
+# Two-sided Wilcoxon rank-sum on patient means for every pair of groups with >= min_pat patients.
+pat_tests <- function(u, grp, levels, panel, min_pat = 3) {
+  n_by <- table(factor(u$pat[[grp]], levels = levels)); lv <- names(n_by)[n_by >= min_pat]
+  if (length(lv) < 2) return(data.table())
+  rbindlist(lapply(combn(lv, 2, simplify = FALSE), function(pr) {
+    a <- u$pat[get(grp) == pr[1], score]; b <- u$pat[get(grp) == pr[2], score]
+    data.table(panel = panel, group1 = pr[1], group2 = pr[2], n_patients1 = length(a), n_patients2 = length(b),
+               median1 = median(a), median2 = median(b), p = suppressWarnings(wilcox.test(a, b)$p.value))
+  }))
+}
+with_bh <- function(tt) { if (nrow(tt)) tt[, padj := p.adjust(p, "BH")]; tt }   # BH over the comparisons of one panel
+box_panel <- function(u, grp, levels, tt, title, ylab, fill = NULL, colour = NULL, colour_values = NULL,
+                      colour_name = NULL, shape = NULL, size_cells = FALSE, note = NULL, width = 7.5) {
+  pts <- u$pts[get(grp) %in% levels]; pat <- u$pat[get(grp) %in% levels]
+  levels <- levels[levels %in% pts[[grp]]]
+  pts[, x := factor(get(grp), levels = levels)]
+  n_pt <- table(pts$x); n_pa <- table(factor(pat[[grp]], levels = levels)); small <- names(n_pa)[n_pa < 3]
+  tt <- tt[group1 %in% levels & group2 %in% levels]
+  cap <- paste(c(sprintf("One point per tumour/tissue (orig.ident, >= %d cells); Wilcoxon rank-sum on patient means, two-sided, BH-adjusted within the panel (%d tests). n = orig.ident (patients).",
+                         MIN_CELLS, nrow(tt)),
+                 if (length(small)) sprintf("Not tested (< 3 patients): %s.", paste(small, collapse = ", ")), note),
+               collapse = " ")
+  m <- list(); if (!is.null(colour)) m$colour <- as.name(colour)
+  if (size_cells) m$size <- as.name("n_cells"); if (!is.null(shape)) m$shape <- as.name(shape)
+  fixed <- c(if (is.null(colour)) list(colour = "black"), if (!size_cells) list(size = 2.2))
+  p <- ggplot(pts, aes(x, score)) +
+    (if (is.null(fill)) geom_boxplot(fill = "grey85", alpha = 0.7, outlier.shape = NA, width = 0.6)
+     else geom_boxplot(aes(fill = x), alpha = 0.45, outlier.shape = NA, width = 0.6, show.legend = FALSE)) +
+    do.call(geom_quasirandom, c(list(mapping = do.call(aes, m), width = 0.22, alpha = 0.85), fixed)) +
+    scale_x_discrete(labels = setNames(sprintf("%s\nn = %d (%d pat.)", levels, as.integer(n_pt), as.integer(n_pa)), levels)) +
+    scale_y_continuous(expand = expansion(mult = c(0.05, 0.06 + 0.11 * nrow(tt)))) +
+    labs(title = title, x = NULL, y = ylab, caption = wrap_cap(cap, width)) + thm
+  if (nrow(tt)) p <- p + geom_signif(comparisons = unname(Map(c, tt$group1, tt$group2)), annotations = signif_label_adj(tt$padj),
+                                     step_increase = 0.11, tip_length = 0.01, textsize = 3.2, vjust = -0.2)
+  if (!is.null(fill)) p <- p + scale_fill_manual(values = fill)
+  if (!is.null(colour)) p <- p + scale_colour_manual(values = colour_values, name = colour_name,
+                                                     breaks = intersect(names(colour_values), unique(as.character(pts[[colour]]))))
+  if (size_cells) p <- p + scale_size_continuous(name = "Cells", range = c(1.5, 6), breaks = c(100, 1000, 5000, 10000), labels = nfmt)
+  if (!is.null(shape)) p <- p + scale_shape_manual(values = c(primary = 16, metastasis = 17), name = NULL)
+  p
+}
+tests <- list()
+```
+
+<style>
+.main-container img { max-width: min(100%, 1400px) !important; height: auto !important; display: block; margin: 0 auto; }
+</style>
+
+# {.tabset}
 
 ## Overview
 
-Started on `r format(Sys.time(), "%Y-%m-%d %H:%M:%S")`
+**Purpose**: infer the developmental potential (stemness) of every cell of the atlas with CytoTRACE2 and compare it between
+disease stages, uveal locations, secondary mutations, age classes and genders; derive the stemness signature used on the
+Xenium sections and the external datasets.
 
-**Purpose**: Analyze cellular differentiation potential and stemness in uveal melanoma atlas using CytoTRACE 2.
+**Input**: raw UMI counts of the integrated atlas object and its per-cell metadata (`../new_data_2026b/`).
 
-**CytoTRACE 2** predicts cellular potency from scRNA-seq data, outputting:
-- Continuous scores (0 = differentiated, 1 = totipotent)
-- Discrete potency categories (Differentiated, Unipotent, Oligopotent, Multipotent, Pluripotent, Totipotent)
-- Relative ordering within the dataset
+**CytoTRACE2** (version 1.1.0, `species = "human"`) is run on the raw counts one library (`Sample`) at a time, so its KNN
+smoothing never mixes libraries. Potency categories: Differentiated (0-0.167) to Totipotent (0.833-1).
 
-**Reference**: https://github.com/digitalcytometry/cytotrace2
+**Statistics**: the unit of replication is the patient. Boxplots draw one point per tumour/tissue (`orig.ident`, >= 10 cells)
+and test the patient means (mean over all cells of the set) with a two-sided Wilcoxon rank-sum test between every pair of
+groups with >= 3 patients. P-values are BH-adjusted within each panel (Suppl. Fig. 4a/b by stage: over all comparisons of the
+figure) and shown as "adj. p". Melanocytic cell set = melanoma cells of tumours and melanocytes of non-malignant tissue.
 
-```{r setup}
-knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 10, fig.height = 8)
+**Stemness signature**: Pearson r of the CytoTRACE2 score with log1p(CP10k) expression of every gene detected in >= 1% of
+the cells of a set; the 50 most positively (Top) and 50 most negatively (Bottom) correlated genes.
 
-library(Seurat)
-library(CytoTRACE2)
-library(qs)
-library(tidyverse)
-library(ggplot2)
-library(dittoSeq)
-library(cowplot)
-library(patchwork)
-library(dplyr)
-library(ggpubr)
+**Outputs**: `figures/` (PDF + PNG, named by figure ID), `tables/` (tests, signatures). Scores, per-gene correlations and
+the atlas UMAP are cached under `../Outputs/CytoTRACE2_2026b/` and re-read when present.
 
-# Load Victoria's official color palettes
-source("colors.R")
-
-# CRITICAL: Reorder origin_colors to match disease progression (healthy → primary → metastasis)
-# This ensures consistent ordering across all plots
-origin_order <- c("healthy", "primary", "metastasis")
-origin_colors <- origin_colors[origin_order]
-
-output_dir <- "Outputs/"
-dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
-
-# Color palettes
-# Potency category colors (CytoTRACE2 standard)
-labels <- c("Differentiated", "Unipotent", "Oligopotent",
-            "Multipotent", "Pluripotent", "Totipotent")
-colors.cyto <- c("#9E0142", "#F46D43", "#FEE08B",
-                 "#E6F598", "#66C2A5", "#5E4FA2")
-names(colors.cyto) <- labels
-
-# Use Victoria's cell type colors
-celltype_colors <- majority_celltype_col
-
-# Extended colors for additional cell types (fallback)
-base_colors <- unname(pals::polychrome())
-mycols <- colorRampPalette(base_colors)(100)
-
-# Increased base font size for better readability (per collaborator request)
-theme_set(theme_minimal(base_size = 14))
-```
-
-## Load Data
-
-```{r load_data}
-# Load Victoria's updated dataset (Dec 2025) - has correct cells and UMAP
-cat("Loading Victoria's updated UM atlas (Dec 2025)...\n")
-um_atlas <- qs::qread(
-  "../13_final_Dataset_reclustered_28012025.qs",
-  nthreads = 32
-)
-
-cat("Loaded new UM atlas:\n")
-cat("  - Cells:", ncol(um_atlas), "\n")
-cat("  - Features:", nrow(um_atlas), "\n")
-cat("  - Assays:", names(um_atlas@assays), "\n\n")
-
-# Load pre-computed CytoTRACE2 results from old object and transfer by barcode matching
-cat("Loading pre-computed CytoTRACE2 results...\n")
-old_atlas <- qs::qread(
-  "../UM_atlas_cytotrace2.qs2",
-  nthreads = 32
-)
-
-cat("Old atlas with CytoTRACE2:\n")
-cat("  - Cells:", ncol(old_atlas), "\n\n")
-
-# Transfer CytoTRACE2 scores by matching cell barcodes
-cat("Transferring CytoTRACE2 scores to new object...\n")
-common_cells <- intersect(colnames(um_atlas), colnames(old_atlas))
-cat("  - Common cells:", length(common_cells), "\n")
-cat("  - New cells (no CytoTRACE2):", sum(!colnames(um_atlas) %in% common_cells), "\n")
-cat("  - Removed cells (had CytoTRACE2):", sum(!colnames(old_atlas) %in% common_cells), "\n\n")
-
-# Transfer CytoTRACE2 columns
-cytotrace_cols <- c("CytoTRACE2_Score", "CytoTRACE2_Relative", "CytoTRACE2_Potency",
-                    "preKNN_CytoTRACE2_Score", "preKNN_CytoTRACE2_Potency")
-
-for (col in cytotrace_cols) {
-  if (col %in% colnames(old_atlas@meta.data)) {
-    um_atlas@meta.data[[col]] <- NA
-    um_atlas@meta.data[common_cells, col] <- old_atlas@meta.data[common_cells, col]
-    cat("  Transferred:", col, "-", sum(!is.na(um_atlas@meta.data[[col]])), "cells\n")
+```{r compute}
+score_file <- file.path(CT, "cytotrace2_scores.qs2")
+umap_file  <- file.path(CT, "atlas_umap.csv.gz")
+cor_file   <- function(s) file.path(CT, sprintf("gene_cor_%s.csv", s))
+if (!all(file.exists(c(score_file, umap_file, cor_file(names(SETS)))))) {
+  suppressPackageStartupMessages({ library(Seurat); library(CytoTRACE2); library(Matrix) })
+  dir.create(file.path(CT, "per_library"), recursive = TRUE, showWarnings = FALSE)
+  obj <- qs2::qs_read(OBJ, nthreads = 1)
+  obj[["RNA"]] <- JoinLayers(obj[["RNA"]])
+  counts <- LayerData(obj, assay = "RNA", layer = "counts")
+  cm <- obj@meta.data[, c("Sample", "origin", "Malignant", "majority_celltype")]
+  if (!file.exists(umap_file)) {
+    e <- Embeddings(obj, "umap")
+    fwrite(data.table(cell = rownames(e), UMAP_1 = e[, 1], UMAP_2 = e[, 2]), umap_file)
   }
-}
-
-# Convert integer potency to factor with proper labels
-potency_labels <- c("Differentiated", "Unipotent", "Oligopotent",
-                    "Multipotent", "Pluripotent", "Totipotent")
-um_atlas$CytoTRACE2_Potency <- factor(
-  potency_labels[um_atlas$CytoTRACE2_Potency],
-  levels = potency_labels
-)
-um_atlas$preKNN_CytoTRACE2_Potency <- factor(
-  potency_labels[um_atlas$preKNN_CytoTRACE2_Potency],
-  levels = potency_labels
-)
-cat("  Converted potency columns to factor with labels\n")
-
-# Clean up old object to free memory
-rm(old_atlas)
-gc()
-
-cat("\nCytoTRACE2 transfer complete!\n")
-cat("Coverage:", round(100 * sum(!is.na(um_atlas@meta.data$CytoTRACE2_Score)) / ncol(um_atlas), 1), "%\n\n")
-
-# Display metadata columns
-cat("Metadata columns:\n")
-print(colnames(um_atlas@meta.data))
-
-# Check for cell type annotations
-celltype_cols <- grep("cell.*type|cluster|annotation", colnames(um_atlas@meta.data),
-                      value = TRUE, ignore.case = TRUE)
-cat("\nPotential cell type columns:\n")
-print(celltype_cols)
-```
-
-## Run CytoTRACE2 {.tabset}
-
-### Compute Scores
-
-```{r run_cytotrace2, eval = FALSE}
-# Seurat v5 compatibility: Join layers before extracting counts
-cat("Joining RNA assay layers for CytoTRACE2 compatibility...\n")
-um_atlas[["RNA"]] <- JoinLayers(um_atlas[["RNA"]])
-cat("Layers joined successfully.\n\n")
-
-# Extract count matrix
-cat("Extracting count matrix...\n")
-count_matrix <- GetAssayData(um_atlas, assay = "RNA", layer = "counts")
-count_matrix <- as.matrix(count_matrix)
-cat("Count matrix extracted: ", nrow(count_matrix), "genes x", ncol(count_matrix), "cells\n\n")
-
-# Run CytoTRACE2 on the full dataset
-cat("Running CytoTRACE2 on full dataset...\n")
-cytotrace2_result <- cytotrace2(
-  count_matrix,
-  is_seurat = FALSE,
-  ncores = 32,
-  species = "human",
-  batch_size = 10000
-)
-
-cat("CytoTRACE2 computation complete!\n\n")
-
-# Extract results from the CytoTRACE2 output
-cat("Extracting results...\n")
-cytotrace2_df <- cytotrace2_result$CytoTRACE2_results
-
-# Add results to Seurat object metadata
-cat("Adding results to Seurat object...\n")
-um_atlas$CytoTRACE2_Score <- cytotrace2_df$CytoTRACE2_Score[match(colnames(um_atlas), rownames(cytotrace2_df))]
-um_atlas$CytoTRACE2_Relative <- cytotrace2_df$CytoTRACE2_Relative[match(colnames(um_atlas), rownames(cytotrace2_df))]
-um_atlas$CytoTRACE2_Potency <- cytotrace2_df$CytoTRACE2_Potency[match(colnames(um_atlas), rownames(cytotrace2_df))]
-um_atlas$preKNN_CytoTRACE2_Score <- cytotrace2_df$preKNN_CytoTRACE2_Score[match(colnames(um_atlas), rownames(cytotrace2_df))]
-um_atlas$preKNN_CytoTRACE2_Potency <- cytotrace2_df$preKNN_CytoTRACE2_Potency[match(colnames(um_atlas), rownames(cytotrace2_df))]
-
-cat("CytoTRACE2 analysis complete!\n")
-cat("  - CytoTRACE2_Score: ", sum(!is.na(um_atlas$CytoTRACE2_Score)), "cells\n")
-cat("  - CytoTRACE2_Potency categories: ", table(um_atlas$CytoTRACE2_Potency), "\n\n")
-
-# Save results
-output_path <- file.path(
-  "..",
-  "UM_atlas_cytotrace2.qs2"
-)
-cat("Saving to:", output_path, "\n")
-qs::qsave(um_atlas, output_path, nthreads = 32)
-
-cat("\nResults saved!\n")
-```
-
-### Check CytoTRACE2 Results
-
-```{r load_results}
-# Check if CytoTRACE2 results exist in current object (computed in previous chunk)
-# NOTE: We no longer load from cached file to ensure we use the correct NEW dataset
-
-# Flag to track if we have CytoTRACE2 results
-has_cytotrace2 <- "CytoTRACE2_Score" %in% colnames(um_atlas@meta.data) &&
-                  sum(!is.na(um_atlas$CytoTRACE2_Score)) > 0
-
-if (has_cytotrace2) {
-  cat("CytoTRACE2 results found in current object.\n")
-  cat("Cells with CytoTRACE2 scores:", sum(!is.na(um_atlas$CytoTRACE2_Score)), "\n")
-} else {
-  cat("CytoTRACE2 results not found.\n")
-  cat("\nTo compute CytoTRACE2 scores:\n")
-  cat("1. Set eval=TRUE in the 'Compute Scores' chunk above\n")
-  cat("2. Re-render this document\n")
-  cat("\nSkipping visualization sections...\n")
-}
-
-# Initialize has_malignant for later use
-has_malignant <- FALSE
-
-# Check CytoTRACE2 columns if we have results
-if (has_cytotrace2) {
-  cytotrace_cols <- grep("CytoTRACE2", colnames(um_atlas@meta.data), value = TRUE)
-  cat("\nCytoTRACE2 columns:\n")
-  print(cytotrace_cols)
-
-  if ("CytoTRACE2_Score" %in% colnames(um_atlas@meta.data)) {
-    cat("\nCytoTRACE2 Score summary:\n")
-    print(summary(um_atlas$CytoTRACE2_Score))
-
-    cat("\nCytoTRACE2 Potency distribution:\n")
-    print(table(um_atlas$CytoTRACE2_Potency))
-  } else {
-    has_cytotrace2 <- FALSE
-    cat("\nERROR: CytoTRACE2 columns not found in loaded object!\n")
+  rm(obj); invisible(gc())
+  if (!file.exists(score_file)) {
+    # about one core per 500 cells: with more cores, small libraries leave empty KNN chunks and CytoTRACE2 fails
+    res <- rbindlist(lapply(split(colnames(counts), cm$Sample), function(cells) {
+      f <- file.path(CT, "per_library", paste0(cm[cells[1], "Sample"], ".qs2"))
+      if (file.exists(f)) return(qs2::qs_read(f, nthreads = 1))
+      r <- cytotrace2(as.matrix(counts[, cells, drop = FALSE]), is_seurat = FALSE, species = "human",
+                      ncores = min(8L, max(1L, length(cells) %/% 500L)), batch_size = 10000, seed = 14)
+      r <- data.table(cell = rownames(r), r)
+      qs2::qs_save(r, f, nthreads = 1)
+      r
+    }))
+    res[, Sample := cm[cell, "Sample"]]
+    stopifnot(setequal(res$cell, colnames(counts)), !anyNA(res$CytoTRACE2_Score))
+    qs2::qs_save(res, score_file, nthreads = 1)
   }
-}
-```
-
-## Data Cleaning {.tabset}
-
-### Fix Primary Mutation Typo
-
-```{r fix_primary_mutation}
-# Fix typo: GANQ should be GNAQ (applied after loading data)
-cat("Fixing primary_mutation typo: GANQ → GNAQ\n")
-cat("\nBefore correction:\n")
-print(table(um_atlas$primary_mutation))
-
-# Merge GANQ into GNAQ
-um_atlas$primary_mutation[um_atlas$primary_mutation == "GANQ"] <- "GNAQ"
-
-cat("\nAfter correction:\n")
-print(table(um_atlas$primary_mutation))
-cat("\n✅ GANQ merged into GNAQ\n")
-```
-
-## UMAP Visualizations {.tabset}
-
-### Cell Type Reference
-
-```{r umap_celltype, fig.width = 10, fig.height = 9, eval = has_cytotrace2}
-# Use majority_celltype for cell type annotations
-celltype_col <- "majority_celltype"
-
-if (celltype_col %in% colnames(um_atlas@meta.data)) {
-  cat("Using cell type column:", celltype_col, "\n")
-  cat("\nCell type distribution:\n")
-  print(table(um_atlas@meta.data[[celltype_col]]))
-} else {
-  cat("ERROR: majority_celltype column not found in metadata!\n")
-  cat("Available columns:", paste(colnames(um_atlas@meta.data), collapse = ", "), "\n")
-}
-
-# Set up colors based on number of groups
-n_groups <- length(unique(um_atlas@meta.data[[celltype_col]]))
-if (n_groups <= length(mycols)) {
-  group_colors <- mycols[1:n_groups]
-} else {
-  group_colors <- mycols
-}
-
-p_celltype <- DimPlot(
-  um_atlas,
-  reduction = "umap",
-  group.by = celltype_col,
-  cols = celltype_colors,
-  label = TRUE,
-  repel = TRUE,
-  order = TRUE,
-  raster = FALSE
-) +
-  coord_fixed() +
-  ggtitle(paste("Cell Type Annotations -", celltype_col))
-
-print(p_celltype)
-ggsave(file.path(output_dir, "umap_celltypes.png"), p_celltype,
-       width = 10, height = 9, dpi = 300, bg = "white")
-```
-
-### CytoTRACE2 Relative Score
-
-```{r umap_relative, fig.width = 9, fig.height = 8, eval = has_cytotrace2}
-# Setup UMAP limits for consistent aspect ratio
-x_limits <- range(um_atlas@reductions$umap@cell.embeddings[, 1], na.rm = TRUE)
-y_limits <- range(um_atlas@reductions$umap@cell.embeddings[, 2], na.rm = TRUE)
-
-p_relative <- FeaturePlot(
-  um_atlas,
-  reduction = "umap",
-  features = "CytoTRACE2_Relative",
-  raster = FALSE
-) +
-  scale_colour_gradientn(
-    colours = c("#000004FF", "#3B0F70FF", "#8C2981FF",
-                "#DE4968FF", "#FE9F6DFF", "#FCFDBFFF"),
-    na.value = "transparent",
-    limits = c(0, 1),
-    breaks = seq(0, 1, by = 0.2),
-    labels = c("0.0 (More diff.)", "0.2", "0.4", "0.6", "0.8", "1.0 (Less diff.)"),
-    name = "Relative\norder",
-    guide = guide_colorbar(frame.colour = "black", ticks.colour = "black")
-  ) +
-  coord_fixed() +
-  coord_cartesian(xlim = x_limits, ylim = y_limits) +
-  ggtitle("CytoTRACE 2 Relative Score") +
-  xlab("UMAP1") + ylab("UMAP2") +
-  theme(
-    legend.text = element_text(size = 10),
-    legend.title = element_text(size = 12),
-    axis.text = element_text(size = 12),
-    axis.title = element_text(size = 12),
-    plot.title = element_text(size = 14, face = "bold", hjust = 0.5, margin = margin(b = 20))
-  )
-
-print(p_relative)
-ggsave(file.path(output_dir, "umap_cytotrace2_relative.png"), p_relative,
-       width = 9, height = 8, dpi = 300, bg = "white")
-```
-
-### CytoTRACE2 Absolute Score
-
-```{r umap_absolute, fig.width = 9, fig.height = 8, eval = has_cytotrace2}
-p_absolute <- FeaturePlot(
-  um_atlas,
-  reduction = "umap",
-  features = "CytoTRACE2_Score",
-  raster = FALSE
-) +
-  scale_colour_gradientn(
-    colours = c("#000004FF", "#3B0F70FF", "#8C2981FF",
-                "#DE4968FF", "#FE9F6DFF", "#FCFDBFFF"),
-    na.value = "transparent",
-    limits = c(0, 1),
-    breaks = seq(0, 1, by = 0.2),
-    labels = c("0.0 (More diff.)", "0.2", "0.4", "0.6", "0.8", "1.0 (Less diff.)"),
-    name = "CytoTRACE2\nScore",
-    guide = guide_colorbar(frame.colour = "black", ticks.colour = "black")
-  ) +
-  coord_fixed() +
-  coord_cartesian(xlim = x_limits, ylim = y_limits) +
-  ggtitle("CytoTRACE 2 Absolute Score") +
-  xlab("UMAP1") + ylab("UMAP2") +
-  theme(
-    legend.text = element_text(size = 10),
-    legend.title = element_text(size = 12),
-    axis.text = element_text(size = 12),
-    axis.title = element_text(size = 12),
-    plot.title = element_text(size = 14, face = "bold", hjust = 0.5, margin = margin(b = 20))
-  )
-
-print(p_absolute)
-ggsave(file.path(output_dir, "umap_cytotrace2_absolute.png"), p_absolute,
-       width = 9, height = 8, dpi = 300, bg = "white")
-```
-
-### CytoTRACE2 Potency Categories
-
-```{r umap_potency, fig.width = 10, fig.height = 8, eval = has_cytotrace2}
-p_potency <- DimPlot(
-  um_atlas,
-  reduction = "umap",
-  group.by = "CytoTRACE2_Potency",
-  cols = colors.cyto,
-  order = TRUE,
-  raster = FALSE
-) +
-  coord_fixed() +
-  coord_cartesian(xlim = x_limits, ylim = y_limits) +
-  ggtitle("CytoTRACE 2 Potency Categories") +
-  xlab("UMAP1") + ylab("UMAP2")
-
-print(p_potency)
-ggsave(file.path(output_dir, "umap_cytotrace2_potency.png"), p_potency,
-       width = 10, height = 8, dpi = 300, bg = "white")
-```
-
-### Pre-KNN Score (Raw)
-
-```{r umap_preknn, fig.width = 9, fig.height = 8, eval = has_cytotrace2}
-p_preknn <- FeaturePlot(
-  um_atlas,
-  reduction = "umap",
-  features = "preKNN_CytoTRACE2_Score",
-  raster = FALSE
-) +
-  scale_colour_gradientn(
-    colours = c("#000004FF", "#3B0F70FF", "#8C2981FF",
-                "#DE4968FF", "#FE9F6DFF", "#FCFDBFFF"),
-    na.value = "transparent",
-    limits = c(0, 1),
-    breaks = seq(0, 1, by = 0.2),
-    labels = c("0.0 (More diff.)", "0.2", "0.4", "0.6", "0.8", "1.0 (Less diff.)"),
-    name = "Pre-KNN\nScore",
-    guide = guide_colorbar(frame.colour = "black", ticks.colour = "black")
-  ) +
-  coord_fixed() +
-  coord_cartesian(xlim = x_limits, ylim = y_limits) +
-  ggtitle("CytoTRACE 2 Pre-KNN Score (before smoothing)") +
-  xlab("UMAP1") + ylab("UMAP2") +
-  theme(
-    legend.text = element_text(size = 10),
-    legend.title = element_text(size = 12),
-    axis.text = element_text(size = 12),
-    axis.title = element_text(size = 12),
-    plot.title = element_text(size = 14, face = "bold", hjust = 0.5, margin = margin(b = 20))
-  )
-
-print(p_preknn)
-ggsave(file.path(output_dir, "umap_cytotrace2_preknn.png"), p_preknn,
-       width = 9, height = 8, dpi = 300, bg = "white")
-```
-
-## Violin Plots {.tabset}
-
-### By Cell Type
-
-```{r violin_celltype, fig.width = 14, fig.height = 9, eval = has_cytotrace2}
-p_vln_celltype <- VlnPlot(
-  um_atlas,
-  features = "CytoTRACE2_Score",
-  group.by = celltype_col,
-  cols = celltype_colors,
-  sort = TRUE,
-  pt.size = 0
-) +
-  scale_y_continuous(
-    breaks = seq(0, 1, by = 0.2),
-    limits = c(0, 1),
-    sec.axis = sec_axis(
-      trans = ~.,
-      breaks = seq(0, 1, by = 1/12),
-      labels = c("", "Differentiated", "", "Unipotent", "",
-                 "Oligopotent", "", "Multipotent", "",
-                 "Pluripotent", "", "Totipotent", "")
-    )
-  ) +
-  labs(x = "Cell Type", y = "Potency Score") +
-  ggtitle("Developmental Potential by Cell Type") +
-  theme(
-    legend.position = "None",
-    axis.text = element_text(size = 10),
-    axis.title = element_text(size = 12),
-    plot.title = element_text(size = 14, face = "bold", hjust = 0.5, margin = margin(b = 20)),
-    axis.text.x = element_text(angle = 45, hjust = 1),
-    axis.ticks.y.right = element_line(
-      color = c("black", NA, "black", NA, "black", NA,
-                "black", NA, "black", NA, "black", NA, "black")
-    ),
-    aspect.ratio = 0.8,
-    axis.ticks.length.y.right = unit(0.3, "cm")
-  )
-
-print(p_vln_celltype)
-ggsave(file.path(output_dir, "violin_cytotrace2_celltype.png"), p_vln_celltype,
-       width = 14, height = 9, dpi = 300, bg = "white")
-```
-
-### By Sample (if available)
-
-```{r violin_sample, fig.width = 12, fig.height = 8, eval = has_cytotrace2}
-# Use orig.ident to merge biological replicates from same tumor
-if ("orig.ident" %in% colnames(um_atlas@meta.data)) {
-
-  n_samples <- length(unique(um_atlas$orig.ident))
-  # Use Victoria's sample colors if available
-  available_samples <- unique(um_atlas$orig.ident)
-  sample_colors_use <- sample_col[names(sample_col) %in% available_samples]
-  if (length(sample_colors_use) < n_samples) {
-    sample_colors_use <- mycols[1:min(n_samples, length(mycols))]
+  res <- qs2::qs_read(score_file, nthreads = 1)
+  score <- setNames(res$CytoTRACE2_Score, res$cell)[colnames(counts)]
+  # Pearson r from sparse sums (no dense genes x cells matrix)
+  norm <- counts %*% Diagonal(x = 1e4 / colSums(counts)); norm@x <- log1p(norm@x)
+  dimnames(norm) <- dimnames(counts)
+  cells_of <- list(malignant = rownames(cm)[cm$Malignant == "Malignant"],
+                   healthy_melanocyte = rownames(cm)[cm$origin == "non-malignant" & cm$majority_celltype == "Melanocytes"],
+                   all_cells = rownames(cm))
+  for (s in names(SETS)) if (!file.exists(cor_file(s))) {
+    X <- norm[, cells_of[[s]], drop = FALSE]; y <- score[cells_of[[s]]]; n <- length(y)
+    sx <- rowSums(X); sxx <- rowSums(X^2); sxy <- as.numeric(X %*% y)
+    r <- (n * sxy - sx * sum(y)) / sqrt((n * sxx - sx^2) * (n * sum(y^2) - sum(y)^2))
+    g <- data.table(gene = rownames(X), correlation = r, pct_expressed = rowSums(X > 0) / n)[pct_expressed >= 0.01][order(-correlation)]
+    stopifnot(abs(g$correlation[1] - cor(as.numeric(norm[g$gene[1], cells_of[[s]]]), y)) < 1e-8)
+    fwrite(g, cor_file(s))
   }
-
-  p_vln_sample <- VlnPlot(
-    um_atlas,
-    features = "CytoTRACE2_Score",
-    group.by = "orig.ident",
-    cols = sample_colors_use,
-    sort = TRUE,
-    pt.size = 0
-  ) +
-    scale_y_continuous(
-      breaks = seq(0, 1, by = 0.2),
-      limits = c(0, 1),
-      sec.axis = sec_axis(
-        trans = ~.,
-        breaks = seq(0, 1, by = 1/12),
-        labels = c("", "Differentiated", "", "Unipotent", "",
-                   "Oligopotent", "", "Multipotent", "",
-                   "Pluripotent", "", "Totipotent", "")
-      )
-    ) +
-    labs(x = "Sample", y = "Potency Score") +
-    ggtitle("Developmental Potential by Sample") +
-    theme(
-      legend.position = "None",
-      axis.text = element_text(size = 10),
-      axis.title = element_text(size = 12),
-      plot.title = element_text(size = 14, face = "bold", hjust = 0.5, margin = margin(b = 20)),
-      axis.ticks.y.right = element_line(
-        color = c("black", NA, "black", NA, "black", NA,
-                  "black", NA, "black", NA, "black", NA, "black")
-      ),
-      aspect.ratio = 0.8,
-      axis.ticks.length.y.right = unit(0.3, "cm")
-    )
-
-  print(p_vln_sample)
-  ggsave(file.path(output_dir, "violin_cytotrace2_sample.png"), p_vln_sample,
-         width = 12, height = 8, dpi = 300, bg = "white")
-
-} else {
-  cat("No 'Sample' column found in metadata. Skipping sample-level violin plot.\n")
+  rm(counts, norm); invisible(gc())
 }
 ```
 
-### Split by Sample and Cell Type
+```{r load}
+meta <- fread(META, select = c("cell", "orig.ident", "Sample", "Patient_nr", "origin", "majority_celltype", "Malignant",
+                               "primary_location", "location", "secondary_mutation", "Gender", "Age_atDiagnosisY"))
+ct <- qs2::qs_read(score_file, nthreads = 1)
+d <- merge(meta, ct[, .(cell, CytoTRACE2_Score, CytoTRACE2_Potency)], by = "cell")
+stopifnot(nrow(d) == nrow(meta), !anyNA(d$CytoTRACE2_Score), all(d$origin %in% ORIGINS))
+# Age is a patient attribute: non-malignant samples take their patient's age at diagnosis.
+age <- unique(d[!is.na(Age_atDiagnosisY), .(Patient_nr, age = Age_atDiagnosisY)])
+stopifnot("a patient has two ages" = !anyDuplicated(age$Patient_nr))
+d[age, age := i.age, on = "Patient_nr"]
+d[, age_class := factor(fcase(is.na(age), "unknown", age < 40, "<40", age < 60, "40-60", default = "≥60"), levels = AGES)]
+oi <- unique(d[, .(orig.ident, location, Gender, age_class)])
+stopifnot("orig.ident metadata not unique" = !anyDuplicated(oi$orig.ident))
+mel <- d[Malignant == "Malignant" | majority_celltype == "Melanocytes"]
+```
 
-```{r violin_split, fig.width = 16, fig.height = 9, eval = has_cytotrace2}
-if ("orig.ident" %in% colnames(um_atlas@meta.data)) {
+The atlas has `r nfmt(nrow(d))` cells from `r uniqueN(d$Sample)` libraries, `r uniqueN(d$orig.ident)` tumours/tissues and `r uniqueN(d$Patient_nr)` patients.
 
-  # Median statistic function
-  median.stat <- function(x) {
-    out <- quantile(x, probs = c(0.5))
-    names(out) <- c("ymed")
-    return(out)
-  }
+## Fig. 2c
 
-  p_vln_split <- VlnPlot(
-    um_atlas,
-    features = "CytoTRACE2_Score",
-    split.by = "orig.ident",  # Use orig.ident to merge biological replicates
-    group.by = celltype_col,
-    cols = celltype_colors,
-    sort = TRUE,
-    pt.size = 0
-  ) +
-    scale_y_continuous(
-      breaks = seq(0, 1, by = 0.2),
-      limits = c(0, 1),
-      sec.axis = sec_axis(
-        trans = ~.,
-        breaks = seq(0, 1, by = 1/12),
-        labels = c("", "Differentiated", "", "Unipotent", "",
-                   "Oligopotent", "", "Multipotent", "",
-                   "Pluripotent", "", "Totipotent", "")
-      )
-    ) +
-    labs(x = "Cell Type", y = "Potency Score") +
-    ggtitle("Developmental Potential by Cell Type and Sample") +
-    theme(
-      axis.text = element_text(size = 8),
-      axis.title = element_text(size = 12),
-      plot.title = element_text(size = 14, face = "bold", hjust = 0.5, margin = margin(b = 20)),
-      axis.text.x = element_text(angle = 45, hjust = 1),
-      axis.ticks.y.right = element_line(
-        color = c("black", NA, "black", NA, "black", NA,
-                  "black", NA, "black", NA, "black", NA, "black")
-      ),
-      aspect.ratio = 0.8,
-      axis.ticks.length.y.right = unit(0.3, "cm")
-    ) +
-    RestoreLegend() +
-    stat_summary(
-      fun.y = median.stat,
-      geom = "point",
-      size = 3,
-      colour = "white",
-      position = position_dodge(0.9),
-      key_glyph = "blank"
-    )
+```{r fig2c, fig.width = 9.5, fig.height = 7.5}
+um <- merge(fread(umap_file), d[, .(cell, CytoTRACE2_Potency)], by = "cell")
+stopifnot("UMAP misses cells" = nrow(um) == nrow(d))
+um[, pot := factor(CytoTRACE2_Potency, levels = potency_labels)]
+setorder(um, pot)   # higher potency drawn on top
+n_pot <- table(um$pot)
+p <- ggplot(um, aes(UMAP_1, UMAP_2, colour = pot)) + geom_scattermore(pointsize = 2.8, pixels = c(2400, 2400)) +
+  scale_colour_manual(values = potency_colors, drop = FALSE, name = "CytoTRACE2 potency",
+                      labels = sprintf("%s (%s)", names(n_pot), nfmt(as.integer(n_pot)))) +
+  guides(colour = guide_legend(override.aes = list(size = 4))) +
+  labs(title = "CytoTRACE2 potency", x = "UMAP 1", y = "UMAP 2",
+       caption = sprintf("All %s cells (%d libraries, %d patients).", nfmt(nrow(um)), uniqueN(d$Sample), uniqueN(d$Patient_nr))) +
+  thm + theme(aspect.ratio = 1)
+save_gg(p, "Fig2c_cytotrace_potency_umap", 9.5, 7.5)
+```
 
-  print(p_vln_split)
-  ggsave(file.path(output_dir, "violin_cytotrace2_split.png"), p_vln_split,
-         width = 16, height = 9, dpi = 300, bg = "white")
+## Fig. 2d
 
-} else {
-  cat("No 'Sample' column found in metadata. Skipping split violin plot.\n")
+```{r fig2d, fig.width = 11, fig.height = 7}
+ord <- d[, .(m = median(CytoTRACE2_Score)), by = majority_celltype][order(-m), majority_celltype]
+n_ct <- d[, .N, by = majority_celltype][, setNames(N, majority_celltype)]
+p <- ggplot(d, aes(factor(majority_celltype, levels = ord), CytoTRACE2_Score, fill = majority_celltype)) +
+  geom_violin(scale = "width", linewidth = 0.3) +
+  stat_summary(fun = median, fun.min = median, fun.max = median, geom = "crossbar", width = 0.5, linewidth = 0.3) +
+  scale_fill_manual(values = majority_celltype_col, guide = "none") +
+  scale_x_discrete(labels = sprintf("%s (%s)", ord, nfmt(n_ct[ord]))) +
+  labs(title = "CytoTRACE2 score by cell type", x = NULL, y = "CytoTRACE2 score",
+       caption = sprintf("All %s cells, cell level; bar = median. Descriptive, no test.", nfmt(nrow(d)))) +
+  thm + theme(axis.text.x = element_text(angle = 45, hjust = 1), plot.margin = margin(5.5, 5.5, 5.5, 60))
+save_gg(p, "Fig2d_cytotrace_violin_celltype", 11, 7)
+```
+
+## Fig. 2e
+
+Melanocytic cells by disease stage; points coloured by location, sized by cell number.
+
+```{r fig2e}
+u_or <- units(mel[, .(orig.ident, Patient_nr, origin, v = CytoTRACE2_Score)], "origin")
+tests$f2e <- with_bh(pat_tests(u_or, "origin", ORIGINS, "Fig2e_cytotrace_by_origin_location"))
+n_shared <- length(intersect(u_or$pat[origin == "non-malignant", Patient_nr], u_or$pat[origin == "primary", Patient_nr]))
+note_or <- sprintf("Melanoma cells of tumours, melanocytes of non-malignant tissue. %d patients give both a non-malignant and a primary unit.", n_shared)
+save_gg(box_panel(u_or, "origin", ORIGINS, tests$f2e, "CytoTRACE2 by disease stage", "Mean CytoTRACE2 score",
+                  colour = "location", colour_values = location_colors, colour_name = "Location", size_cells = TRUE, note = note_or),
+        "Fig2e_cytotrace_by_origin_location", 7.5, 6.5)
+```
+
+## Fig. 2i
+
+Malignant cells of primary tumours by uveal location.
+
+```{r fig2i, fig.width = 7}
+u_loc <- units(d[Malignant == "Malignant" & origin == "primary", .(orig.ident, Patient_nr, primary_location, v = CytoTRACE2_Score)],
+               "primary_location")
+tests$f2i <- with_bh(pat_tests(u_loc, "primary_location", LOC3, "Fig2i_cytotrace_pUM_location"))
+save_gg(box_panel(u_loc, "primary_location", LOC3, tests$f2i, "CytoTRACE2 in primary UM by location",
+                  "Mean CytoTRACE2 score, malignant cells", fill = primary_location_colors, width = 7),
+        "Fig2i_cytotrace_pUM_location", 7, 6.5)
+```
+
+## Suppl. Fig. 4 {.tabset}
+
+### a, b: age class and gender
+
+Age class and gender compared within each disease stage (melanocytic cells, points coloured by location). BH over all
+comparisons of the figure. Age classes need >= 2 patients to be tested; unknown age is shown, not tested.
+
+```{r sfig4ab, fig.width = 14, fig.height = 6.5}
+by_stage <- function(col, levels, test_lv, fill, id, title, note, min_pat = 3) {
+  loc_all <- intersect(names(location_colors), unique(oi$location))
+  us <- lapply(setNames(ORIGINS, ORIGINS), function(o)
+    units(mel[origin == o, .(orig.ident, Patient_nr, g = as.character(get(col)), v = CytoTRACE2_Score)], "g"))
+  tt <- rbindlist(lapply(ORIGINS, function(o) pat_tests(us[[o]], "g", test_lv, paste0(id, ":", o), min_pat)))
+  tt[, padj := p.adjust(p, "BH")]
+  ps <- lapply(ORIGINS, function(o) {
+    p <- box_panel(us[[o]], "g", levels, tt[panel == paste0(id, ":", o)], o, if (o == ORIGINS[1]) "Mean CytoTRACE2 score" else NULL,
+                   fill = fill, colour = "location", colour_values = location_colors, colour_name = "Location")
+    p$layers[[2]]$show.legend <- TRUE   # every location key in every panel, so patchwork collects one legend
+    p + labs(caption = NULL) + theme(axis.text.x = element_text(size = 9)) + guides(fill = "none") +
+      suppressMessages(scale_colour_manual(values = location_colors, name = "Location", drop = FALSE, limits = loc_all))
+  })
+  cap <- sprintf("One point per orig.ident with >= %d cells, coloured by location; Wilcoxon rank-sum on patient means within each stage, two-sided, BH-adjusted across all %d comparisons in the figure. n = orig.ident (patients). %s",
+                 MIN_CELLS, nrow(tt), note)
+  nlv <- sapply(ORIGINS, function(o) sum(levels %in% us[[o]]$pts$g))
+  print(save_gg(wrap_plots(ps, nrow = 1, widths = nlv, guides = "collect") +
+                  plot_annotation(title = title, caption = wrap_cap(cap, 13), theme = thm), id, 14, 6.5))
+  tt
 }
+tests$s4a <- by_stage("age_class", AGES, AGES[1:3], age_colors, "SFig4a_cytotrace_age_by_stage",
+                      "CytoTRACE2 by age class within disease stage",
+                      sprintf("%s Unknown age (%d patients) shown, not tested.", note_or, uniqueN(d[is.na(age), Patient_nr])), min_pat = 2)
+tests$s4b <- by_stage("Gender", c("F", "M"), c("F", "M"), gender_col, "SFig4b_cytotrace_gender_by_stage",
+                      "CytoTRACE2 by gender within disease stage", note_or)
 ```
 
-## Metadata Comparisons {.tabset}
+Fig. 2e with the points coloured by age class and by gender (tests as Fig. 2e).
 
-### By Origin (Healthy, Primary, Metastasis)
-
-```{r violin_origin, fig.width = 12, fig.height = 8, eval = has_cytotrace2}
-if ("origin" %in% colnames(um_atlas@meta.data)) {
-
-  cat("Origin distribution:\n")
-  print(table(um_atlas$origin))
-
-  # Enforce disease progression order: healthy → primary → metastasis
-  um_atlas$origin <- factor(um_atlas$origin, levels = c("healthy", "primary", "metastasis"))
-
-  # Violin plot with medians (using Victoria's origin_colors)
-  p_origin <- VlnPlot(
-    um_atlas,
-    features = "CytoTRACE2_Score",
-    group.by = "origin",
-    pt.size = 0,
-    cols = origin_colors
-  ) +
-    scale_x_discrete(limits = origin_order) +
-    scale_y_continuous(
-      breaks = seq(0, 1, by = 0.2),
-      limits = c(0, 1),
-      sec.axis = sec_axis(
-        trans = ~.,
-        breaks = seq(0, 1, by = 1/12),
-        labels = c("", "Differentiated", "", "Unipotent", "",
-                   "Oligopotent", "", "Multipotent", "",
-                   "Pluripotent", "", "Totipotent", "")
-      )
-    ) +
-    stat_summary(fun = median, geom = "crossbar", width = 0.5, color = "black", linewidth = 0.8) +
-    labs(title = "CytoTRACE2 Score by Sample Origin (Healthy → Primary → Metastasis)",
-         x = "Origin", y = "Potency Score") +
-    theme(
-      axis.text = element_text(size = 12),
-      axis.title = element_text(size = 14),
-      plot.title = element_text(size = 14, face = "bold", hjust = 0.5, margin = margin(b = 20)),
-      axis.ticks.y.right = element_line(
-        color = c("black", NA, "black", NA, "black", NA,
-                  "black", NA, "black", NA, "black", NA, "black")
-      ),
-      axis.ticks.length.y.right = unit(0.3, "cm")
-    )
-
-  print(p_origin)
-  ggsave(file.path(output_dir, "violin_cytotrace2_origin.png"), p_origin,
-         width = 12, height = 8, dpi = 300, bg = "white")
-
-  # Statistical summary
-  origin_stats <- um_atlas@meta.data |>
-    dplyr::group_by(origin) |>
-    dplyr::summarise(
-      n_cells = n(),
-      mean_potency = mean(CytoTRACE2_Score, na.rm = TRUE),
-      median_potency = median(CytoTRACE2_Score, na.rm = TRUE),
-      sd_potency = sd(CytoTRACE2_Score, na.rm = TRUE),
-      .groups = "drop"
-    )
-
-  cat("\nCytoTRACE2 statistics by origin:\n")
-  print(origin_stats)
-
-} else {
-  cat("No 'origin' column found in metadata.\n")
-}
+```{r sfig4ab_origin, fig.width = 15, fig.height = 6.5}
+p_age <- box_panel(u_or, "origin", ORIGINS, tests$f2e, "CytoTRACE2 by disease stage, age class", "Mean CytoTRACE2 score",
+                   colour = "age_class", colour_values = age_colors, colour_name = "Age at diagnosis", size_cells = TRUE, note = note_or)
+p_gen <- box_panel(u_or, "origin", ORIGINS, tests$f2e, "CytoTRACE2 by disease stage, gender", "Mean CytoTRACE2 score",
+                   colour = "Gender", colour_values = gender_col, colour_name = "Gender", size_cells = TRUE, note = note_or)
+save_gg(p_age, "SFig4a_cytotrace_origin_age", 7.5, 6.5) | save_gg(p_gen, "SFig4b_cytotrace_origin_gender", 7.5, 6.5)
 ```
 
-### By Primary Mutation
+### c: secondary mutation
 
-```{r violin_mutation, fig.width = 14, fig.height = 8, eval = has_cytotrace2}
-if ("primary_mutation" %in% colnames(um_atlas@meta.data)) {
+Malignant cells of primary and metastatic tumours by secondary mutation, coloured by gender.
 
-  cat("Primary mutation distribution:\n")
-  print(table(um_atlas$primary_mutation))
-
-  # Violin plot
-  p_mutation <- VlnPlot(
-    um_atlas,
-    features = "CytoTRACE2_Score",
-    group.by = "primary_mutation",
-    pt.size = 0
-  ) +
-    scale_y_continuous(
-      breaks = seq(0, 1, by = 0.2),
-      limits = c(0, 1),
-      sec.axis = sec_axis(
-        trans = ~.,
-        breaks = seq(0, 1, by = 1/12),
-        labels = c("", "Differentiated", "", "Unipotent", "",
-                   "Oligopotent", "", "Multipotent", "",
-                   "Pluripotent", "", "Totipotent", "")
-      )
-    ) +
-    stat_summary(fun = median, geom = "crossbar", width = 0.5, color = "black", linewidth = 0.8) +
-    labs(title = "CytoTRACE2 Score by Primary Mutation",
-         x = "Primary Mutation", y = "Potency Score") +
-    theme(
-      axis.text = element_text(size = 11),
-      axis.title = element_text(size = 14),
-      axis.text.x = element_text(angle = 45, hjust = 1),
-      plot.title = element_text(size = 14, face = "bold", hjust = 0.5, margin = margin(b = 20)),
-      axis.ticks.y.right = element_line(
-        color = c("black", NA, "black", NA, "black", NA,
-                  "black", NA, "black", NA, "black", NA, "black")
-      ),
-      axis.ticks.length.y.right = unit(0.3, "cm")
-    )
-
-  print(p_mutation)
-  ggsave(file.path(output_dir, "violin_cytotrace2_mutation.png"), p_mutation,
-         width = 14, height = 8, dpi = 300, bg = "white")
-
-  # Statistical summary
-  mutation_stats <- um_atlas@meta.data |>
-    dplyr::group_by(primary_mutation) |>
-    dplyr::summarise(
-      n_cells = n(),
-      mean_potency = mean(CytoTRACE2_Score, na.rm = TRUE),
-      median_potency = median(CytoTRACE2_Score, na.rm = TRUE),
-      sd_potency = sd(CytoTRACE2_Score, na.rm = TRUE),
-      .groups = "drop"
-    ) |>
-    dplyr::arrange(desc(n_cells))
-
-  cat("\nCytoTRACE2 statistics by primary mutation:\n")
-  print(mutation_stats)
-
-} else {
-  cat("No 'primary_mutation' column found in metadata.\n")
-}
+```{r sfig4c}
+u_mut <- units(d[Malignant == "Malignant" & secondary_mutation %in% MUTS,
+                 .(orig.ident, Patient_nr, secondary_mutation, v = CytoTRACE2_Score)], "secondary_mutation")
+u_mut$pts <- merge(u_mut$pts, unique(d[, .(orig.ident, origin)]), by = "orig.ident")
+tests$s4c <- with_bh(pat_tests(u_mut, "secondary_mutation", MUTS, "SFig4c_cytotrace_secondary_mutation_gender"))
+save_gg(box_panel(u_mut, "secondary_mutation", MUTS, tests$s4c, "CytoTRACE2 by secondary mutation",
+                  "Mean CytoTRACE2 score, malignant cells", fill = second_mutations_col, colour = "Gender",
+                  colour_values = gender_col, colour_name = "Gender", shape = "origin",
+                  note = sprintf("Primary and metastatic tumours: %d of the BAP1 points are metastases.",
+                                 u_mut$pts[secondary_mutation == "BAP1" & origin == "metastasis", .N])),
+        "SFig4c_cytotrace_secondary_mutation_gender", 7.5, 6.5)
 ```
 
-### By Organ
+### c: secondary mutation, choroidal primaries
 
-```{r violin_organ, fig.width = 12, fig.height = 8, eval = has_cytotrace2}
-if ("organ" %in% colnames(um_atlas@meta.data)) {
+Choroidal primary tumours only, so that uveal location does not confound the comparison. One point per patient (mean over
+its malignant cells), BH over the 3 tests of the panel.
 
-  cat("Organ distribution:\n")
-  print(table(um_atlas$organ))
-
-  # Violin plot
-  p_organ <- VlnPlot(
-    um_atlas,
-    features = "CytoTRACE2_Score",
-    group.by = "organ",
-    pt.size = 0,
-    cols = c("eye" = "#377EB8", "liver" = "#E41A1C", "brain" = "#984EA3",
-             "skin" = "#FF7F00", "thyroid" = "#4DAF4A")
-  ) +
-    scale_y_continuous(
-      breaks = seq(0, 1, by = 0.2),
-      limits = c(0, 1),
-      sec.axis = sec_axis(
-        trans = ~.,
-        breaks = seq(0, 1, by = 1/12),
-        labels = c("", "Differentiated", "", "Unipotent", "",
-                   "Oligopotent", "", "Multipotent", "",
-                   "Pluripotent", "", "Totipotent", "")
-      )
-    ) +
-    stat_summary(fun = median, geom = "crossbar", width = 0.5, color = "black", linewidth = 0.8) +
-    labs(title = "CytoTRACE2 Score by Organ",
-         x = "Organ", y = "Potency Score") +
-    theme(
-      axis.text = element_text(size = 12),
-      axis.title = element_text(size = 14),
-      plot.title = element_text(size = 14, face = "bold", hjust = 0.5, margin = margin(b = 20)),
-      axis.ticks.y.right = element_line(
-        color = c("black", NA, "black", NA, "black", NA,
-                  "black", NA, "black", NA, "black", NA, "black")
-      ),
-      axis.ticks.length.y.right = unit(0.3, "cm")
-    )
-
-  print(p_organ)
-  ggsave(file.path(output_dir, "violin_cytotrace2_organ.png"), p_organ,
-         width = 12, height = 8, dpi = 300, bg = "white")
-
-  # Statistical summary
-  organ_stats <- um_atlas@meta.data |>
-    dplyr::group_by(organ) |>
-    dplyr::summarise(
-      n_cells = n(),
-      mean_potency = mean(CytoTRACE2_Score, na.rm = TRUE),
-      median_potency = median(CytoTRACE2_Score, na.rm = TRUE),
-      sd_potency = sd(CytoTRACE2_Score, na.rm = TRUE),
-      .groups = "drop"
-    ) |>
-    dplyr::arrange(desc(n_cells))
-
-  cat("\nCytoTRACE2 statistics by organ:\n")
-  print(organ_stats)
-
-} else {
-  cat("No 'organ' column found in metadata.\n")
-}
+```{r sfig4c_choroid, fig.width = 6.5}
+pat <- d[Malignant == "Malignant" & origin == "primary" & primary_location == "choroid",
+         .(score = mean(CytoTRACE2_Score), secondary_mutation = secondary_mutation[1], n_mut = uniqueN(secondary_mutation)), by = Patient_nr]
+stopifnot("a patient has two secondary mutations" = all(pat$n_mut == 1))
+pat <- pat[secondary_mutation %in% MUTS][, x := factor(secondary_mutation, levels = MUTS)]
+n_pa <- table(pat$x)
+tt_ch <- rbindlist(lapply(combn(MUTS, 2, simplify = FALSE), function(g) {
+  a <- pat[x == g[1], score]; b <- pat[x == g[2], score]
+  data.table(panel = "SFig4c_cytotrace_choroid_pUM_secondary_mutation", group1 = g[1], group2 = g[2], n_patients1 = length(a),
+             n_patients2 = length(b), median1 = median(a), median2 = median(b), p = suppressWarnings(wilcox.test(a, b)$p.value))
+}))
+tests$s4c_choroid <- with_bh(tt_ch)
+cap <- "Malignant cells of choroidal primary tumours. One point per patient (mean CytoTRACE2 score over its malignant cells); Wilcoxon rank-sum on patient means, two-sided, BH-adjusted within the panel (3 tests). n = patients."
+p <- ggplot(pat, aes(x, score)) +
+  geom_boxplot(aes(fill = x), alpha = 0.45, outlier.shape = NA, width = 0.6, show.legend = FALSE) +
+  geom_quasirandom(width = 0.22, size = 2.2, alpha = 0.85) +
+  geom_signif(comparisons = unname(Map(c, tt_ch$group1, tt_ch$group2)), annotations = signif_label_adj(tt_ch$padj),
+              step_increase = 0.11, tip_length = 0.01, textsize = 3.2, vjust = -0.2) +
+  scale_fill_manual(values = second_mutations_col) +
+  scale_x_discrete(labels = setNames(sprintf("%s\nn = %d", MUTS, as.integer(n_pa[MUTS])), MUTS)) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.4))) +
+  labs(title = "CytoTRACE2 by secondary mutation, choroidal pUM", x = NULL, y = "Mean CytoTRACE2 score, malignant cells",
+       caption = wrap_cap(cap, 6.5)) + thm
+save_gg(p, "SFig4c_cytotrace_choroid_pUM_secondary_mutation", 6.5, 6.5)
 ```
 
-### By Location (pUM Focus)
-
-```{r violin_location, fig.width = 16, fig.height = 8, eval = has_cytotrace2}
-if ("location" %in% colnames(um_atlas@meta.data)) {
-
-  cat("Location distribution:\n")
-  print(table(um_atlas$location))
-
-  # Violin plot for all locations
-  p_location <- VlnPlot(
-    um_atlas,
-    features = "CytoTRACE2_Score",
-    group.by = "location",
-    pt.size = 0
-  ) +
-    scale_y_continuous(
-      breaks = seq(0, 1, by = 0.2),
-      limits = c(0, 1),
-      sec.axis = sec_axis(
-        trans = ~.,
-        breaks = seq(0, 1, by = 1/12),
-        labels = c("", "Differentiated", "", "Unipotent", "",
-                   "Oligopotent", "", "Multipotent", "",
-                   "Pluripotent", "", "Totipotent", "")
-      )
-    ) +
-    stat_summary(fun = median, geom = "crossbar", width = 0.5, color = "black", linewidth = 0.8) +
-    labs(title = "CytoTRACE2 Score by Anatomical Location",
-         x = "Location", y = "Potency Score") +
-    theme(
-      axis.text = element_text(size = 9),
-      axis.title = element_text(size = 14),
-      axis.text.x = element_text(angle = 45, hjust = 1),
-      plot.title = element_text(size = 14, face = "bold", hjust = 0.5, margin = margin(b = 20)),
-      axis.ticks.y.right = element_line(
-        color = c("black", NA, "black", NA, "black", NA,
-                  "black", NA, "black", NA, "black", NA, "black")
-      ),
-      axis.ticks.length.y.right = unit(0.3, "cm")
-    )
-
-  print(p_location)
-  ggsave(file.path(output_dir, "violin_cytotrace2_location.png"), p_location,
-         width = 16, height = 8, dpi = 300, bg = "white")
-
-  # Statistical summary
-  location_stats <- um_atlas@meta.data |>
-    dplyr::group_by(location) |>
-    dplyr::summarise(
-      n_cells = n(),
-      mean_potency = mean(CytoTRACE2_Score, na.rm = TRUE),
-      median_potency = median(CytoTRACE2_Score, na.rm = TRUE),
-      sd_potency = sd(CytoTRACE2_Score, na.rm = TRUE),
-      .groups = "drop"
-    ) |>
-    dplyr::arrange(desc(n_cells))
-
-  cat("\nCytoTRACE2 statistics by location:\n")
-  print(location_stats)
-
-  # Focus on pUM locations (Choroid, Iris, Ciliary Body)
-  pum_locations <- c("choroid", "iris", "ciliary body")
-  if (any(tolower(um_atlas$location) %in% pum_locations)) {
-
-    um_atlas_pum <- subset(um_atlas, subset = tolower(location) %in% pum_locations)
-
-    cat("\n\nFocus on pUM locations (Choroid, Iris, Ciliary Body):\n")
-    cat("Number of cells:", ncol(um_atlas_pum), "\n")
-    print(table(um_atlas_pum$location))
-
-    p_pum_location <- VlnPlot(
-      um_atlas_pum,
-      features = "CytoTRACE2_Score",
-      group.by = "location",
-      pt.size = 0,
-      cols = c("choroid" = "#E41A1C", "iris" = "#377EB8", "ciliary body" = "#4DAF4A")
-    ) +
-      scale_y_continuous(
-        breaks = seq(0, 1, by = 0.2),
-        limits = c(0, 1),
-        sec.axis = sec_axis(
-          trans = ~.,
-          breaks = seq(0, 1, by = 1/12),
-          labels = c("", "Differentiated", "", "Unipotent", "",
-                     "Oligopotent", "", "Multipotent", "",
-                     "Pluripotent", "", "Totipotent", "")
-        )
-      ) +
-      stat_summary(fun = median, geom = "crossbar", width = 0.5, color = "black", linewidth = 0.8) +
-      labs(title = "CytoTRACE2 Score in pUM Locations (Choroid, Iris, Ciliary Body)",
-           x = "pUM Location", y = "Potency Score") +
-      theme(
-        axis.text = element_text(size = 12),
-        axis.title = element_text(size = 14),
-        plot.title = element_text(size = 14, face = "bold", hjust = 0.5, margin = margin(b = 20)),
-        axis.ticks.y.right = element_line(
-          color = c("black", NA, "black", NA, "black", NA,
-                    "black", NA, "black", NA, "black", NA, "black")
-        ),
-        axis.ticks.length.y.right = unit(0.3, "cm")
-      )
-
-    print(p_pum_location)
-    ggsave(file.path(output_dir, "violin_cytotrace2_pum_locations.png"), p_pum_location,
-           width = 10, height = 8, dpi = 300, bg = "white")
-
-    pum_location_stats <- um_atlas_pum@meta.data |>
-      dplyr::group_by(location) |>
-      dplyr::summarise(
-        n_cells = n(),
-        mean_potency = mean(CytoTRACE2_Score, na.rm = TRUE),
-        median_potency = median(CytoTRACE2_Score, na.rm = TRUE),
-        sd_potency = sd(CytoTRACE2_Score, na.rm = TRUE),
-        .groups = "drop"
-      )
-
-    cat("\nCytoTRACE2 statistics for pUM locations:\n")
-    print(pum_location_stats)
-  }
-
-} else {
-  cat("No 'location' column found in metadata.\n")
-}
+```{r write_tests, include = FALSE}
+out <- rbindlist(tests)[, .(panel, comparison = paste(group1, "vs", group2), n_patients1, n_patients2,
+                            median_patient_mean1 = median1, median_patient_mean2 = median2, p, p_adj_BH = padj)]
+fwrite(out, "tables/tests_cytotrace2.csv")
 ```
 
-### Sample-Level Dispersion
+## Suppl. Table 2
 
-```{r boxplot_patients, fig.width = 18, fig.height = 10, eval = has_cytotrace2}
-# Use orig.ident to merge biological replicates from same tumor
-if ("orig.ident" %in% colnames(um_atlas@meta.data)) {
+Stemness signature of malignant cells: the 50 genes most positively (Top) and most negatively (Bottom) correlated with the
+CytoTRACE2 score. The same signature is also written for non-malignant melanocytes and for all cells
+(`tables/stemness_signature_<set>_top50.csv`).
 
-  cat("Sample distribution (biological replicates merged):\n")
-  sample_counts <- table(um_atlas$orig.ident)
-  print(sample_counts)
-  cat("\nTotal samples:", length(sample_counts), "\n")
-
-  # Compute sample-level summary statistics
-  sample_stats <- um_atlas@meta.data |>
-    dplyr::group_by(orig.ident) |>
-    dplyr::summarise(
-      n_cells = n(),
-      mean_potency = mean(CytoTRACE2_Score, na.rm = TRUE),
-      median_potency = median(CytoTRACE2_Score, na.rm = TRUE),
-      sd_potency = sd(CytoTRACE2_Score, na.rm = TRUE),
-      origin = first(origin),
-      organ = first(organ),
-      primary_mutation = first(primary_mutation),
-      .groups = "drop"
-    ) |>
-    dplyr::rename(Sample = orig.ident) |>
-    dplyr::arrange(origin, organ)
-
-  # Boxplot by sample (ordered by origin)
-  p_sample_box <- ggplot(sample_stats, aes(x = reorder(Sample, mean_potency), y = mean_potency, fill = origin)) +
-    geom_boxplot(aes(group = origin), alpha = 0.3, outlier.shape = NA) +
-    geom_point(aes(color = origin, size = n_cells), alpha = 0.8) +
-    scale_fill_manual(values = origin_colors) +
-    scale_color_manual(values = origin_colors) +
-    scale_size_continuous(name = "Cell count", range = c(2, 8)) +
-    labs(
-      title = "Sample-Level CytoTRACE2 Mean Potency Score Distribution",
-      subtitle = "Points colored by origin, sized by cell count",
-      x = "Sample",
-      y = "Mean Potency Score"
-    ) +
-    theme_cowplot() +
-    theme(
-      axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 7),
-      plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
-      plot.subtitle = element_text(size = 11, hjust = 0.5),
-      legend.position = "right"
-    )
-
-  print(p_sample_box)
-  ggsave(file.path(output_dir, "boxplot_cytotrace2_samples.png"), p_sample_box,
-         width = 18, height = 10, dpi = 300, bg = "white")
-
-  # Save sample-level statistics
-  write.csv(sample_stats, file.path(output_dir, "cytotrace2_stats_by_sample.csv"), row.names = FALSE)
-  cat("\nSample-level statistics saved to:", file.path(output_dir, "cytotrace2_stats_by_sample.csv"), "\n")
-
-  # Summary by origin
-  origin_sample_summary <- sample_stats |>
-    dplyr::group_by(origin) |>
-    dplyr::summarise(
-      n_samples = n(),
-      mean_of_means = mean(mean_potency, na.rm = TRUE),
-      sd_of_means = sd(mean_potency, na.rm = TRUE),
-      median_of_medians = median(median_potency, na.rm = TRUE),
-      .groups = "drop"
-    )
-
-  cat("\nSample-level summary by origin:\n")
-  print(origin_sample_summary)
-
-  # Violin plot by sample (showing dispersion within each sample)
-  p_sample_violin <- VlnPlot(
-    um_atlas,
-    features = "CytoTRACE2_Score",
-    group.by = "orig.ident",
-    cols = sample_col,
-    pt.size = 0
-  ) +
-    labs(title = "CytoTRACE2 Score Distribution by Sample (Within-Sample Dispersion)",
-         x = "Sample", y = "Potency Score") +
-    theme(
-      axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 6),
-      plot.title = element_text(size = 14, face = "bold", hjust = 0.5)
-    )
-
-  print(p_sample_violin)
-  ggsave(file.path(output_dir, "violin_cytotrace2_samples_dispersion.png"), p_sample_violin,
-         width = 20, height = 8, dpi = 300, bg = "white")
-
-} else {
-  cat("No 'orig.ident' column found in metadata.\n")
-}
-```
-
-### Cell Type Statistics
-
-```{r celltype_stats, fig.width = 12, fig.height = 6, eval = has_cytotrace2}
-# Using majority_celltype as the official cell type annotation
-cat("Cell type distribution (majority_celltype):\n")
-print(table(um_atlas$majority_celltype))
-
-# Statistical summary by cell type
-majority_stats <- um_atlas@meta.data |>
-  dplyr::group_by(majority_celltype) |>
-  dplyr::summarise(
-    n_cells = n(),
-    mean_potency = mean(CytoTRACE2_Score, na.rm = TRUE),
-    median_potency = median(CytoTRACE2_Score, na.rm = TRUE),
-    sd_potency = sd(CytoTRACE2_Score, na.rm = TRUE),
-    .groups = "drop"
-  ) |>
-  dplyr::arrange(desc(median_potency))
-
-cat("\nCytoTRACE2 statistics by cell type (sorted by median potency):\n")
-print(majority_stats)
-
-# Save stats
-write.csv(majority_stats, file.path(output_dir, "cytotrace2_stats_by_celltype.csv"), row.names = FALSE)
-```
-
-## Compositional Analysis {.tabset}
-
-### Potency by Cell Type
-
-```{r barplot_celltype, fig.width = 12, fig.height = 7, eval = has_cytotrace2}
-p_bar_celltype <- dittoBarPlot(
-  um_atlas,
-  var = "CytoTRACE2_Potency",
-  group.by = celltype_col,
-  color.panel = colors.cyto
-) +
-  ggtitle("CytoTRACE2 Potency Composition by Cell Type") +
-  theme(
-    plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
-    axis.text.x = element_text(angle = 45, hjust = 1)
-  )
-
-print(p_bar_celltype)
-ggsave(file.path(output_dir, "barplot_potency_celltype.png"), p_bar_celltype,
-       width = 12, height = 7, dpi = 300, bg = "white")
-```
-
-### Potency by Cell Type (Counts)
-
-```{r barplot_celltype_counts, fig.width = 12, fig.height = 7, eval = has_cytotrace2}
-p_bar_counts <- dittoBarPlot(
-  um_atlas,
-  var = "CytoTRACE2_Potency",
-  group.by = celltype_col,
-  color.panel = colors.cyto,
-  scale = "count"
-) +
-  ggtitle("CytoTRACE2 Potency Counts by Cell Type") +
-  theme(
-    plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
-    axis.text.x = element_text(angle = 45, hjust = 1)
-  )
-
-print(p_bar_counts)
-ggsave(file.path(output_dir, "barplot_potency_celltype_counts.png"), p_bar_counts,
-       width = 12, height = 7, dpi = 300, bg = "white")
-```
-
-### Potency by Sample (if available)
-
-```{r barplot_sample, fig.width = 12, fig.height = 7, eval = has_cytotrace2}
-# Use orig.ident to merge biological replicates from same tumor
-if ("orig.ident" %in% colnames(um_atlas@meta.data)) {
-
-  p_bar_sample <- dittoBarPlot(
-    um_atlas,
-    var = "CytoTRACE2_Potency",
-    group.by = celltype_col,
-    split.by = "orig.ident",
-    color.panel = colors.cyto
-  ) +
-    ggtitle("CytoTRACE2 Potency by Cell Type and Sample") +
-    theme(
-      plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
-      axis.text.x = element_text(angle = 45, hjust = 1)
-    )
-
-  print(p_bar_sample)
-  ggsave(file.path(output_dir, "barplot_potency_sample.png"), p_bar_sample,
-         width = 12, height = 7, dpi = 300, bg = "white")
-
-} else {
-  cat("No 'Sample' column found in metadata. Skipping sample-level bar plot.\n")
-}
-```
-
-## Gene Correlation Analysis {.tabset}
-
-### Top Stemness Markers
-
-Genes positively correlated with high CytoTRACE2 scores (stemness/undifferentiated state).
-
-```{r correlation_stemness, fig.width = 11, fig.height = 8, eval = has_cytotrace2}
-# Extract CytoTRACE2 scores
-cytotrace2_scores <- as.numeric(um_atlas@meta.data$CytoTRACE2_Score)
-
-# Extract RNA assay data (Seurat v5 syntax)
-expr_matrix <- GetAssayData(um_atlas, assay = "RNA", layer = "data")
-expr_matrix <- as.matrix(expr_matrix)
-
-# Calculate gene-wise correlations
-cat("Calculating correlations for", nrow(expr_matrix), "genes...\n")
-correlations <- apply(expr_matrix, 1, function(x) {
-  cor(cytotrace2_scores, x, use = "complete.obs")
+```{r stable2, fig.width = 10, fig.height = 11}
+sig <- lapply(setNames(names(SETS), names(SETS)), function(s) {
+  g <- fread(cor_file(s))
+  out <- rbind(g[order(-correlation)][1:50][, direction := "Top"],
+               g[order(correlation)][1:50][, direction := "Bottom"])[, .(gene, correlation, direction)]
+  fwrite(out, sprintf("tables/stemness_signature_%s_top50.csv", s))
+  out
 })
-
-# Create correlation dataframe
-cor_df <- data.frame(
-  gene = names(correlations),
-  correlation = correlations,
-  stringsAsFactors = FALSE
-) |>
-  dplyr::filter(!is.na(correlation)) |>
-  dplyr::arrange(desc(abs(correlation)))
-
-# Plot top positively correlated genes (stemness markers)
-p_stemness <- cor_df |>
-  dplyr::top_n(25, wt = correlation) |>
-  dplyr::arrange(desc(correlation)) |>
-  ggplot(aes(x = reorder(gene, correlation), y = correlation)) +
-  geom_col(fill = "deepskyblue") +
-  theme_cowplot() +
-  ggtitle("Top 25 Genes Correlated with Stemness (High CytoTRACE2)") +
-  ylab("Correlation with CytoTRACE2 Score") +
-  xlab("") +
-  theme(
-    axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
-    plot.title = element_text(size = 14, face = "bold", hjust = 0.5)
-  )
-
-print(p_stemness)
-ggsave(file.path(output_dir, "genes_correlated_stemness.png"), p_stemness,
-       width = 11, height = 8, dpi = 300, bg = "white")
+n_mal <- d[Malignant == "Malignant", .N]
+ggplot(sig$malignant, aes(correlation, reorder(gene, correlation), fill = direction)) + geom_col(width = 0.8) +
+  facet_wrap(~ factor(direction, c("Top", "Bottom")), scales = "free_y") +
+  scale_fill_manual(values = c(Top = "firebrick3", Bottom = "steelblue4"), guide = "none") +
+  labs(title = sprintf("Stemness signature, malignant cells (n = %s)", nfmt(n_mal)), x = "Pearson r with CytoTRACE2 score", y = NULL) +
+  thm + theme(axis.text.y = element_text(size = 7))
 ```
 
-### Top Differentiation Markers
+## Session info
 
-Genes negatively correlated with CytoTRACE2 scores (differentiation markers).
-
-```{r correlation_differentiation, fig.width = 11, fig.height = 8, eval = has_cytotrace2}
-# Plot top negatively correlated genes (differentiation markers)
-p_diff <- cor_df |>
-  dplyr::top_n(25, wt = -correlation) |>
-  dplyr::arrange(correlation) |>
-  ggplot(aes(x = reorder(gene, correlation), y = correlation)) +
-  geom_col(fill = "salmon") +
-  theme_cowplot() +
-  ggtitle("Top 25 Genes Correlated with Differentiation (Low CytoTRACE2)") +
-  ylab("Correlation with CytoTRACE2 Score") +
-  xlab("") +
-  theme(
-    axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
-    plot.title = element_text(size = 14, face = "bold", hjust = 0.5)
-  )
-
-print(p_diff)
-ggsave(file.path(output_dir, "genes_correlated_differentiation.png"), p_diff,
-       width = 11, height = 8, dpi = 300, bg = "white")
-```
-
-### Combined Plot
-
-```{r correlation_combined, fig.width = 11, fig.height = 15, eval = has_cytotrace2}
-p_combined <- p_stemness / p_diff
-print(p_combined)
-ggsave(file.path(output_dir, "genes_correlated_combined.png"), p_combined,
-       width = 11, height = 15, dpi = 300, bg = "white")
-```
-
-### Export Correlation Table
-
-```{r export_correlations, eval = has_cytotrace2}
-# Export full correlation table
-cor_output <- file.path(output_dir, "cytotrace2_gene_correlations.csv")
-write.csv(cor_df, cor_output, row.names = FALSE)
-cat("Saved gene correlation table to:", cor_output, "\n")
-
-# Display top 10 in each direction
-cat("\nTop 10 stemness markers:\n")
-print(cor_df |> dplyr::top_n(10, wt = correlation) |> dplyr::arrange(desc(correlation)))
-
-cat("\nTop 10 differentiation markers:\n")
-print(cor_df |> dplyr::top_n(10, wt = -correlation) |> dplyr::arrange(correlation))
-```
-
-## Malignant Cell Analysis (if applicable) {.tabset}
-
-### Identify Malignant Population
-
-```{r identify_malignant, eval = has_cytotrace2}
-# Identify melanocytic cells: healthy melanocytes + malignant melanoma cells
-has_malignant <- FALSE
-malignant_subset <- NULL
-
-if ("majority_celltype" %in% colnames(um_atlas@meta.data)) {
-  cat("Checking for Melanocytes and Melanoma cells in majority_celltype...\n")
-  cat("\nmajority_celltype distribution:\n")
-  print(table(um_atlas@meta.data$majority_celltype))
-
-  # Check if both "Melanocytes" and "Melanoma cells" categories exist
-  melanocytic_celltypes <- c("Melanocytes", "Melanoma cells")
-  available_types <- intersect(melanocytic_celltypes, unique(um_atlas@meta.data$majority_celltype))
-
-  if (length(available_types) > 0) {
-    malignant_subset <- subset(um_atlas, subset = majority_celltype %in% available_types)
-
-    # Remove 2 erroneous melanocytes from mUM15 metastasis sample
-    # These cells lack CNV data and were misclassified (should not be in metastasis)
-    erroneous_cells <- c("mUM15_TAAGAGACAGCTCCGA-1_48", "mUM15_GTCACGGGTGTGTGCC-1_48")
-    cells_before <- ncol(malignant_subset)
-    malignant_subset <- malignant_subset[, !colnames(malignant_subset) %in% erroneous_cells]
-    cells_after <- ncol(malignant_subset)
-
-    has_malignant <- TRUE
-    cat("\n✅ Identified melanocytic cells:\n")
-    print(table(malignant_subset$majority_celltype))
-    cat("Total cells:", cells_after, "(removed", cells_before - cells_after, "erroneous cells from mUM15)\n")
-
-    cat("\nBy origin:\n")
-    origin_table <- table(malignant_subset$origin, malignant_subset$majority_celltype)
-    print(origin_table)
-    cat("\nTotal by origin:\n")
-    print(rowSums(origin_table))
-  } else {
-    cat("\n⚠️ Neither 'Melanocytes' nor 'Melanoma cells' categories found in majority_celltype.\n")
-    cat("Available categories:", paste(unique(um_atlas@meta.data$majority_celltype), collapse = ", "), "\n")
-  }
-} else {
-  cat("\n❌ majority_celltype column not found in metadata.\n")
-}
-
-if (!has_malignant) {
-  cat("\nNo melanocytic cell population identified. Skipping melanocytic-specific analysis.\n")
-}
-```
-
-### Malignant Cell UMAP
-
-```{r malignant_umap, fig.width = 10, fig.height = 8, eval = has_malignant}
-if (has_malignant) {
-  p_mal_umap <- FeaturePlot(
-    malignant_subset,
-    reduction = "umap",
-    features = "CytoTRACE2_Score",
-    raster = FALSE
-  ) +
-    scale_colour_gradientn(
-      colours = c("#000004FF", "#3B0F70FF", "#8C2981FF",
-                  "#DE4968FF", "#FE9F6DFF", "#FCFDBFFF"),
-      na.value = "transparent",
-      limits = c(0, 1),
-      breaks = seq(0, 1, by = 0.2),
-      labels = c("0.0 (More diff.)", "0.2", "0.4", "0.6", "0.8", "1.0 (Less diff.)"),
-      name = "CytoTRACE2\nScore",
-      guide = guide_colorbar(frame.colour = "black", ticks.colour = "black")
-    ) +
-    coord_fixed() +
-    ggtitle("CytoTRACE 2 Score - Malignant Cells") +
-    xlab("UMAP1") + ylab("UMAP2")
-
-  print(p_mal_umap)
-  ggsave(file.path(output_dir, "umap_cytotrace2_malignant.png"), p_mal_umap,
-         width = 10, height = 8, dpi = 300, bg = "white")
-}
-```
-
-### Malignant Gene Correlations
-
-```{r malignant_correlations, fig.width = 11, fig.height = 15, eval = has_malignant}
-if (has_malignant) {
-
-  # Function for correlation analysis
-  correlation_plot <- function(data, title_suffix) {
-    expr_matrix <- GetAssayData(data, assay = "RNA", layer = "data")
-    expr_matrix <- as.matrix(expr_matrix)
-
-    score <- as.numeric(data@meta.data$CytoTRACE2_Score)
-
-    correlations <- apply(expr_matrix, 1, function(x) {
-      cor(score, x, use = "complete.obs")
-    })
-
-    cor_df <- data.frame(
-      gene = names(correlations),
-      correlation = correlations,
-      stringsAsFactors = FALSE
-    ) |>
-      dplyr::filter(!is.na(correlation))
-
-    p1 <- cor_df |>
-      dplyr::top_n(20, wt = correlation) |>
-      dplyr::arrange(desc(correlation)) |>
-      ggplot(aes(x = reorder(gene, correlation), y = correlation)) +
-      geom_col(fill = "deepskyblue") +
-      theme_cowplot() +
-      ggtitle(paste("Genes Correlated with Stemness in", title_suffix)) +
-      ylab("Correlation") +
-      xlab("") +
-      theme(axis.text.x = element_text(angle = 45, hjust = 1))
-
-    p2 <- cor_df |>
-      dplyr::top_n(20, wt = -correlation) |>
-      dplyr::arrange(correlation) |>
-      ggplot(aes(x = reorder(gene, correlation), y = correlation)) +
-      geom_col(fill = "salmon") +
-      theme_cowplot() +
-      ggtitle(paste("Genes Anticorrelated with Stemness in", title_suffix)) +
-      ylab("Correlation") +
-      xlab("") +
-      theme(axis.text.x = element_text(angle = 45, hjust = 1))
-
-    list(combined = p1 / p2, cor_df = cor_df)
-  }
-
-  # Run analysis
-  mal_results <- correlation_plot(malignant_subset, "Malignant Cells")
-
-  print(mal_results$combined)
-  ggsave(file.path(output_dir, "genes_correlated_malignant.png"),
-         mal_results$combined,
-         width = 11, height = 15, dpi = 300, bg = "white")
-
-  # Export malignant correlation table
-  write.csv(
-    mal_results$cor_df |> dplyr::arrange(desc(abs(correlation))),
-    file.path(output_dir, "cytotrace2_malignant_gene_correlations.csv"),
-    row.names = FALSE
-  )
-
-  cat("\nTop malignant stemness markers:\n")
-  print(mal_results$cor_df |> dplyr::top_n(10, wt = correlation) |>
-          dplyr::arrange(desc(correlation)))
-}
-```
-
-### Healthy Melanocytes Only - Gene Correlations
-
-```{r healthy_melanocytes_correlation, fig.width = 11, fig.height = 15, eval = has_malignant}
-if (has_malignant) {
-  # Subset to healthy melanocytes only (origin == "healthy")
-  healthy_melanocytes <- subset(malignant_subset, subset = origin == "healthy")
-
-  cat("\n=== Healthy Melanocytes Gene Correlation Analysis ===\n")
-  cat("Total healthy melanocytes:", ncol(healthy_melanocytes), "\n")
-  cat("This analysis reveals normal melanocyte differentiation programs\n")
-  cat("without malignant transformation.\n\n")
-
-  # Run correlation analysis using the existing function
-  healthy_results <- correlation_plot(healthy_melanocytes, "Healthy Melanocytes")
-
-  print(healthy_results$combined)
-  ggsave(file.path(output_dir, "genes_correlated_healthy_melanocytes.png"),
-         healthy_results$combined,
-         width = 11, height = 15, dpi = 300, bg = "white")
-
-  # Export healthy melanocytes correlation table
-  write.csv(
-    healthy_results$cor_df |> dplyr::arrange(desc(abs(correlation))),
-    file.path(output_dir, "cytotrace2_healthy_melanocytes_gene_correlations.csv"),
-    row.names = FALSE
-  )
-
-  cat("\nTop healthy melanocyte stemness markers (positive correlations):\n")
-  print(healthy_results$cor_df |> dplyr::top_n(10, wt = correlation) |>
-          dplyr::arrange(desc(correlation)))
-
-  cat("\nTop healthy melanocyte differentiation markers (negative correlations):\n")
-  print(healthy_results$cor_df |> dplyr::top_n(10, wt = -correlation) |>
-          dplyr::arrange(correlation))
-}
-```
-
-## Melanocytic Cell Focus - UM Atlas Key Comparisons {.tabset}
-
-### Overview
-
-This section focuses on **melanocytic cells** (healthy melanocytes + malignant melanoma cells) to address the key biological questions of the UM atlas:
-
-1. **Disease progression** across healthy melanocytes → primary UM → metastatic UM (KEY COMPARISON)
-2. **Secondary mutations** in pUM tumors (BAP1, SF3B1, EIF1AX)
-3. **Anatomical locations** in pUM cohort (Choroid, Iris, Ciliary Body)
-
-```{r malignant_focus_overview, eval = has_malignant}
-if (has_malignant) {
-  cat("Melanocytic Cell Population Statistics:\n")
-  cat("========================================\n\n")
-  cat("Total melanocytic cells:", ncol(malignant_subset), "\n\n")
-
-  # Cell type distribution
-  cat("Cell type distribution:\n")
-  print(table(malignant_subset$majority_celltype))
-
-  # Secondary mutation distribution
-  cat("\n\nSecondary mutation distribution:\n")
-  print(table(malignant_subset$secondary_mutation))
-
-  cat("\n\nLocation distribution:\n")
-  print(table(malignant_subset$location))
-
-  cat("\n\nOrigin distribution:\n")
-  origin_celltype_table <- table(malignant_subset$origin, malignant_subset$majority_celltype)
-  print(origin_celltype_table)
-  cat("\nTotal by origin:\n")
-  print(rowSums(origin_celltype_table))
-}
-```
-
-### Secondary Mutations (BAP1, SF3B1, EIF1AX)
-
-```{r malignant_secondary_mutations, fig.width = 12, fig.height = 8, eval = has_malignant}
-if (has_malignant) {
-  # Filter to EIF1AX, SF3B1, BAP1 only (remove unknown and none)
-  mal_known_mut <- malignant_subset@meta.data |>
-    dplyr::filter(secondary_mutation %in% c("EIF1AX", "SF3B1", "BAP1")) |>
-    dplyr::mutate(secondary_mutation = factor(secondary_mutation,
-                                               levels = c("EIF1AX", "SF3B1", "BAP1")))
-
-  # Boxplot with statistical comparisons
-  p_mut <- ggplot(mal_known_mut,
-                   aes(x = secondary_mutation, y = CytoTRACE2_Score, fill = secondary_mutation)) +
-    geom_boxplot(alpha = 0.7, outlier.size = 0.5) +
-    scale_fill_manual(values = second_mutations_col) +
-    stat_compare_means(comparisons = list(c("EIF1AX", "SF3B1"), c("SF3B1", "BAP1"), c("EIF1AX", "BAP1")),
-                       method = "wilcox.test", label = "p.signif") +
-    theme_cowplot() +
-    ggtitle("CytoTRACE2 Scores by Secondary Mutation in Malignant Cells") +
-    xlab("Secondary Mutation") +
-    ylab("CytoTRACE2 Score") +
-    theme(legend.position = "none",
-          axis.text.x = element_text(size = 12, angle = 0))
-
-  print(p_mut)
-  ggsave(file.path(output_dir, "malignant_cytotrace2_secondary_mutations.png"), p_mut,
-         width = 12, height = 8, dpi = 300, bg = "white")
-
-  # Summary statistics
-  mut_stats <- mal_known_mut |>
-    dplyr::group_by(secondary_mutation) |>
-    dplyr::summarise(
-      n_cells = n(),
-      mean_score = mean(CytoTRACE2_Score, na.rm = TRUE),
-      sd_score = sd(CytoTRACE2_Score, na.rm = TRUE),
-      median_score = median(CytoTRACE2_Score, na.rm = TRUE),
-      .groups = "drop"
-    ) |>
-    dplyr::arrange(desc(mean_score))
-
-  cat("\nCytoTRACE2 Statistics by Secondary Mutation:\n")
-  print(mut_stats)
-
-  write.csv(mut_stats,
-            file.path(output_dir, "malignant_cytotrace2_stats_secondary_mutations.csv"),
-            row.names = FALSE)
-}
-```
-
-### pUM Anatomical Locations
-
-```{r malignant_pum_locations, fig.width = 12, fig.height = 10, eval = has_malignant}
-if (has_malignant) {
-  library(ggpubr)
-
-  # Focus on primary UM locations: choroid, iris, ciliary body
-  pum_locations <- c("choroid", "ciliary body", "iris")
-  mal_pum <- subset(malignant_subset, subset = location %in% pum_locations)
-
-  if (ncol(mal_pum) > 0) {
-    # Statistical tests
-    cat("=== Statistical Analysis: CytoTRACE2 Scores by Intraocular Location ===\n\n")
-
-    # Kruskal-Wallis test (non-parametric, 3+ groups)
-    kw_test <- kruskal.test(CytoTRACE2_Score ~ location, data = mal_pum@meta.data)
-    cat("Kruskal-Wallis test:\n")
-    cat("  Chi-squared =", round(kw_test$statistic, 2), "\n")
-    cat("  df =", kw_test$parameter, "\n")
-    cat("  p-value =", format(kw_test$p.value, scientific = TRUE, digits = 3), "\n\n")
-
-    # Pairwise Wilcoxon with Bonferroni correction
-    pairwise_tests <- pairwise.wilcox.test(
-      mal_pum@meta.data$CytoTRACE2_Score,
-      mal_pum@meta.data$location,
-      p.adjust.method = "bonferroni"
-    )
-    cat("Pairwise Wilcoxon tests (Bonferroni corrected):\n")
-    print(pairwise_tests)
-    cat("\n")
-
-    # Violin plot with statistical annotations (Victoria's location colors)
-    comparisons_list <- list(c("choroid", "iris"), c("ciliary body", "iris"), c("choroid", "ciliary body"))
-
-    p_loc <- ggplot(mal_pum@meta.data,
-                     aes(x = location, y = CytoTRACE2_Score, fill = location)) +
-      geom_violin(alpha = 0.7, scale = "width") +
-      geom_boxplot(width = 0.2, outlier.size = 0.5, alpha = 0.5) +
-      scale_fill_manual(values = primary_location_colors) +
-      stat_compare_means(comparisons = comparisons_list,
-                         method = "wilcox.test",
-                         label = "p.signif",
-                         hide.ns = FALSE) +
-      stat_compare_means(method = "kruskal.test",
-                         label.y = 1.15,
-                         label = "p.format") +
-      theme_cowplot() +
-      ggtitle("CytoTRACE2 Scores by Anatomical Location in pUM Malignant Cells",
-              subtitle = "Statistical comparison: Kruskal-Wallis + pairwise Wilcoxon (Bonferroni)") +
-      xlab("Anatomical Location") +
-      ylab("CytoTRACE2 Score") +
-      theme(legend.position = "none",
-            axis.text.x = element_text(size = 12),
-            plot.subtitle = element_text(size = 10))
-
-    print(p_loc)
-    ggsave(file.path(output_dir, "malignant_cytotrace2_pum_locations.png"), p_loc,
-           width = 12, height = 10, dpi = 300, bg = "white")
-
-    # Summary statistics
-    loc_stats <- mal_pum@meta.data |>
-      dplyr::group_by(location) |>
-      dplyr::summarise(
-        n_cells = n(),
-        mean_score = mean(CytoTRACE2_Score, na.rm = TRUE),
-        sd_score = sd(CytoTRACE2_Score, na.rm = TRUE),
-        median_score = median(CytoTRACE2_Score, na.rm = TRUE),
-        .groups = "drop"
-      ) |>
-      dplyr::arrange(desc(mean_score))
-
-    cat("\nCytoTRACE2 Statistics by pUM Location:\n")
-    cat("Cells analyzed:", ncol(mal_pum), "\n\n")
-    print(loc_stats)
-
-    write.csv(loc_stats,
-              file.path(output_dir, "malignant_cytotrace2_stats_pum_locations.csv"),
-              row.names = FALSE)
-  } else {
-    cat("No malignant cells found in pUM locations (choroid, iris, ciliary body)\n")
-  }
-}
-```
-
-### ★ KEY: Disease Progression (Healthy → Primary → Metastatic)
-
-```{r malignant_origin, fig.width = 10, fig.height = 12, eval = has_malignant}
-if (has_malignant) {
-  library(ggbeeswarm)
-
-  # Enforce disease progression order
-  malignant_subset$origin <- factor(malignant_subset$origin,
-                                     levels = c("healthy", "primary", "metastasis"))
-
-  # 1. Violin plot (all cells merged) - standard approach (Victoria's colors)
-  p_violin_all <- ggplot(malignant_subset@meta.data,
-                          aes(x = origin, y = CytoTRACE2_Score, fill = origin)) +
-    geom_violin(alpha = 0.7, scale = "width") +
-    geom_boxplot(width = 0.2, outlier.size = 0.5, alpha = 0.5) +
-    scale_x_discrete(limits = origin_order) +
-    scale_fill_manual(values = origin_colors) +
-    scale_y_continuous(
-      breaks = seq(0, 1, by = 0.2),
-      limits = c(0, 1),
-      sec.axis = sec_axis(
-        trans = ~.,
-        breaks = seq(0, 1, by = 1/12),
-        labels = c("", "Differentiated", "", "Unipotent", "",
-                   "Oligopotent", "", "Multipotent", "",
-                   "Pluripotent", "", "Totipotent", "")
-      )
-    ) +
-    stat_summary(fun = median, geom = "crossbar", width = 0.5, color = "black", linewidth = 1) +
-    theme_cowplot() +
-    ggtitle("CytoTRACE2 Scores by Origin (All Cells Merged)",
-            subtitle = "Healthy melanocytes → Primary UM → Metastatic UM") +
-    xlab("Disease Stage") +
-    ylab("CytoTRACE2 Score") +
-    theme(
-      legend.position = "none",
-      axis.text.x = element_text(size = 12),
-      plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
-      plot.subtitle = element_text(size = 11, hjust = 0.5),
-      axis.ticks.y.right = element_line(
-        color = c("black", NA, "black", NA, "black", NA,
-                  "black", NA, "black", NA, "black", NA, "black")
-      ),
-      axis.ticks.length.y.right = unit(0.3, "cm")
-    )
-
-  # 2. Split violin plot by cell type (Melanocytes vs Melanoma cells)
-  p_violin_split <- ggplot(malignant_subset@meta.data,
-                            aes(x = origin, y = CytoTRACE2_Score, fill = majority_celltype)) +
-    geom_violin(alpha = 0.7, scale = "width", position = position_dodge(0.9)) +
-    geom_boxplot(width = 0.2, position = position_dodge(0.9), outlier.size = 0.3, alpha = 0.5) +
-    scale_x_discrete(limits = origin_order) +
-    scale_fill_manual(
-      values = c("Melanocytes" = "#E6F5E6", "Melanoma cells" = "#8DA0CB"),
-      name = "Cell Type"
-    ) +
-    scale_y_continuous(
-      breaks = seq(0, 1, by = 0.2),
-      limits = c(0, 1)
-    ) +
-    theme_cowplot() +
-    ggtitle("CytoTRACE2 Scores by Origin (Split by Cell Type)",
-            subtitle = "Comparing healthy melanocytes vs malignant melanoma cells") +
-    xlab("Disease Stage") +
-    ylab("CytoTRACE2 Score") +
-    theme(
-      legend.position = "right",
-      axis.text.x = element_text(size = 12),
-      plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
-      plot.subtitle = element_text(size = 11, hjust = 0.5)
-    )
-
-  # 3. Comprehensive sample-level statistics with all metadata (replicates merged)
-  sample_stats_full <- malignant_subset@meta.data |>
-    dplyr::group_by(orig.ident, origin, majority_celltype, organ, location,
-                    primary_mutation, secondary_mutation, Age_atDiagnosisY,
-                    Gender, LocationPrimaryTumor, Patient_nr) |>
-    dplyr::summarise(
-      n_cells = n(),
-      mean_score = mean(CytoTRACE2_Score, na.rm = TRUE),
-      median_score = median(CytoTRACE2_Score, na.rm = TRUE),
-      .groups = "drop"
-    ) |>
-    dplyr::filter(n_cells >= 10)  # Filter patients with at least 10 melanocytic cells
-
-  # Create age bins for visualization (convert to numeric first)
-  sample_stats_full <- sample_stats_full |>
-    dplyr::mutate(
-      Age_atDiagnosisY_num = as.numeric(as.character(Age_atDiagnosisY)),
-      age_bin = cut(Age_atDiagnosisY_num,
-                    breaks = c(0, 50, 60, 70, 100),
-                    labels = c("<50", "50-60", "60-70", ">70"),
-                    include.lowest = TRUE)
-    )
-
-  # Get polychrome palette for multi-category variables
-  polychrome_colors <- unname(pals::polychrome())
-
-  # Enforce disease progression order in sample_stats_full
-  sample_stats_full$origin <- factor(sample_stats_full$origin,
-                                      levels = c("healthy", "primary", "metastasis"))
-
-  # Boxplot by Origin (using Victoria's colors)
-  p_boxplot_origin <- ggplot(sample_stats_full,
-                               aes(x = origin, y = mean_score, fill = origin)) +
-    geom_boxplot(alpha = 0.7, outlier.shape = NA) +
-    geom_quasirandom(aes(color = origin, size = n_cells),
-                     alpha = 0.7, dodge.width = 0.8) +
-    scale_x_discrete(limits = origin_order) +
-    scale_fill_manual(values = origin_colors, name = "Uveal Location") +
-    scale_color_manual(values = origin_colors, name = "Uveal Location") +
-    scale_size_continuous(name = "Cell count", range = c(2, 8)) +
-    theme_cowplot() +
-    ggtitle("Patient-Level CytoTRACE2 Scores by Disease Stage",
-            subtitle = "Each point = one patient (sized by cell count, ≥10 cells)") +
-    xlab("Disease Progression") +
-    ylab("Mean CytoTRACE2 Score per Patient") +
-    theme(legend.position = "right", axis.text.x = element_text(size = 12),
-          plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
-          plot.subtitle = element_text(size = 11, hjust = 0.5))
-
-  # Additional boxplot variants colored by metadata variables
-
-  # 1. Boxplot colored by Organ (using Victoria's organ_colors from config)
-  p_boxplot_organ <- ggplot(sample_stats_full,
-                             aes(x = origin, y = mean_score)) +
-    geom_boxplot(alpha = 0.3, outlier.shape = NA, fill = "gray80") +
-    geom_quasirandom(aes(color = organ, size = n_cells),
-                     alpha = 0.7, dodge.width = 0.8) +
-    scale_x_discrete(limits = origin_order) +
-    scale_color_manual(values = organ_colors, name = "Organ") +
-    scale_size_continuous(name = "Cell count", range = c(2, 8)) +
-    stat_compare_means(aes(group = organ), method = "kruskal.test",
-                       label = "p.format", label.y = max(sample_stats_full$mean_score, na.rm = TRUE) + 0.05) +
-    theme_cowplot() +
-    ggtitle("Patient-Level CytoTRACE2 Scores by Disease Stage",
-            subtitle = "Colored by Organ | Each point = one patient (sized by cell count, ≥10 cells)") +
-    xlab("Disease Stage") +
-    ylab("Mean CytoTRACE2 Score per Patient") +
-    theme(legend.position = "right", axis.text.x = element_text(size = 12),
-          plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
-          plot.subtitle = element_text(size = 11, hjust = 0.5))
-
-  print(p_boxplot_organ)
-  ggsave(file.path(output_dir, "patient_boxplot_by_organ.png"),
-         p_boxplot_organ, width = 12, height = 8, dpi = 300, bg = "white")
-
-  # 2. Boxplot colored by Primary Mutation
-  n_mut <- length(unique(sample_stats_full$primary_mutation))
-  mutation_colors <- setNames(polychrome_colors[1:n_mut], sort(unique(sample_stats_full$primary_mutation)))
-
-  p_boxplot_mutation <- ggplot(sample_stats_full,
-                                 aes(x = origin, y = mean_score)) +
-    geom_boxplot(alpha = 0.3, outlier.shape = NA, fill = "gray80") +
-    geom_quasirandom(aes(color = primary_mutation, size = n_cells),
-                     alpha = 0.7, dodge.width = 0.8) +
-    scale_x_discrete(limits = origin_order) +
-    scale_color_manual(values = mutation_colors, name = "Primary Mutation") +
-    scale_size_continuous(name = "Cell count", range = c(2, 8)) +
-    theme_cowplot() +
-    ggtitle("Patient-Level CytoTRACE2 Scores by Disease Stage",
-            subtitle = "Colored by Primary Mutation | Each point = one patient (sized by cell count, ≥10 cells)") +
-    xlab("Disease Stage") +
-    ylab("Mean CytoTRACE2 Score per Patient") +
-    theme(legend.position = "right", axis.text.x = element_text(size = 12),
-          plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
-          plot.subtitle = element_text(size = 11, hjust = 0.5))
-
-  print(p_boxplot_mutation)
-  ggsave(file.path(output_dir, "patient_boxplot_by_primary_mutation.png"),
-         p_boxplot_mutation, width = 12, height = 8, dpi = 300, bg = "white")
-
-  # 3. Boxplot colored by Secondary Mutation
-  sample_stats_full_2nd <- sample_stats_full |>
-    dplyr::filter(!is.na(secondary_mutation) & secondary_mutation != "")
-
-  if (nrow(sample_stats_full_2nd) > 0) {
-    n_mut2 <- length(unique(sample_stats_full_2nd$secondary_mutation))
-    mutation2_colors <- setNames(polychrome_colors[1:n_mut2], sort(unique(sample_stats_full_2nd$secondary_mutation)))
-
-    p_boxplot_mutation2 <- ggplot(sample_stats_full_2nd,
-                                   aes(x = origin, y = mean_score)) +
-      geom_boxplot(alpha = 0.3, outlier.shape = NA, fill = "gray80") +
-      geom_quasirandom(aes(color = secondary_mutation, size = n_cells),
-                       alpha = 0.7, dodge.width = 0.8) +
-      scale_x_discrete(limits = origin_order) +
-      scale_color_manual(values = mutation2_colors, name = "Secondary Mutation") +
-      scale_size_continuous(name = "Cell count", range = c(2, 8)) +
-      theme_cowplot() +
-      ggtitle("Patient-Level CytoTRACE2 Scores by Disease Stage",
-              subtitle = "Colored by Secondary Mutation | Each point = one patient (sized by cell count, ≥10 cells)") +
-      xlab("Disease Stage") +
-      ylab("Mean CytoTRACE2 Score per Patient") +
-      theme(legend.position = "right", axis.text.x = element_text(size = 12),
-            plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
-            plot.subtitle = element_text(size = 11, hjust = 0.5))
-
-    print(p_boxplot_mutation2)
-    ggsave(file.path(output_dir, "patient_boxplot_by_secondary_mutation.png"),
-           p_boxplot_mutation2, width = 12, height = 8, dpi = 300, bg = "white")
-  }
-
-  # 4. Boxplot colored by Uveal Location
-  patient_stats_uveal <- sample_stats_full |>
-    dplyr::filter(!is.na(location) & location != "" & location != "NA")
-
-  if (nrow(patient_stats_uveal) > 0) {
-    n_loc <- length(unique(patient_stats_uveal$location))
-    location_colors <- setNames(polychrome_colors[1:n_loc], sort(unique(patient_stats_uveal$location)))
-
-    p_boxplot_location <- ggplot(patient_stats_uveal,
-                                  aes(x = origin, y = mean_score)) +
-      geom_boxplot(alpha = 0.3, outlier.shape = NA, fill = "gray80") +
-      geom_quasirandom(aes(color = location, size = n_cells),
-                       alpha = 0.7, dodge.width = 0.8) +
-      scale_x_discrete(limits = origin_order) +
-      scale_color_manual(values = location_colors, name = "Uveal Location") +
-      scale_size_continuous(name = "Cell count", range = c(2, 8)) +
-      theme_cowplot() +
-      ggtitle("Patient-Level CytoTRACE2 Scores by Disease Stage",
-              subtitle = "Colored by Uveal Location | Each point = one patient (sized by cell count, ≥10 cells)") +
-      xlab("Disease Stage") +
-      ylab("Mean CytoTRACE2 Score per Patient") +
-      theme(legend.position = "right", axis.text.x = element_text(size = 12),
-            plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
-            plot.subtitle = element_text(size = 11, hjust = 0.5))
-
-    print(p_boxplot_location)
-    ggsave(file.path(output_dir, "patient_boxplot_by_uveal_location.png"),
-           p_boxplot_location, width = 12, height = 8, dpi = 300, bg = "white")
-  }
-
-  # 5. Boxplot colored by Age Class (using Victoria's ageGroup_col from config)
-  # Map age_bin categories to ageGroup_col names
-  age_to_agegroup <- c("<50" = "Young", "50-60" = "Middle", "60-70" = "Middle", ">70" = "Old")
-  sample_stats_full <- sample_stats_full |>
-    dplyr::mutate(age_group = factor(age_to_agegroup[as.character(age_bin)],
-                                      levels = c("Young", "Middle", "Old")))
-
-  p_boxplot_age <- ggplot(sample_stats_full,
-                          aes(x = origin, y = mean_score)) +
-    geom_boxplot(alpha = 0.3, outlier.shape = NA, fill = "gray80") +
-    geom_quasirandom(aes(color = age_group, size = n_cells),
-                     alpha = 0.7, dodge.width = 0.8) +
-    scale_x_discrete(limits = origin_order) +
-    scale_color_manual(values = ageGroup_col, name = "Age Class", na.translate = FALSE) +
-    scale_size_continuous(name = "Cell count", range = c(2, 8)) +
-    theme_cowplot() +
-    ggtitle("Patient-Level CytoTRACE2 Scores by Disease Stage",
-            subtitle = "Colored by Age Class | Each point = one patient (sized by cell count, ≥10 cells)") +
-    xlab("Disease Progression") +
-    ylab("Mean CytoTRACE2 Score per Patient") +
-    theme(legend.position = "right", axis.text.x = element_text(size = 12),
-          plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
-          plot.subtitle = element_text(size = 11, hjust = 0.5))
-
-  print(p_boxplot_age)
-  ggsave(file.path(output_dir, "patient_boxplot_by_age.png"),
-         p_boxplot_age, width = 12, height = 8, dpi = 300, bg = "white")
-
-  # 6. Boxplot colored by Gender (using Victoria's gender_col from config)
-  p_boxplot_gender <- ggplot(sample_stats_full,
-                              aes(x = origin, y = mean_score)) +
-    geom_boxplot(alpha = 0.3, outlier.shape = NA, fill = "gray80") +
-    geom_quasirandom(aes(color = Gender, size = n_cells),
-                     alpha = 0.7, dodge.width = 0.8) +
-    scale_x_discrete(limits = origin_order) +
-    scale_color_manual(values = gender_col, name = "Gender") +
-    scale_size_continuous(name = "Cell count", range = c(2, 8)) +
-    theme_cowplot() +
-    ggtitle("Patient-Level CytoTRACE2 Scores by Disease Stage",
-            subtitle = "Colored by Gender | Each point = one patient (sized by cell count, ≥10 cells)") +
-    xlab("Disease Progression") +
-    ylab("Mean CytoTRACE2 Score per Patient") +
-    theme(legend.position = "right", axis.text.x = element_text(size = 12),
-          plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
-          plot.subtitle = element_text(size = 11, hjust = 0.5))
-
-  print(p_boxplot_gender)
-  ggsave(file.path(output_dir, "patient_boxplot_by_gender.png"),
-         p_boxplot_gender, width = 12, height = 8, dpi = 300, bg = "white")
-
-  # 7. Boxplot colored by Patient
-  n_patients <- length(unique(sample_stats_full$Patient_nr))
-  patient_colors <- setNames(polychrome_colors[1:n_patients], sort(unique(sample_stats_full$Patient_nr)))
-
-  p_boxplot_patient <- ggplot(sample_stats_full,
-                               aes(x = origin, y = mean_score)) +
-    geom_boxplot(alpha = 0.3, outlier.shape = NA, fill = "gray80") +
-    geom_quasirandom(aes(color = Patient_nr, size = n_cells),
-                     alpha = 0.7, dodge.width = 0.8) +
-    scale_x_discrete(limits = origin_order) +
-    scale_color_manual(values = patient_colors, name = "Patient") +
-    scale_size_continuous(name = "Cell count", range = c(2, 8)) +
-    theme_cowplot() +
-    ggtitle("Patient-Level CytoTRACE2 Scores by Disease Stage",
-            subtitle = "Colored by Patient | Each point = one patient (sized by cell count, ≥10 cells)") +
-    xlab("Disease Stage") +
-    ylab("Mean CytoTRACE2 Score per Patient") +
-    theme(legend.position = "right", axis.text.x = element_text(size = 12),
-          plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
-          plot.subtitle = element_text(size = 11, hjust = 0.5))
-
-  print(p_boxplot_patient)
-  ggsave(file.path(output_dir, "patient_boxplot_by_patient.png"),
-         p_boxplot_patient, width = 14, height = 8, dpi = 300, bg = "white")
-
-  # Combine plots (violins + boxplot)
-  # Use relative heights: violins get more space, boxplot is compact
-  p_combined_origin <- (p_violin_all / p_violin_split / p_boxplot_origin) +
-    plot_layout(heights = c(2, 2, 1))
-
-  print(p_combined_origin)
-  ggsave(file.path(output_dir, "melanocytic_cytotrace2_origin_comprehensive.png"),
-         p_combined_origin,
-         width = 10, height = 12, dpi = 300, bg = "white")
-
-  # Cell-level summary statistics
-  origin_stats <- malignant_subset@meta.data |>
-    dplyr::group_by(origin) |>
-    dplyr::summarise(
-      n_cells = n(),
-      mean_score = mean(CytoTRACE2_Score, na.rm = TRUE),
-      sd_score = sd(CytoTRACE2_Score, na.rm = TRUE),
-      median_score = median(CytoTRACE2_Score, na.rm = TRUE),
-      .groups = "drop"
-    ) |>
-    dplyr::arrange(origin)
-
-  cat("\n=== CELL-LEVEL Statistics by Origin ===\n")
-  print(origin_stats)
-
-  # Patient-level summary statistics
-  patient_summary_origin <- sample_stats_full |>
-    dplyr::group_by(origin) |>
-    dplyr::summarise(
-      n_patients = n(),
-      mean_of_patient_means = mean(mean_score, na.rm = TRUE),
-      sd_of_patient_means = sd(mean_score, na.rm = TRUE),
-      median_of_patient_means = median(mean_score, na.rm = TRUE),
-      .groups = "drop"
-    ) |>
-    dplyr::arrange(origin)
-
-  cat("\n=== PATIENT-LEVEL Statistics by Origin ===\n")
-  cat("(Patients with ≥10 melanocytic cells)\n\n")
-  print(patient_summary_origin)
-
-  # Cell type breakdown by origin
-  celltype_origin_stats <- malignant_subset@meta.data |>
-    dplyr::group_by(origin, majority_celltype) |>
-    dplyr::summarise(
-      n_cells = n(),
-      mean_score = mean(CytoTRACE2_Score, na.rm = TRUE),
-      median_score = median(CytoTRACE2_Score, na.rm = TRUE),
-      .groups = "drop"
-    ) |>
-    dplyr::arrange(origin, majority_celltype)
-
-  cat("\n=== By Cell Type and Origin ===\n")
-  print(celltype_origin_stats)
-
-  # Export statistics
-  write.csv(origin_stats,
-            file.path(output_dir, "melanocytic_cytotrace2_stats_origin_cell_level.csv"),
-            row.names = FALSE)
-  write.csv(patient_summary_origin,
-            file.path(output_dir, "melanocytic_cytotrace2_stats_origin_patient_level.csv"),
-            row.names = FALSE)
-  write.csv(celltype_origin_stats,
-            file.path(output_dir, "melanocytic_cytotrace2_stats_origin_by_celltype.csv"),
-            row.names = FALSE)
-  write.csv(sample_stats_full,
-            file.path(output_dir, "melanocytic_cytotrace2_patient_data_full.csv"),
-            row.names = FALSE)
-}
-```
-
-### Patient-Level Boxplots - Multiple Perspectives {.tabset}
-
-Explore patient-level CytoTRACE2 scores colored by different clinical and biological variables.
-
-#### By Organ (Metastases)
-
-```{r malignant_boxplot_organ, fig.width = 12, fig.height = 8, eval = has_malignant}
-if (has_malignant) {
-  # Filter to metastases only and remove NA organs
-  patient_stats_metastasis <- sample_stats_full |>
-    dplyr::filter(origin == "metastasis" & !is.na(organ) & organ != "")
-
-  # Get unique organs and assign colors
-  unique_organs <- unique(patient_stats_metastasis$organ)
-  n_organs <- length(unique_organs)
-  organ_colors_fill <- polychrome_colors[1:n_organs]
-  organ_colors_line <- adjustcolor(organ_colors_fill, red.f = 0.7, green.f = 0.7, blue.f = 0.7)
-  names(organ_colors_fill) <- unique_organs
-  names(organ_colors_line) <- unique_organs
-
-  p_boxplot_organ <- ggplot(patient_stats_metastasis,
-                             aes(x = organ, y = mean_score, fill = organ)) +
-    geom_boxplot(alpha = 0.7, outlier.shape = NA) +
-    geom_quasirandom(aes(color = organ, size = n_cells),
-                     alpha = 0.7, dodge.width = 0.8) +
-    scale_fill_manual(values = organ_colors_fill) +
-    scale_color_manual(values = organ_colors_line) +
-    scale_size_continuous(name = "Cell count", range = c(2, 8)) +
-    theme_cowplot() +
-    ggtitle("Patient-Level CytoTRACE2 Scores by Metastasis Organ",
-            subtitle = "Metastasis samples only (≥10 cells per patient)") +
-    xlab("Metastasis Organ") +
-    ylab("Mean CytoTRACE2 Score per Patient") +
-    theme(legend.position = "right", axis.text.x = element_text(size = 11, angle = 45, hjust = 1),
-          plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
-          plot.subtitle = element_text(size = 11, hjust = 0.5))
-
-  print(p_boxplot_organ)
-  ggsave(file.path(output_dir, "patient_boxplot_by_organ.png"),
-         p_boxplot_organ, width = 12, height = 8, dpi = 300, bg = "white")
-}
-```
-
-#### By Primary Mutation
-
-```{r malignant_boxplot_mutation, fig.width = 12, fig.height = 8, eval = has_malignant}
-if (has_malignant) {
-  # Filter out unknown mutations
-  patient_stats_mutation <- sample_stats_full |>
-    dplyr::filter(!is.na(primary_mutation) & primary_mutation != "" & primary_mutation != "unknown")
-
-  # Get unique mutations and assign colors
-  unique_mutations <- unique(patient_stats_mutation$primary_mutation)
-  n_mutations <- length(unique_mutations)
-  mutation_colors_fill <- polychrome_colors[1:n_mutations]
-  mutation_colors_line <- adjustcolor(mutation_colors_fill, red.f = 0.7, green.f = 0.7, blue.f = 0.7)
-  names(mutation_colors_fill) <- unique_mutations
-  names(mutation_colors_line) <- unique_mutations
-
-  p_boxplot_mutation <- ggplot(patient_stats_mutation,
-                                aes(x = primary_mutation, y = mean_score, fill = primary_mutation)) +
-    geom_boxplot(alpha = 0.7, outlier.shape = NA) +
-    geom_quasirandom(aes(color = primary_mutation, size = n_cells),
-                     alpha = 0.7, dodge.width = 0.8) +
-    scale_fill_manual(values = mutation_colors_fill) +
-    scale_color_manual(values = mutation_colors_line) +
-    scale_size_continuous(name = "Cell count", range = c(2, 8)) +
-    theme_cowplot() +
-    ggtitle("Patient-Level CytoTRACE2 Scores by Primary Mutation",
-            subtitle = "All disease stages (≥10 cells per patient)") +
-    xlab("Primary Mutation") +
-    ylab("Mean CytoTRACE2 Score per Patient") +
-    theme(legend.position = "right", axis.text.x = element_text(size = 11, angle = 45, hjust = 1),
-          plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
-          plot.subtitle = element_text(size = 11, hjust = 0.5))
-
-  print(p_boxplot_mutation)
-  ggsave(file.path(output_dir, "patient_boxplot_by_mutation.png"),
-         p_boxplot_mutation, width = 12, height = 8, dpi = 300, bg = "white")
-}
-```
-
-#### By Uveal Location
-
-```{r malignant_boxplot_uveal, fig.width = 12, fig.height = 8, eval = has_malignant}
-if (has_malignant) {
-  # Filter to primary + healthy with known location
-  patient_stats_uveal <- sample_stats_full |>
-    dplyr::filter(origin %in% c("healthy", "primary") &
-                  !is.na(LocationPrimaryTumor) &
-                  LocationPrimaryTumor != "" &
-                  LocationPrimaryTumor != "unknown")
-
-  # Assign colors for iris, choroid, ciliary body
-  uveal_colors <- c("iris" = "#E41A1C", "choroid" = "#377EB8", "ciliary body" = "#4DAF4A")
-  uveal_colors_line <- c("iris" = "#B3151A", "choroid" = "#2D6594", "ciliary body" = "#3E8C3B")
-
-  p_boxplot_uveal <- ggplot(patient_stats_uveal,
-                             aes(x = LocationPrimaryTumor, y = mean_score, fill = LocationPrimaryTumor)) +
-    geom_boxplot(alpha = 0.7, outlier.shape = NA) +
-    geom_quasirandom(aes(color = LocationPrimaryTumor, size = n_cells),
-                     alpha = 0.7, dodge.width = 0.8) +
-    scale_fill_manual(values = uveal_colors, na.value = "grey50") +
-    scale_color_manual(values = uveal_colors_line, na.value = "grey30") +
-    scale_size_continuous(name = "Cell count", range = c(2, 8)) +
-    theme_cowplot() +
-    ggtitle("Patient-Level CytoTRACE2 Scores by Uveal Location",
-            subtitle = "Healthy and primary tumors only (≥10 cells per patient)") +
-    xlab("Primary Tumor Location") +
-    ylab("Mean CytoTRACE2 Score per Patient") +
-    theme(legend.position = "right", axis.text.x = element_text(size = 11),
-          plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
-          plot.subtitle = element_text(size = 11, hjust = 0.5))
-
-  print(p_boxplot_uveal)
-  ggsave(file.path(output_dir, "patient_boxplot_by_uveal_location.png"),
-         p_boxplot_uveal, width = 12, height = 8, dpi = 300, bg = "white")
-}
-```
-
-#### By Patient
-
-```{r malignant_boxplot_patient, fig.width = 16, fig.height = 8, eval = has_malignant}
-if (has_malignant) {
-  # Sort patients by mean score for better visualization
-  patient_order <- sample_stats_full |>
-    dplyr::group_by(Patient_nr) |>
-    dplyr::summarise(mean_score_avg = mean(mean_score, na.rm = TRUE), .groups = "drop") |>
-    dplyr::arrange(mean_score_avg) |>
-    dplyr::pull(Patient_nr)
-
-  sample_stats_full$Patient_nr <- factor(sample_stats_full$Patient_nr, levels = patient_order)
-
-  # Assign unique colors to each patient
-  n_patients <- length(unique(sample_stats_full$Patient_nr))
-  patient_colors <- rep(polychrome_colors, length.out = n_patients)
-  names(patient_colors) <- levels(sample_stats_full$Patient_nr)
-
-  p_boxplot_patient <- ggplot(sample_stats_full,
-                               aes(x = Patient_nr, y = mean_score, fill = Patient_nr)) +
-    geom_boxplot(alpha = 0.7, outlier.shape = NA, show.legend = FALSE) +
-    geom_quasirandom(aes(size = n_cells), alpha = 0.7, dodge.width = 0.8, show.legend = TRUE) +
-    scale_fill_manual(values = patient_colors) +
-    scale_size_continuous(name = "Cell count", range = c(2, 6)) +
-    theme_cowplot() +
-    ggtitle("Patient-Level CytoTRACE2 Scores by Patient",
-            subtitle = "All patients sorted by mean score (≥10 cells per patient)") +
-    xlab("Patient ID") +
-    ylab("Mean CytoTRACE2 Score per Patient") +
-    theme(axis.text.x = element_text(size = 8, angle = 90, hjust = 1, vjust = 0.5),
-          plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
-          plot.subtitle = element_text(size = 11, hjust = 0.5),
-          legend.position = "right")
-
-  print(p_boxplot_patient)
-  ggsave(file.path(output_dir, "patient_boxplot_by_patient.png"),
-         p_boxplot_patient, width = 16, height = 8, dpi = 300, bg = "white")
-}
-```
-
-#### By Age
-
-```{r malignant_boxplot_age, fig.width = 12, fig.height = 8, eval = has_malignant}
-if (has_malignant) {
-  # Filter out patients with missing age
-  patient_stats_age <- sample_stats_full |>
-    dplyr::filter(!is.na(age_bin))
-
-  # Define age colors
-  age_colors <- c("<50" = "#FEE5D9", "50-60" = "#FCAE91", "60-70" = "#FB6A4A", ">70" = "#CB181D")
-  age_colors_line <- c("<50" = "#CCBAB4", "50-60" = "#CA8B74", "60-70" = "#C9553B", ">70" = "#A21317")
-
-  p_boxplot_age <- ggplot(patient_stats_age,
-                           aes(x = age_bin, y = mean_score, fill = age_bin)) +
-    geom_boxplot(alpha = 0.7, outlier.shape = NA) +
-    geom_quasirandom(aes(color = age_bin, size = n_cells),
-                     alpha = 0.7, dodge.width = 0.8) +
-    scale_fill_manual(values = age_colors) +
-    scale_color_manual(values = age_colors_line) +
-    scale_size_continuous(name = "Cell count", range = c(2, 8)) +
-    theme_cowplot() +
-    ggtitle("Patient-Level CytoTRACE2 Scores by Age at Diagnosis",
-            subtitle = "All disease stages (≥10 cells per patient)") +
-    xlab("Age Group (Years)") +
-    ylab("Mean CytoTRACE2 Score per Patient") +
-    theme(legend.position = "right", axis.text.x = element_text(size = 11),
-          plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
-          plot.subtitle = element_text(size = 11, hjust = 0.5))
-
-  print(p_boxplot_age)
-  ggsave(file.path(output_dir, "patient_boxplot_by_age.png"),
-         p_boxplot_age, width = 12, height = 8, dpi = 300, bg = "white")
-}
-```
-
-#### By Gender
-
-```{r malignant_boxplot_gender, fig.width = 10, fig.height = 8, eval = has_malignant}
-if (has_malignant) {
-  # Filter out patients with missing gender
-  patient_stats_gender <- sample_stats_full |>
-    dplyr::filter(!is.na(Gender) & Gender != "")
-
-  # Define gender colors
-  gender_colors <- c("Female" = "#F781BF", "Male" = "#377EB8", "female" = "#F781BF", "male" = "#377EB8")
-  gender_colors_line <- c("Female" = "#C6679F", "Male" = "#2D6594", "female" = "#C6679F", "male" = "#2D6594")
-
-  p_boxplot_gender <- ggplot(patient_stats_gender,
-                              aes(x = Gender, y = mean_score, fill = Gender)) +
-    geom_boxplot(alpha = 0.7, outlier.shape = NA) +
-    geom_quasirandom(aes(color = Gender, size = n_cells),
-                     alpha = 0.7, dodge.width = 0.8) +
-    scale_fill_manual(values = gender_colors) +
-    scale_color_manual(values = gender_colors_line) +
-    scale_size_continuous(name = "Cell count", range = c(2, 8)) +
-    theme_cowplot() +
-    ggtitle("Patient-Level CytoTRACE2 Scores by Gender",
-            subtitle = "All disease stages (≥10 cells per patient)") +
-    xlab("Gender") +
-    ylab("Mean CytoTRACE2 Score per Patient") +
-    theme(legend.position = "right", axis.text.x = element_text(size = 12),
-          plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
-          plot.subtitle = element_text(size = 11, hjust = 0.5))
-
-  print(p_boxplot_gender)
-  ggsave(file.path(output_dir, "patient_boxplot_by_gender.png"),
-         p_boxplot_gender, width = 10, height = 8, dpi = 300, bg = "white")
-}
-```
-
-### Combined Analysis: Mutations × Origin
-
-```{r malignant_mutation_origin, fig.width = 14, fig.height = 8, eval = has_malignant}
-if (has_malignant) {
-  # Filter out unknown mutations
-  mal_known <- subset(malignant_subset, subset = secondary_mutation != "unknown")
-
-  # Ensure disease progression order
-  mal_known$origin <- factor(mal_known$origin, levels = c("healthy", "primary", "metastasis"))
-
-  # Faceted violin plot (Victoria's colors)
-  p_comb <- ggplot(mal_known@meta.data,
-                    aes(x = origin, y = CytoTRACE2_Score, fill = origin)) +
-    geom_violin(alpha = 0.7, scale = "width") +
-    geom_boxplot(width = 0.3, outlier.size = 0.3, alpha = 0.5) +
-    facet_wrap(~ secondary_mutation, nrow = 1) +
-    scale_x_discrete(limits = origin_order) +
-    scale_fill_manual(values = origin_colors) +
-    theme_cowplot() +
-    ggtitle("CytoTRACE2 Scores: Secondary Mutations across Origins (Malignant Cells)") +
-    xlab("Origin") +
-    ylab("CytoTRACE2 Score") +
-    theme(legend.position = "bottom",
-          axis.text.x = element_text(angle = 45, hjust = 1))
-
-  print(p_comb)
-  ggsave(file.path(output_dir, "malignant_cytotrace2_mutation_origin.png"), p_comb,
-         width = 14, height = 8, dpi = 300, bg = "white")
-
-  # Summary statistics
-  comb_stats <- mal_known@meta.data |>
-    dplyr::group_by(secondary_mutation, origin) |>
-    dplyr::summarise(
-      n_cells = n(),
-      mean_score = mean(CytoTRACE2_Score, na.rm = TRUE),
-      sd_score = sd(CytoTRACE2_Score, na.rm = TRUE),
-      median_score = median(CytoTRACE2_Score, na.rm = TRUE),
-      .groups = "drop"
-    ) |>
-    dplyr::arrange(secondary_mutation, desc(mean_score))
-
-  cat("\nCytoTRACE2 Statistics by Secondary Mutation and Origin:\n")
-  print(comb_stats)
-
-  write.csv(comb_stats,
-            file.path(output_dir, "malignant_cytotrace2_stats_mutation_origin.csv"),
-            row.names = FALSE)
-}
-```
-
-### Sample-Level Dispersion
-
-```{r malignant_patient_dispersion, fig.width = 14, fig.height = 10, eval = has_malignant}
-# Use orig.ident to merge biological replicates from same tumor
-if (has_malignant && "orig.ident" %in% colnames(malignant_subset@meta.data)) {
-  # Calculate per-sample statistics (replicates merged)
-  sample_stats_mal <- malignant_subset@meta.data |>
-    dplyr::group_by(orig.ident, origin, secondary_mutation) |>
-    dplyr::summarise(
-      n_cells = n(),
-      mean_score = mean(CytoTRACE2_Score, na.rm = TRUE),
-      sd_score = sd(CytoTRACE2_Score, na.rm = TRUE),
-      median_score = median(CytoTRACE2_Score, na.rm = TRUE),
-      .groups = "drop"
-    ) |>
-    dplyr::rename(Sample = orig.ident) |>
-    dplyr::filter(n_cells >= 10)  # Filter samples with at least 10 malignant cells
-
-  # Boxplot showing sample-level dispersion
-  p_sample <- ggplot(sample_stats_mal,
-                   aes(x = secondary_mutation, y = mean_score, fill = origin)) +
-    geom_boxplot(alpha = 0.7, outlier.size = 1) +
-    geom_jitter(width = 0.2, size = 1.5, alpha = 0.4) +
-    scale_fill_manual(values = origin_colors) +
-    theme_cowplot() +
-    ggtitle("Sample-Level CytoTRACE2 Dispersion by Secondary Mutation and Origin\n(Malignant Cells, n≥10)") +
-    xlab("Secondary Mutation") +
-    ylab("Mean CytoTRACE2 Score per Sample") +
-    theme(legend.position = "right",
-          axis.text.x = element_text(angle = 45, hjust = 1))
-
-  print(p_sample)
-  ggsave(file.path(output_dir, "malignant_sample_dispersion.png"), p_sample,
-         width = 14, height = 10, dpi = 300, bg = "white")
-
-  cat("\nSample-level statistics (biological replicates merged):\n")
-  cat("Number of samples with ≥10 malignant cells:", nrow(sample_stats_mal), "\n\n")
-
-  write.csv(sample_stats_mal,
-            file.path(output_dir, "malignant_cytotrace2_sample_stats.csv"),
-            row.names = FALSE)
-}
-```
-
-## Cell Type-Specific CytoTRACE2 Analyses {.tabset}
-
-This section analyzes CytoTRACE2 potency scores and gene correlations for key non-melanocytic cell populations.
-
-### Fibroblasts
-
-```{r fibroblasts_correlation, fig.width = 11, fig.height = 15, eval = has_cytotrace2}
-if (has_cytotrace2 && "Fibroblasts" %in% unique(um_atlas@meta.data$majority_celltype)) {
-  # Subset to Fibroblasts
-  fibroblasts <- subset(um_atlas, subset = majority_celltype == "Fibroblasts")
-
-  cat("\n=== Fibroblasts Gene Correlation Analysis ===\n")
-  cat("Total fibroblast cells:", ncol(fibroblasts), "\n\n")
-
-  # Run correlation analysis
-  fibro_results <- correlation_plot(fibroblasts, "Fibroblasts")
-
-  print(fibro_results$combined)
-  ggsave(file.path(output_dir, "genes_correlated_fibroblasts.png"),
-         fibro_results$combined,
-         width = 11, height = 15, dpi = 300, bg = "white")
-
-  # Export correlation table
-  write.csv(
-    fibro_results$cor_df |> dplyr::arrange(desc(abs(correlation))),
-    file.path(output_dir, "cytotrace2_fibroblasts_gene_correlations.csv"),
-    row.names = FALSE
-  )
-
-  cat("\nTop fibroblast stemness markers:\n")
-  print(fibro_results$cor_df |> dplyr::top_n(10, wt = correlation) |>
-          dplyr::arrange(desc(correlation)))
-
-  cat("\nTop fibroblast differentiation markers:\n")
-  print(fibro_results$cor_df |> dplyr::top_n(10, wt = -correlation) |>
-          dplyr::arrange(correlation))
-}
-```
-
-### T/NK Cells
-
-```{r tnk_correlation, fig.width = 11, fig.height = 15, eval = has_cytotrace2}
-if (has_cytotrace2 && "T/NK cells" %in% unique(um_atlas@meta.data$majority_celltype)) {
-  # Subset to T/NK cells
-  tnk_cells <- subset(um_atlas, subset = majority_celltype == "T/NK cells")
-
-  cat("\n=== T/NK Cells Gene Correlation Analysis ===\n")
-  cat("Total T/NK cells:", ncol(tnk_cells), "\n\n")
-
-  # Run correlation analysis
-  tnk_results <- correlation_plot(tnk_cells, "T/NK Cells")
-
-  print(tnk_results$combined)
-  ggsave(file.path(output_dir, "genes_correlated_tnk.png"),
-         tnk_results$combined,
-         width = 11, height = 15, dpi = 300, bg = "white")
-
-  # Export correlation table
-  write.csv(
-    tnk_results$cor_df |> dplyr::arrange(desc(abs(correlation))),
-    file.path(output_dir, "cytotrace2_tnk_gene_correlations.csv"),
-    row.names = FALSE
-  )
-
-  cat("\nTop T/NK stemness markers:\n")
-  print(tnk_results$cor_df |> dplyr::top_n(10, wt = correlation) |>
-          dplyr::arrange(desc(correlation)))
-
-  cat("\nTop T/NK differentiation markers:\n")
-  print(tnk_results$cor_df |> dplyr::top_n(10, wt = -correlation) |>
-          dplyr::arrange(correlation))
-}
-```
-
-### Myeloid Cells
-
-```{r myeloid_correlation, fig.width = 11, fig.height = 15, eval = has_cytotrace2}
-if (has_cytotrace2 && "Myeloid cells" %in% unique(um_atlas@meta.data$majority_celltype)) {
-  # Subset to Myeloid cells
-  myeloid_cells <- subset(um_atlas, subset = majority_celltype == "Myeloid cells")
-
-  cat("\n=== Myeloid Cells Gene Correlation Analysis ===\n")
-  cat("Total myeloid cells:", ncol(myeloid_cells), "\n\n")
-
-  # Run correlation analysis
-  myeloid_results <- correlation_plot(myeloid_cells, "Myeloid Cells")
-
-  print(myeloid_results$combined)
-  ggsave(file.path(output_dir, "genes_correlated_myeloid.png"),
-         myeloid_results$combined,
-         width = 11, height = 15, dpi = 300, bg = "white")
-
-  # Export correlation table
-  write.csv(
-    myeloid_results$cor_df |> dplyr::arrange(desc(abs(correlation))),
-    file.path(output_dir, "cytotrace2_myeloid_gene_correlations.csv"),
-    row.names = FALSE
-  )
-
-  cat("\nTop myeloid stemness markers:\n")
-  print(myeloid_results$cor_df |> dplyr::top_n(10, wt = correlation) |>
-          dplyr::arrange(desc(correlation)))
-
-  cat("\nTop myeloid differentiation markers:\n")
-  print(myeloid_results$cor_df |> dplyr::top_n(10, wt = -correlation) |>
-          dplyr::arrange(correlation))
-}
-```
-
-## Summary Statistics {.tabset}
-
-### Overall Distribution
-
-```{r summary_stats, eval = has_cytotrace2}
-cat("CytoTRACE2 Score Statistics:\n")
-cat("===========================\n\n")
-
-cat("Overall:\n")
-print(summary(um_atlas$CytoTRACE2_Score))
-
-cat("\n\nBy Potency Category:\n")
-print(table(um_atlas$CytoTRACE2_Potency))
-
-cat("\n\nPotency Proportions:\n")
-print(prop.table(table(um_atlas$CytoTRACE2_Potency)))
-```
-
-### By Cell Type
-
-```{r summary_by_celltype, eval = has_cytotrace2}
-cat("CytoTRACE2 Score by Cell Type:\n")
-cat("==============================\n\n")
-
-# Mean and SD by cell type
-celltype_stats <- um_atlas@meta.data |>
-  dplyr::group_by(.data[[celltype_col]]) |>
-  dplyr::summarise(
-    n_cells = n(),
-    mean_score = mean(CytoTRACE2_Score, na.rm = TRUE),
-    sd_score = sd(CytoTRACE2_Score, na.rm = TRUE),
-    median_score = median(CytoTRACE2_Score, na.rm = TRUE),
-    .groups = "drop"
-  ) |>
-  dplyr::arrange(desc(mean_score))
-
-print(celltype_stats)
-
-# Export
-write.csv(
-  celltype_stats,
-  file.path(output_dir, "cytotrace2_stats_by_celltype.csv"),
-  row.names = FALSE
-)
-```
-
-### By Sample
-
-```{r summary_by_sample, eval = has_cytotrace2}
-# Use orig.ident to merge biological replicates from same tumor
-if ("orig.ident" %in% colnames(um_atlas@meta.data)) {
-  cat("CytoTRACE2 Score by Sample (biological replicates merged):\n")
-  cat("==========================================================\n\n")
-
-  sample_stats <- um_atlas@meta.data |>
-    dplyr::group_by(orig.ident) |>
-    dplyr::summarise(
-      n_cells = n(),
-      mean_score = mean(CytoTRACE2_Score, na.rm = TRUE),
-      sd_score = sd(CytoTRACE2_Score, na.rm = TRUE),
-      median_score = median(CytoTRACE2_Score, na.rm = TRUE),
-      .groups = "drop"
-    ) |>
-    dplyr::rename(Sample = orig.ident) |>
-    dplyr::arrange(desc(mean_score))
-
-  print(sample_stats)
-
-  # Export
-  write.csv(
-    sample_stats,
-    file.path(output_dir, "cytotrace2_stats_by_sample.csv"),
-    row.names = FALSE
-  )
-} else {
-  cat("No 'Sample' column found. Skipping sample-level statistics.\n")
-}
-```
-
-## Healthy vs Primary Melanocytes: Stemness Comparison {.tabset}
-
-This section compares CytoTRACE2 stemness-correlated genes between healthy melanocytes and primary melanoma cells.
-
-### Venn Diagram: Stemness Gene Overlap
-
-```{r venn_healthy_primary, fig.width=10, fig.height=8, eval = has_cytotrace2}
-library(VennDiagram)
-library(ggvenn)
-library(clusterProfiler)
-library(enrichplot)
-library(org.Hs.eg.db)
-
-# Load gene correlations
-healthy_genes <- read.csv(file.path(output_dir, "cytotrace2_healthy_melanocytes_gene_correlations.csv"))
-malignant_genes <- read.csv(file.path(output_dir, "cytotrace2_malignant_gene_correlations.csv"))
-
-# Get top 100 stemness genes (positive correlation with CytoTRACE2 score = stemness)
-n_top <- 100
-healthy_stemness <- healthy_genes |>
-  dplyr::filter(correlation > 0) |>
-  dplyr::arrange(desc(correlation)) |>
-  head(n_top) |>
-  dplyr::pull(gene)
-
-malignant_stemness <- malignant_genes |>
-  dplyr::filter(correlation > 0) |>
-  dplyr::arrange(desc(correlation)) |>
-  head(n_top) |>
-  dplyr::pull(gene)
-
-# Create Venn diagram data
-venn_data <- list(
-  "Healthy Melanocytes" = healthy_stemness,
-  "Primary Melanoma" = malignant_stemness
-)
-
-# Plot with ggvenn
-p_venn <- ggvenn(
-  venn_data,
-  fill_color = c("#4DAF4A", "#E41A1C"),
-  stroke_size = 0.5,
-  set_name_size = 5,
-  text_size = 4
-) +
-  ggtitle(paste0("Top ", n_top, " Stemness Genes: Healthy vs Primary Melanoma")) +
-  theme(plot.title = element_text(hjust = 0.5, size = 14, face = "bold"))
-print(p_venn)
-
-ggsave(
-  file.path(output_dir, "venn_stemness_healthy_vs_primary.png"),
-  p_venn, width = 10, height = 8, dpi = 300, bg = "white"
-)
-
-# Calculate overlaps
-overlap <- intersect(healthy_stemness, malignant_stemness)
-healthy_unique <- setdiff(healthy_stemness, malignant_stemness)
-malignant_unique <- setdiff(malignant_stemness, healthy_stemness)
-
-cat("\n=== Stemness Gene Overlap Summary ===\n")
-cat("Shared genes:", length(overlap), "\n")
-cat("Healthy-specific genes:", length(healthy_unique), "\n")
-cat("Malignant-specific genes:", length(malignant_unique), "\n")
-```
-
-### Shared Stemness Genes
-
-```{r shared_stemness_genes, eval = has_cytotrace2}
-cat("=== Genes associated with stemness in BOTH healthy and malignant melanocytes ===\n\n")
-
-if (length(overlap) > 0) {
-  # Get correlations for shared genes
-  shared_df <- data.frame(
-    gene = overlap,
-    correlation_healthy = healthy_genes$correlation[match(overlap, healthy_genes$gene)],
-    correlation_malignant = malignant_genes$correlation[match(overlap, malignant_genes$gene)]
-  ) |>
-    dplyr::mutate(
-      mean_correlation = (correlation_healthy + correlation_malignant) / 2
-    ) |>
-    dplyr::arrange(desc(mean_correlation))
-
-  print(shared_df)
-
-  write.csv(
-    shared_df,
-    file.path(output_dir, "stemness_genes_shared_healthy_malignant.csv"),
-    row.names = FALSE
-  )
-}
-```
-
-### Unique Stemness Genes
-
-```{r unique_stemness_genes, eval = has_cytotrace2}
-cat("=== Healthy-Specific Stemness Genes ===\n")
-cat("(Genes correlated with stemness only in healthy melanocytes)\n\n")
-
-if (length(healthy_unique) > 0) {
-  healthy_unique_df <- healthy_genes |>
-    dplyr::filter(gene %in% healthy_unique) |>
-    dplyr::arrange(desc(correlation))
-  print(healthy_unique_df)
-
-  write.csv(
-    healthy_unique_df,
-    file.path(output_dir, "stemness_genes_healthy_unique.csv"),
-    row.names = FALSE
-  )
-}
-
-cat("\n=== Malignant-Specific Stemness Genes ===\n")
-cat("(Genes correlated with stemness only in malignant melanoma cells)\n\n")
-
-if (length(malignant_unique) > 0) {
-  malignant_unique_df <- malignant_genes |>
-    dplyr::filter(gene %in% malignant_unique) |>
-    dplyr::arrange(desc(correlation))
-  print(malignant_unique_df)
-
-  write.csv(
-    malignant_unique_df,
-    file.path(output_dir, "stemness_genes_malignant_unique.csv"),
-    row.names = FALSE
-  )
-}
-```
-
-### GO Enrichment: Stemness Genes
-
-```{r enrichment_stemness, fig.width=10, fig.height=8, eval = has_cytotrace2}
-# Reusable function for GO BP enrichment
-run_enrichment <- function(genes, category_name, output_prefix) {
-  if (length(genes) < 5) {
-    cat("Too few genes for enrichment:", category_name, "\n")
-    return(NULL)
-  }
-
-  # GO Biological Process
-  ego <- enrichGO(
-    gene = genes,
-    OrgDb = org.Hs.eg.db,
-    keyType = "SYMBOL",
-    ont = "BP",
-    pAdjustMethod = "BH",
-    pvalueCutoff = 0.05,
-    qvalueCutoff = 0.2
-  )
-
-  if (!is.null(ego) && nrow(ego) > 0) {
-    p_go <- dotplot(ego, showCategory = 15, title = paste(category_name, "- GO BP"))
-    print(p_go)
-    ggsave(file.path(output_dir, paste0(output_prefix, "_GO_BP_dotplot.png")),
-           p_go, width = 10, height = 8, dpi = 300, bg = "white")
-  } else {
-    cat("No significant GO BP terms for:", category_name, "\n")
-  }
-
-  return(ego)
-}
-
-cat("=== GO Enrichment Analysis: Stemness Genes ===\n\n")
-
-# Run enrichment for 3 stemness categories
-cat("--- Shared Stemness Genes ---\n")
-enr_shared_stemness <- run_enrichment(overlap, "Shared Stemness Genes", "enrichment_stemness_shared")
-
-cat("\n--- Healthy-Specific Stemness Genes ---\n")
-enr_healthy_stemness <- run_enrichment(healthy_unique, "Healthy-Specific Stemness", "enrichment_stemness_healthy_unique")
-
-cat("\n--- Malignant-Specific Stemness Genes ---\n")
-enr_malignant_stemness <- run_enrichment(malignant_unique, "Malignant-Specific Stemness", "enrichment_stemness_malignant_unique")
-```
-
-### Venn Diagram: Differentiation Gene Overlap
-
-```{r venn_differentiation, fig.width=10, fig.height=8, eval = has_cytotrace2}
-# Get top 100 differentiation genes (NEGATIVE correlation = differentiation)
-healthy_diff <- healthy_genes |>
-  dplyr::filter(correlation < 0) |>
-  dplyr::arrange(correlation) |>
-  head(n_top) |>
-  dplyr::pull(gene)
-
-malignant_diff <- malignant_genes |>
-  dplyr::filter(correlation < 0) |>
-  dplyr::arrange(correlation) |>
-  head(n_top) |>
-  dplyr::pull(gene)
-
-# Create Venn diagram data
-venn_data_diff <- list(
-  "Healthy Melanocytes" = healthy_diff,
-  "Primary Melanoma" = malignant_diff
-)
-
-# Plot with ggvenn
-p_venn_diff <- ggvenn(
-  venn_data_diff,
-  fill_color = c("#4DAF4A", "#E41A1C"),
-  stroke_size = 0.5,
-  set_name_size = 5,
-  text_size = 4
-) +
-  ggtitle(paste0("Top ", n_top, " Differentiation Genes: Healthy vs Primary Melanoma")) +
-  theme(plot.title = element_text(hjust = 0.5, size = 14, face = "bold"))
-print(p_venn_diff)
-
-ggsave(
-  file.path(output_dir, "venn_differentiation_healthy_vs_primary.png"),
-  p_venn_diff, width = 10, height = 8, dpi = 300, bg = "white"
-)
-
-# Calculate overlaps
-overlap_diff <- intersect(healthy_diff, malignant_diff)
-healthy_unique_diff <- setdiff(healthy_diff, malignant_diff)
-malignant_unique_diff <- setdiff(malignant_diff, healthy_diff)
-
-cat("\n=== Differentiation Gene Overlap Summary ===\n")
-cat("Shared genes:", length(overlap_diff), "\n")
-cat("Healthy-specific genes:", length(healthy_unique_diff), "\n")
-cat("Malignant-specific genes:", length(malignant_unique_diff), "\n")
-
-# Save differentiation gene lists
-write.csv(
-  data.frame(
-    gene = overlap_diff,
-    correlation_healthy = healthy_genes$correlation[match(overlap_diff, healthy_genes$gene)],
-    correlation_malignant = malignant_genes$correlation[match(overlap_diff, malignant_genes$gene)]
-  ),
-  file.path(output_dir, "differentiation_genes_shared_healthy_malignant.csv"),
-  row.names = FALSE
-)
-
-write.csv(
-  healthy_genes |> dplyr::filter(gene %in% healthy_unique_diff) |> dplyr::arrange(correlation),
-  file.path(output_dir, "differentiation_genes_healthy_unique.csv"),
-  row.names = FALSE
-)
-
-write.csv(
-  malignant_genes |> dplyr::filter(gene %in% malignant_unique_diff) |> dplyr::arrange(correlation),
-  file.path(output_dir, "differentiation_genes_malignant_unique.csv"),
-  row.names = FALSE
-)
-```
-
-### GO Enrichment: Differentiation Genes
-
-```{r enrichment_differentiation, fig.width=10, fig.height=8, eval = has_cytotrace2}
-cat("=== GO Enrichment Analysis: Differentiation Genes ===\n\n")
-
-# Run enrichment for 3 differentiation categories
-cat("--- Shared Differentiation Genes ---\n")
-enr_shared_diff <- run_enrichment(overlap_diff, "Shared Differentiation Genes", "enrichment_diff_shared")
-
-cat("\n--- Healthy-Specific Differentiation Genes ---\n")
-enr_healthy_diff <- run_enrichment(healthy_unique_diff, "Healthy-Specific Differentiation", "enrichment_diff_healthy_unique")
-
-cat("\n--- Malignant-Specific Differentiation Genes ---\n")
-enr_malignant_diff <- run_enrichment(malignant_unique_diff, "Malignant-Specific Differentiation", "enrichment_diff_malignant_unique")
-```
-
-### Statistical Comparison
-
-```{r healthy_vs_primary_stats, fig.width=10, fig.height=6, eval = has_cytotrace2}
-# Compare CytoTRACE2 scores between healthy and primary melanocytes
-melanocytic_cells <- um_atlas@meta.data |>
-  dplyr::filter(majority_celltype %in% c("Melanocytes", "Melanoma cells")) |>
-  dplyr::filter(origin %in% c("healthy", "primary"))
-
-cat("=== CytoTRACE2 Score Comparison: Healthy vs Primary ===\n\n")
-
-# Statistical test
-wilcox_result <- wilcox.test(
-  CytoTRACE2_Score ~ origin,
-  data = melanocytic_cells,
-  alternative = "two.sided"
-)
-
-cat("Wilcoxon rank-sum test:\n")
-cat("W =", wilcox_result$statistic, "\n")
-cat("p-value =", format(wilcox_result$p.value, scientific = TRUE), "\n\n")
-
-# Summary stats
-origin_stats <- melanocytic_cells |>
-  dplyr::group_by(origin) |>
-  dplyr::summarise(
-    n_cells = n(),
-    mean_score = mean(CytoTRACE2_Score, na.rm = TRUE),
-    sd_score = sd(CytoTRACE2_Score, na.rm = TRUE),
-    median_score = median(CytoTRACE2_Score, na.rm = TRUE),
-    .groups = "drop"
-  )
-print(origin_stats)
-
-# Violin plot comparison (using Victoria's origin_colors)
-melanocytic_cells$origin <- factor(melanocytic_cells$origin, levels = c("healthy", "primary", "metastasis"))
-p_compare <- ggplot(melanocytic_cells, aes(x = origin, y = CytoTRACE2_Score, fill = origin)) +
-  geom_violin(trim = FALSE, alpha = 0.7) +
-  geom_boxplot(width = 0.1, fill = "white", outlier.shape = NA) +
-  scale_x_discrete(limits = origin_order) +
-  scale_fill_manual(values = origin_colors) +
-  labs(
-    title = "CytoTRACE2 Stemness: Healthy Melanocytes vs Primary Melanoma",
-    subtitle = paste0("Wilcoxon p = ", format(wilcox_result$p.value, scientific = TRUE, digits = 3)),
-    x = "Origin",
-    y = "CytoTRACE2 Score (Stemness)"
-  ) +
-  theme_classic(base_size = 14) +
-  theme(legend.position = "none")
-print(p_compare)
-
-ggsave(
-  file.path(output_dir, "violin_healthy_vs_primary_comparison.png"),
-  p_compare, width = 8, height = 6, dpi = 300, bg = "white"
-)
-```
-
-## Stemness Signature for Xenium Validation {.tabset}
-
-Extract top stemness genes from primary melanoma for spatial validation on Xenium data.
-
-### Top Melanoma Stemness Genes
-
-```{r extract_xenium_signature, eval = has_cytotrace2}
-# Get top 50 melanoma stemness genes for Xenium validation
-n_signature <- 50
-
-melanoma_stemness_signature <- malignant_genes |>
-  dplyr::filter(correlation > 0) |>
-  dplyr::arrange(desc(correlation)) |>
-  head(n_signature)
-
-cat("=== Top", n_signature, "Melanoma Stemness Genes for Xenium Validation ===\n\n")
-print(melanoma_stemness_signature)
-
-# Save signature
-write.csv(
-  melanoma_stemness_signature,
-  file.path(output_dir, "melanoma_stemness_signature_xenium.csv"),
-  row.names = FALSE
-)
-
-cat("\nSignature saved to: Outputs/melanoma_stemness_signature_xenium.csv\n")
-cat("\nTop 20 genes:\n")
-cat(paste(melanoma_stemness_signature$gene[1:20], collapse = ", "), "\n")
-```
-
-### Check Xenium Panel Availability
-
-```{r check_xenium_panel, eval = has_cytotrace2}
-# Load Xenium data to check which genes are available
-xenium_path <- "../Xenium_3cohorts_merged"
-
-if (dir.exists(xenium_path)) {
-  xenium_files <- list.files(xenium_path, pattern = "\\.qs2?$|\\.rds$", full.names = TRUE)
-  cat("Found Xenium files:\n")
-  print(basename(xenium_files))
-} else {
-  cat("Xenium analysis directory not found at expected location.\n")
-  cat("Expected: ", xenium_path, "\n")
-}
-
-# Export gene list as simple text file for easy lookup
-writeLines(
-  melanoma_stemness_signature$gene,
-  file.path(output_dir, "melanoma_stemness_genes_list.txt")
-)
-cat("\nGene list saved as plain text: Outputs/melanoma_stemness_genes_list.txt\n")
-```
-
-## Myeloid Cell Investigation {.tabset}
-
-Investigating why myeloid cells show high correlation with melanocytic genes in CytoTRACE2 analysis.
-
-### Myeloid Gene Correlations Issue
-
-```{r myeloid_investigation, fig.width=12, fig.height=8, eval = has_cytotrace2}
-# Load myeloid gene correlations
-myeloid_genes <- read.csv(file.path(output_dir, "cytotrace2_myeloid_gene_correlations.csv"))
-
-cat("=== Top 30 CytoTRACE2-Correlated Genes in Myeloid Cells ===\n\n")
-print(head(myeloid_genes, 30))
-
-# Define melanocyte markers
-melanocyte_markers <- c("PMEL", "MLANA", "TYR", "TYRP1", "DCT", "MITF", "SOX10",
-                        "PAX3", "CDH19", "RAB38", "OCA2", "EDNRB", "TRPM1")
-
-# Check how many melanocyte markers are in top correlated genes
-top_100_myeloid <- head(myeloid_genes, 100)$gene
-melanocyte_overlap <- intersect(top_100_myeloid, melanocyte_markers)
-
-cat("\n=== Melanocyte Markers in Top 100 Myeloid CytoTRACE2-Correlated Genes ===\n")
-cat("Found:", length(melanocyte_overlap), "of", length(melanocyte_markers), "markers\n")
-cat("Markers present:", paste(melanocyte_overlap, collapse = ", "), "\n")
-```
-
-### Expression Analysis
-
-```{r myeloid_expression_check, fig.width=14, fig.height=10, eval = has_cytotrace2}
-# Subset to myeloid cells
-myeloid_cells <- subset(um_atlas, majority_celltype == "Myeloid cells")
-cat("Number of myeloid cells:", ncol(myeloid_cells), "\n")
-
-# Check expression of melanocyte markers vs myeloid markers
-myeloid_markers <- c("CD68", "CD14", "CD163", "MARCO", "CSF1R", "LYZ", "C1QA", "C1QB", "C1QC")
-all_markers <- c(melanocyte_markers, myeloid_markers)
-
-# Get available markers
-available_markers <- intersect(all_markers, rownames(myeloid_cells))
-cat("\nAvailable markers for analysis:", length(available_markers), "/", length(all_markers), "\n")
-
-# Check doublet scores in myeloid cells
-if ("doubletScore" %in% colnames(myeloid_cells@meta.data)) {
-  cat("\n=== Doublet Scores in Myeloid Cells ===\n")
-  cat("Mean doublet score:", mean(myeloid_cells$doubletScore, na.rm = TRUE), "\n")
-  cat("Median doublet score:", median(myeloid_cells$doubletScore, na.rm = TRUE), "\n")
-  cat("% doublets (score > 0.5):",
-      round(100 * mean(myeloid_cells$doubletScore > 0.5, na.rm = TRUE), 2), "%\n")
-}
-
-# Expression dotplot
-if (length(available_markers) > 0) {
-  p_dot <- DotPlot(
-    myeloid_cells,
-    features = available_markers,
-    group.by = "origin"
-  ) +
-    coord_flip() +
-    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
-    ggtitle("Expression of Melanocyte vs Myeloid Markers in 'Myeloid' Cells")
-  print(p_dot)
-
-  ggsave(
-    file.path(output_dir, "dotplot_myeloid_marker_expression.png"),
-    p_dot, width = 10, height = 10, dpi = 300, bg = "white"
-  )
-}
-```
-
-### Myeloid Cells by Origin and CytoTRACE2
-
-```{r myeloid_by_origin, fig.width=12, fig.height=6, eval = has_cytotrace2}
-# Check CytoTRACE2 distribution in myeloid cells by origin
-# Ensure disease progression order
-myeloid_cells$origin <- factor(myeloid_cells$origin, levels = c("healthy", "primary", "metastasis"))
-
-p_myeloid_origin <- ggplot(
-  myeloid_cells@meta.data,
-  aes(x = origin, y = CytoTRACE2_Score, fill = origin)
-) +
-  geom_violin(trim = FALSE, alpha = 0.7) +
-  geom_boxplot(width = 0.1, fill = "white", outlier.shape = NA) +
-  scale_x_discrete(limits = origin_order) +
-  scale_fill_manual(values = origin_colors) +
-  labs(
-    title = "CytoTRACE2 Score in Myeloid Cells by Origin",
-    x = "Origin",
-    y = "CytoTRACE2 Score"
-  ) +
-  theme_classic(base_size = 14) +
-  theme(legend.position = "none")
-print(p_myeloid_origin)
-
-# Check if high-stemness myeloid cells express melanocyte markers
-myeloid_meta <- myeloid_cells@meta.data
-myeloid_meta$stemness_group <- cut(
-  myeloid_meta$CytoTRACE2_Score,
-  breaks = c(0, 0.2, 0.4, 1),
-  labels = c("Low", "Medium", "High")
-)
-
-cat("\n=== Myeloid Cells by Stemness Group ===\n")
-print(table(myeloid_meta$stemness_group, useNA = "always"))
-```
-
-### Hypothesis: Doublets or Phagocytosis
-
-```{r myeloid_hypothesis, fig.width=12, fig.height=8, eval = has_cytotrace2}
-cat("=== Potential Explanations for Melanocyte Gene Expression in Myeloid Cells ===\n\n")
-
-cat("1. DOUBLETS: Myeloid-melanoma doublets could explain co-expression\n")
-cat("   - Check: Doublet scores should be elevated\n")
-cat("   - Check: Co-expression of myeloid + melanocyte markers in same cells\n\n")
-
-cat("2. PHAGOCYTOSIS: Macrophages may have engulfed melanoma cells\n")
-cat("   - Check: Primarily in macrophage subsets (CD68+, CD163+)\n")
-cat("   - Check: Tumor-associated macrophages in malignant samples\n\n")
-
-cat("3. MISANNOTATION: Some cells may be incorrectly labeled\n")
-cat("   - Check: Reference-based annotation confidence scores\n")
-cat("   - Check: Manual marker inspection\n\n")
-
-# Check correlation between melanocyte and myeloid marker expression
-if (all(c("PMEL", "CD68") %in% rownames(myeloid_cells))) {
-  myeloid_cells <- JoinLayers(myeloid_cells)
-  expr_mat <- GetAssayData(myeloid_cells, layer = "data")
-
-  if ("PMEL" %in% rownames(expr_mat) && "CD68" %in% rownames(expr_mat)) {
-    pmel_expr <- expr_mat["PMEL", ]
-    cd68_expr <- expr_mat["CD68", ]
-
-    cor_test <- cor.test(as.numeric(pmel_expr), as.numeric(cd68_expr))
-
-    cat("=== Co-expression Analysis ===\n")
-    cat("Correlation between PMEL and CD68 in myeloid cells:\n")
-    cat("Pearson r =", round(cor_test$estimate, 3), "\n")
-    cat("p-value =", format(cor_test$p.value, scientific = TRUE), "\n")
-
-    # Scatter plot
-    plot_df <- data.frame(
-      PMEL = as.numeric(pmel_expr),
-      CD68 = as.numeric(cd68_expr),
-      CytoTRACE2 = myeloid_cells$CytoTRACE2_Score
-    )
-
-    p_scatter <- ggplot(plot_df, aes(x = CD68, y = PMEL, color = CytoTRACE2)) +
-      geom_point(alpha = 0.5, size = 1) +
-      scale_color_viridis_c() +
-      labs(
-        title = "CD68 vs PMEL Expression in Myeloid Cells",
-        subtitle = paste0("r = ", round(cor_test$estimate, 3)),
-        x = "CD68 (Myeloid marker)",
-        y = "PMEL (Melanocyte marker)",
-        color = "CytoTRACE2\nScore"
-      ) +
-      theme_classic(base_size = 12)
-    print(p_scatter)
-
-    ggsave(
-      file.path(output_dir, "scatter_myeloid_cd68_vs_pmel.png"),
-      p_scatter, width = 8, height = 6, dpi = 300, bg = "white"
-    )
-  }
-}
-```
-
-## Session Info
-
-```{r session_info}
+```{r session}
 sessionInfo()
 ```
-
-## Interpretation Guide
-
-### CytoTRACE2 Score Ranges
-
-- **0.0 - 0.167**: Differentiated (terminally differentiated cells)
-- **0.167 - 0.333**: Unipotent (single lineage potential)
-- **0.333 - 0.5**: Oligopotent (few lineages)
-- **0.5 - 0.667**: Multipotent (multiple lineages)
-- **0.667 - 0.833**: Pluripotent (most lineages)
-- **0.833 - 1.0**: Totipotent (all lineages)
-
-### Expected Patterns in Uveal Melanoma
-
-- **Malignant cells with high stemness** may represent cancer stem cells with higher tumorigenic potential
-- **Differentiated tumor cells** may be more terminally differentiated and less aggressive
-- **Immune cells** typically show lower potency scores (differentiated)
-- **Endothelial/stromal cells** may show intermediate scores
-
-### Key Outputs
-
-All results saved to: `../Outputs/`
-
-- Seurat object with CytoTRACE2: `../UM_atlas_cytotrace2.qs2`
-- UMAP plots showing potency scores and categories
-- Violin plots by cell type and sample
-- Compositional bar plots
-- Gene correlation tables (stemness and differentiation markers)
-- Summary statistics tables
